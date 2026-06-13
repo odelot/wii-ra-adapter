@@ -185,42 +185,20 @@ static uint16_t static_watch_count = 0;
 #define EVICT_BATCH_SIZE 256
 static uint32_t pending_remove_addrs[EVICT_BATCH_SIZE];  /* BE-encoded */
 static uint16_t pending_remove_count = 0;
-/* DIAG (v0.18.7): set after REMOVE emission, consumed at next SNAPSHOT
- * to print ra-module's actual post-REMOVE count vs ESP's expectation. */
-bool snap_post_remove_armed = false;
-uint16_t snap_post_remove_expected = 0;
 
-/* ra_module_expected_count tracks what we BELIEVE ra-module's watchlist
- * count is at the moment its NEXT read of our prepped response fires. This
- * is essential for canonical TX padding: ra-module's RX offset = its NEXT
- * TX width = 10 + (count after it processes our response). If we pad based
- * on the count it currently shows in its SNAPSHOT (stale by 1 tx after a
- * REMOVE/APPEND emit), the response data lands at the wrong byte and
- * ra-module misses it. Updated on every count-changing emit AND on every
- * SNAPSHOT receive (truth sync). */
-static uint16_t ra_module_expected_count = 0;
 #ifndef WATCHLIST_HIGH_WATER
-/* Phase A.5 ENABLED: trigger LRU eviction when watch_count would exceed
- * the high-water mark. evict_lru drops up to EVICT_BATCH_SIZE=256 LRU
- * dynamic entries (chain-root-safe), leaving headroom before next eviction.
+/* Phase A.5 LRU eviction high-water mark. When watch_count would exceed
+ * this on watchlist_append, evict_lru drops up to EVICT_BATCH_SIZE=256
+ * LRU dynamic entries (chain-root-safe), leaving headroom before the
+ * next eviction.
  *
- * v0.19.3-60hz: lowered from 768 to 500 to force eviction during
- * the very first multi-pass round (boot → initial CONVERGE adds ~128 →
- * 359 + 128 = 487 close; next round pushes past 500). This makes the
- * off-by-2 reproducible without needing to play to a specific gameplay
- * state. Will return to 768 once the off-by-N root cause is fixed.
- *
- * v0.19.3-60hz: raised to 900. Phase B SPI is now reliable (the SETTLE
- * ra_sleep(1) in ra_send_phase_b fixed the slave-not-armed race for large
- * responses). Remaining issue was LRU thrashing: 500 was forcing chain[0]
- * + chain[1] to be evicted on every chain[2] arrival, then chain[2] on
- * every chain[1] re-fetch, oscillating forever and never letting the
- * trigger evaluator reach chain[3] (the ability byte at 0x00000A64).
- *
- * Capacity check for Kirby RtDL chain navigation:
- *   359 static + 4 chain[0] + 128 chain[1] + 128 chain[2] + ~1-4 chain[3]
- *   = ~620-625 worst case. 900 leaves comfortable headroom and still
- *   activates eviction long before hitting RA_MAX_WATCH_ADDRS=1024. */
+ * 900 fits Kirby RtDL's full chain navigation (359 static + 4 chain[0]
+ * + 128 chain[1] + 128 chain[2] + ~1-4 chain[3] ≈ 620-625 worst case)
+ * with comfortable headroom and still activates eviction long before
+ * hitting RA_MAX_WATCH_ADDRS=1024. v0.19.2-no-evict raised this from
+ * 500 (artificially low during the off-by-N debug push) after Phase B
+ * stabilized SPI delivery. See [[project-milestone-phase-b-success]]
+ * for the LRU-thrashing rationale. */
 #define WATCHLIST_HIGH_WATER 900
 #endif
 /* Forward decl — watchlist_append calls evict_lru, but evict_lru lives
@@ -237,44 +215,6 @@ uint32_t query_addrs[ADDR_QUERY_MAX];
 uint8_t  query_values[ADDR_QUERY_MAX];
 uint16_t query_count = 0;
 static volatile bool addr_query_pending = false;
-
-/* Soft cap on dynamic watchlist growth — defends against ra-module lockup
- * observed at watch=855 with full Kirby cheevo set (2026-05-31 / 2026-06-01).
- * Beyond this count, watchlist_append rejects new entries (instead of
- * growing past hardware limits). Proper LRU eviction comes in a later
- * milestone (requires d2x rebuild for RA_EVT_WATCHLIST_TRUNCATE). */
-#ifndef WATCHLIST_SOFT_CAP
-#define WATCHLIST_SOFT_CAP 512
-#endif
-
-/* Rejected-address tracking — prevents multi-pass spin when SOFT CAP
- * rejects a batch. Without this, rc_memrefs_get_addresses keeps emitting
- * the same rejected addresses every frame, collect_missing keeps queuing
- * ADDR_QUERY for them, ra-module keeps reading PPC for those bytes, ADDR_
- * RESPONSE fills query_values, convergence tries to append → SOFT CAP
- * rejects again → infinite loop at full SPI speed, starving the WiFi/HTTP
- * stack on Core 0 (observed Jun 1 2026: HTTP timeout -11 with watch=408
- * and ADDR rate 28Hz). Rejecting an addr ONCE marks it here so subsequent
- * collect_missing skips it. Ring-buffer; oldest entries evicted on wrap. */
-#define REJECT_SET_MAX 512
-static uint32_t reject_set[REJECT_SET_MAX];
-static uint16_t reject_count = 0;
-static uint16_t reject_write_idx = 0;
-
-static bool is_rejected(uint32_t addr) {
-    uint16_t n = (reject_count < REJECT_SET_MAX) ? reject_count : REJECT_SET_MAX;
-    for (uint16_t i = 0; i < n; i++) {
-        if (reject_set[i] == addr) return true;
-    }
-    return false;
-}
-
-static void mark_rejected(uint32_t addr) {
-    if (is_rejected(addr)) return;
-    reject_set[reject_write_idx] = addr;
-    reject_write_idx = (reject_write_idx + 1) % REJECT_SET_MAX;
-    if (reject_count < REJECT_SET_MAX) reject_count++;
-}
 
 /* peek_from_snapshot miss tracker — captures byte addresses that peek
  * was called for but were not in cache. rc_memrefs_get_addresses outputs
@@ -550,7 +490,7 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
      * byte-swap here, the BE size's internal swap reverts our swap and
      * produces the LE-pack value (broken). LE-size cheevos work natively
      * because the dev coded against the LE-pack interpretation. Earlier
-     * v0.15.2 BE swap was a misdiagnosis — Kirby v0.19.3-60hz log 2026-05-31
+     * v0.15.2 BE swap was a misdiagnosis — Kirby v0.21.0-cleanup log 2026-05-31
      * 20:01:42 showed first_qa=0053F774 = LE-pack of [0x80,0xDC,0x53,0x00]
      * + 0x1AF4, proving cheevo uses RC_MEMSIZE_32_BITS (LE) for pptr. */
     for (uint32_t j = 0; j < num_bytes; j++) {
@@ -1145,10 +1085,6 @@ static void send_esp_header_response_4pad(const ra_esp_header_t *hdr) {
  * trigger to ACTIVE prematurely and the NEXT frame fires falsely). */
 static const size_t SNAP_REQ_LEN_PER_VALUE = 1;  /* 1 byte per addr */
 
-/* Captured from the most recent SNAPSHOT so the ADDR_RESPONSE handler
- * can recompute padding (= GC's SNAPSHOT request size). */
-static size_t last_snap_req_len = 0;
-
 /* Index in query_addrs[] where the most recent ADDR_QUERY round
  * started — values from the next ADDR_RESPONSE fill from this index. */
 static uint16_t pending_query_start = 0;
@@ -1191,9 +1127,6 @@ static uint16_t collect_missing_addresses(void) {
             /* In static watchlist? O(1) hash lookup. */
             if (hash_lookup(byte_addr) >= 0) continue;
 
-            /* Previously rejected by SOFT CAP? Don't waste a round trip. */
-            if (is_rejected(byte_addr)) continue;
-
             /* Already in this frame's query cache (from previous round)? */
             bool dup = false;
             for (uint16_t q = 0; q < query_count; q++) {
@@ -1214,7 +1147,6 @@ static uint16_t collect_missing_addresses(void) {
     for (uint16_t i = 0; i < peek_miss_count && query_count < ADDR_QUERY_MAX; i++) {
         uint32_t addr = peek_miss_addrs[i];
         if (hash_lookup(addr) >= 0) continue;
-        if (is_rejected(addr)) continue;
         bool dup = false;
         for (uint16_t q = 0; q < query_count; q++) {
             if (query_addrs[q] == addr) { dup = true; break; }
@@ -1229,26 +1161,28 @@ static uint16_t collect_missing_addresses(void) {
 /* Build & ship an ADDR_QUERY response with the addresses appended in
  * the most recent collect_missing_addresses() call: range
  * [pending_query_start .. query_count-1]. */
-static void send_addr_query_response(size_t pad_len) {
+static void send_addr_query_response(void) {
     uint16_t round_count = query_count - pending_query_start;
     if (round_count == 0) {
-        /* DIAG v0.18.8: zero-round = nothing to send. Should not happen in
-         * normal flow. If it does, we silently no-op which leaves
-         * addr_query_pending unchanged. Log so we know. */
-        Serial.printf("DEBUG=>> send_addr_query SKIPPED: round_count=0 (qc=%u pending=%u)\r\n",
-                      (unsigned)query_count, (unsigned)pending_query_start);
+        /* Zero-round = nothing to send. Should not happen in normal flow.
+         * If it does, we silently no-op (leaves addr_query_pending alone). */
         return;
     }
 
-    /* DIAG v0.18.8: trace every ADDR_QUERY emission. */
-    Serial.printf("DEBUG=>> send_addr_query iter=%u round_count=%u total_qc=%u first_qa=0x%08lX pad=%u\r\n",
-                  (unsigned)addr_query_iter_count, (unsigned)round_count,
-                  (unsigned)query_count,
-                  (unsigned long)query_addrs[pending_query_start],
-                  (unsigned)pad_len);
+    /* Throttled trace — useful when multi-pass is active. */
+    {
+        static uint32_t last_aq_log = 0;
+        uint32_t now_aq = millis();
+        if (now_aq - last_aq_log >= 1000) {
+            last_aq_log = now_aq;
+            Serial.printf("DEBUG=>> send_addr_query iter=%u round=%u total_qc=%u first_qa=0x%08lX\r\n",
+                          (unsigned)addr_query_iter_count, (unsigned)round_count,
+                          (unsigned)query_count,
+                          (unsigned long)query_addrs[pending_query_start]);
+        }
+    }
 
     addr_query_pending = true;
-    Serial.printf("DEBUG=  aqp <- true (ADDR_QUERY sent)\r\n");
     uint16_t payload_len = sizeof(ra_addr_query_t) + round_count * 4;
 
     ra_esp_header_t resp;
@@ -1274,35 +1208,18 @@ static void send_addr_query_response(size_t pad_len) {
     for (uint16_t i = 0; i < round_count; i++)
         aq_addrs[i] = ra_host_to_be32(query_addrs[pending_query_start + i]);
 
-    send_padded_response(buf, sizeof(ra_esp_header_t) + payload_len, pad_len);
+    send_response(buf, sizeof(ra_esp_header_t) + payload_len);
     free(buf);
 }
 
-/* Response sender for SNAPSHOT / ADDR_RESPONSE (Phase B commands).
- *
- * v0.19.1 — `pad` IS NOW IGNORED. Phase B uses a separate CS-low for the
- * Wii's read phase, which always starts reading from tx_buf[0]. Leading
- * padding bytes would corrupt the magic check on the Wii side
- * (`ra_parse_response` reads the header at offset 0). With pad=0 the
- * response sits at tx_buf[0] and the Wii parses it directly.
- *
- * Why pad existed under Phase A: ra_send used a single CS-low for write
- * + read, so the Wii's write phase clocked the leading pad bytes through
- * MISO (the Wii ignored them), and the Wii's read phase landed on the
- * actual response at tx_buf[pad]. Phase B's separate read CS-low makes
- * the pad strictly harmful.
- *
- * Phase A WiiFlow commands (POLL/STATUS/IDENTIFY/CHUNK/GAME_RESET) use
- * different code paths (send_esp_header_response_4pad + bespoke handlers)
- * that bake their own padding into the response — those continue to work
- * because WiiFlow still does single-CS-low write+read.
- *
- * The `pad` parameter is kept in the signature so the existing call sites
- * compile unchanged; once Phase B is settled, we'll drop it entirely. */
-static void send_padded_response(const uint8_t *data, size_t len, size_t pad) {
-    (void)pad;  /* Phase B: ignored */
+/* Response sender for Phase B commands (SNAPSHOT, ADDR_RESPONSE). Places
+ * the response at tx_buf[0] so the Wii's dedicated read CS-low clocks it
+ * out from byte 0 — no leading padding. WiiFlow's Phase A commands
+ * (IDENTIFY/POLL/CHUNK/GAME_RESET) use separate handlers that bake their
+ * own padding for the single-CS-low write+read pattern. */
+static void send_response(const uint8_t *data, size_t len) {
     if (len > EXI_MAX_TRANSACTION_SIZE) {
-        Serial.printf("DEBUG=send_padded_response: too big len=%u\n", (unsigned)len);
+        Serial.printf("DEBUG=send_response: too big len=%u\n", (unsigned)len);
         return;
     }
     /* DIAG: log wire-format ONLY for non-ACK events (event_type at offset 2). */
@@ -1417,26 +1334,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             uint16_t count = ra_be16_to_host(snap->addr_count);
             frame_counter = ra_be32_to_host(snap->frame_counter);
 
-            /* Phase A.5: SNAPSHOT count is ground truth for ra-module's
-             * watchlist size right NOW. Sync our expected. Lru_clock ticks
-             * each SNAPSHOT for LRU eviction freshness. */
-
-            /* DIAG: log first SNAPSHOT after every REMOVE emission so we see
-             * ra-module's actual post-REMOVE count vs what we expected.
-             * snap_post_remove_armed is set right after we emit REMOVE; the
-             * next SNAPSHOT prints the raw delta. This bypasses the mismatch
-             * detector throttle and tells us if off-by-N still happens. */
-            extern bool snap_post_remove_armed;
-            extern uint16_t snap_post_remove_expected;
-            if (snap_post_remove_armed) {
-                snap_post_remove_armed = false;
-                int32_t delta = (int32_t)count - (int32_t)snap_post_remove_expected;
-                Serial.printf("DEBUG=POST-REMOVE SNAP: ra-module count=%u, ESP expected=%u, delta=%+ld, esp_watch=%u\r\n",
-                              (unsigned)count, (unsigned)snap_post_remove_expected,
-                              (long)delta, (unsigned)watch_count);
-            }
-
-            ra_module_expected_count = count;
+            /* lru_clock ticks each SNAPSHOT for LRU eviction freshness. */
             lru_clock++;
 
             // Throttled log: confirm ra_do_frame VBlank hook is firing on GC side.
@@ -1458,41 +1356,31 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             }
 
             /* Re-sync: if SNAPSHOT carries FEWER values than our watchlist
-             * size, ra-module missed a WATCHLIST_APPEND event from a prior
-             * round (race on its parse). Re-send the missing tail BEFORE
-             * doing anything else for this frame. We must skip do_frame
-             * this iteration because peek_from_snapshot would read STALE
-             * memory_data[count..watch_count-1] (those slots haven't been
-             * refreshed since the original append) and could mis-evaluate
-             * triggers (including the player ability chain leaf that
-             * gates "Kirby to the Past"). */
-            /* Track the count we last sent a mismatch-APPEND for. If the
-             * NEXT SNAPSHOT carries the same count (ra-module hasn't
-             * processed our APPEND yet due to the 1-tx arm-after-prepare
-             * delay), do NOT re-send the APPEND — it would land as a
-             * second copy in ra-module's read, causing it to grow its
-             * watchlist by 2× the intended count, breaking the canonical
-             * padding invariant on subsequent transactions and freezing
-             * multi-pass forever (observed 2026-06-01 with eviction at
-             * watch=759, ra-module locked at count=431). */
+             * size, ra-module missed a WATCHLIST_APPEND event (or just
+             * processed a REMOVE we emitted last round and hasn't grown
+             * back to our count yet — transient state during eviction
+             * roundtrips). Re-send the missing tail BEFORE doing anything
+             * else for this frame. We must skip do_frame this iteration
+             * because peek_from_snapshot would read STALE memory_data for
+             * the missing tail slots and could mis-evaluate triggers.
+             *
+             * mismatch_last_sent_count guards against double-emit: if the
+             * NEXT SNAPSHOT still shows the same count, ra-module hasn't
+             * processed our APPEND yet — don't re-send, just send a plain
+             * ACK. Under Phase B's deterministic delivery this dedup is
+             * rarely needed but kept as a cheap belt-and-suspenders. */
             static uint16_t mismatch_last_sent_count = 0xFFFF;
 
             if (state == STATE_ACTIVE && count < watch_count
                 && count == mismatch_last_sent_count) {
-                /* Same mismatch as last tx — skip re-send. Reply with a
-                 * plain ACK padded to the canonical SNAPSHOT width so
-                 * ra-module's RX offset stays aligned. */
-                const size_t SNAP_REQ_LEN = sizeof(ra_gc_header_t)
-                                          + sizeof(ra_snapshot_header_t)
-                                          + count;
-                last_snap_req_len = SNAP_REQ_LEN;
+                /* Same mismatch as last tx — skip re-send, send plain ACK. */
                 ra_esp_header_t ack;
                 ack.magic       = RA_MAGIC_ESP_TO_GC;
                 ack.status      = (uint8_t)state;
                 ack.event_type  = RA_EVT_NONE;
                 ack.event_count = 0;
                 ack.data_len    = 0;
-                send_padded_response((uint8_t*)&ack, sizeof(ack), SNAP_REQ_LEN);
+                send_response((uint8_t*)&ack, sizeof(ack));
                 break;
             }
 
@@ -1500,8 +1388,6 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 uint16_t missing = (uint16_t)(watch_count - count);
                 if (missing > ADDR_QUERY_MAX) missing = ADDR_QUERY_MAX;
                 mismatch_last_sent_count = count;  /* arm dup-suppression */
-                /* DIAG: log EVERY mismatch (was throttled 5s) so we see the
-                 * post-REMOVE off-by-N that the throttle was hiding. */
                 Serial.printf("DEBUG=SNAPSHOT mismatch: ra-module count=%u < esp watch=%u — re-sending APPEND for %u tail addrs\r\n",
                               (unsigned)count, (unsigned)watch_count, (unsigned)missing);
 
@@ -1524,18 +1410,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     uint32_t a = ra_host_to_be32(watch_addresses[count + i]);
                     memcpy(addr_dst + i * 4, &a, 4);
                 }
-                /* Phase A.5 canonical padding (CORRECTED): pad with CURRENT
-                 * ra-module count (= 10 + count). ra-module's NEXT TX is
-                 * still 10 + count because it parses APPEND AFTER reading.
-                 * Update expected_count to post-APPEND value for subsequent. */
-                const size_t SNAP_REQ_LEN = sizeof(ra_gc_header_t)
-                                          + sizeof(ra_snapshot_header_t)
-                                          + count;
-                send_padded_response(buf, sizeof(evt) + data_len, SNAP_REQ_LEN);
-                ra_module_expected_count = count + missing;
-                last_snap_req_len = sizeof(ra_gc_header_t)
-                                  + sizeof(ra_snapshot_header_t)
-                                  + ra_module_expected_count;
+                send_response(buf, sizeof(evt) + data_len);
                 /* Skip do_frame this iteration — wait for ra-module's
                  * next SNAPSHOT to confirm catch-up. */
                 break;
@@ -1563,10 +1438,11 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
              * on the eventual ADDR_RESPONSE. See [[project-snapshot-wipes-
              * inflight-query]]. */
             uint16_t n_missing = 0;
-            /* DIAG v0.18.8: capture addr_query_pending at SNAP_HDR entry —
-             * if it's stuck=true and no ADDR_RESP is arriving, multi-pass
-             * is frozen. */
-            bool aqp_at_entry = addr_query_pending;
+            /* addr_query_pending gates the multi-pass state. If a prior
+             * ADDR_QUERY is still outstanding (ra-module hasn't sent
+             * ADDR_RESP back yet), don't wipe query_count — the in-flight
+             * round's bookkeeping is still needed. See
+             * [[project-snapshot-wipes-inflight-query]]. */
             if (!addr_query_pending) {
                 query_count = 0;
                 pending_query_start = 0;
@@ -1575,29 +1451,20 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                             ? collect_missing_addresses() : 0;
             }
 
-            /* DIAG v0.18.10: throttled 2s — reduce Serial pressure. */
+            /* Throttled snapshot diagnostic — 2s cadence keeps Serial
+             * pressure low while giving a heartbeat that SNAPshots are
+             * arriving and what state they're in. */
             if (state == STATE_ACTIVE) {
                 static uint32_t last_snap_diag = 0;
                 uint32_t now_sd = millis();
                 if (now_sd - last_snap_diag >= 2000) {
                     last_snap_diag = now_sd;
-                    Serial.printf("DEBUG=SNAP_HDR exit: n_missing=%u query_count=%u peek_miss=%u first_qa=%08lX\r\n",
+                    Serial.printf("DEBUG=SNAP_HDR n_missing=%u qc=%u peek_miss=%u first_qa=%08lX\r\n",
                                   (unsigned)n_missing, (unsigned)query_count,
                                   (unsigned)peek_miss_count,
                                   query_count > 0 ? (unsigned long)query_addrs[0] : 0UL);
                 }
             }
-
-            /* Padding for SNAPSHOT response = ra-module's SNAPSHOT request size.
-             * GC writes 4 (gc_hdr) + 6 (snap_hdr) + count (values) = 10+count
-             * bytes during its write phase; ESP32 must clock out exactly that
-             * many filler bytes before the response header so GC's read phase
-             * lands on the esp_header.magic. Without this pad, the SNAPSHOT
-             * response is dropped on the floor (ra-module reads garbage past
-             * its own write tail) and ADDR_QUERY never reaches the GC side. */
-            const size_t SNAP_REQ_LEN = sizeof(ra_gc_header_t)
-                                      + sizeof(ra_snapshot_header_t)
-                                      + count;
 
             // Build response
             ra_esp_header_t resp;
@@ -1605,18 +1472,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             resp.status      = (uint8_t)state;
             resp.event_count = has_pending_event() ? 1 : 0;
 
-            /* Save snapshot request length so ADDR_RESPONSE handler can
-             * pad subsequent ADDR_QUERY responses with the same width
-             * (the GC's response read for ADDR_RESPONSE has the same
-             * write-then-read shape as SNAPSHOT — ra-module is built
-             * to always read a fixed 1024 bytes regardless of cmd). */
-            last_snap_req_len = SNAP_REQ_LEN;
-
             /* Phase A.5 — REMOVE has top priority. evict_lru() queued
              * specific addresses to drop; emit them so ra-module can
-             * defrag in lockstep. Canonical pad for ra-module's NEXT TX
-             * (= 10 + ra_module_expected_count, already decremented by
-             * evict_lru when it filled pending_remove_*). */
+             * defrag in lockstep. */
             if (pending_remove_count > 0) {
                 uint16_t n = pending_remove_count;
                 uint16_t data_len = sizeof(ra_watchlist_remove_t) + n * 4;
@@ -1635,35 +1493,13 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 memcpy(buf + sizeof(evt), &wr, sizeof(wr));
                 memcpy(buf + sizeof(evt) + sizeof(wr),
                        pending_remove_addrs, n * 4);
-                /* Phase A.5 canonical padding (CORRECTED): pad with CURRENT
-                 * ra-module count = SNAP_REQ_LEN (= 10 + count from this
-                 * SNAPSHOT). ra-module's NEXT TX is still using OLD count
-                 * because it parses REMOVE AFTER reading. Update
-                 * last_snap_req_len for subsequent responses. */
-                send_padded_response(buf, sizeof(evt) + data_len, SNAP_REQ_LEN);
-                last_snap_req_len = sizeof(ra_gc_header_t)
-                                  + sizeof(ra_snapshot_header_t)
-                                  + ra_module_expected_count;
-                Serial.printf("DEBUG=Sent WATCHLIST_REMOVE n=%u (ra_expected_post=%u, esp_watch=%u)\r\n",
-                              (unsigned)n, (unsigned)ra_module_expected_count,
-                              (unsigned)watch_count);
+                send_response(buf, sizeof(evt) + data_len);
+                Serial.printf("DEBUG=Sent WATCHLIST_REMOVE n=%u (esp_watch=%u)\r\n",
+                              (unsigned)n, (unsigned)watch_count);
                 pending_remove_count = 0;
-                snap_post_remove_armed = true;
-                snap_post_remove_expected = ra_module_expected_count;
                 new_snapshot = true;
                 break;
             }
-
-            /* DIAG v0.18.8: log the path SNAP_HDR takes — REMOVE/APPEND/
-             * ADDR_QUERY/ACK. Critical for finding the multi-pass freeze. */
-            const char *path =
-                (pending_remove_count > 0) ? "REMOVE-already-emitted"
-                : (n_missing > 0) ? "ADDR_QUERY"
-                : (g_watchlist_pending) ? "WATCHLIST_UPDATE"
-                : "ACK";
-            Serial.printf("DEBUG=SNAP_HDR path=%s aqp_entry=%d aqp_now=%d n_missing=%u qc=%u\r\n",
-                          path, (int)aqp_at_entry, (int)addr_query_pending,
-                          (unsigned)n_missing, (unsigned)query_count);
 
             if (n_missing > 0) {
                 /* Multi-pass round 1: send ADDR_QUERY for the addresses we
@@ -1673,7 +1509,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                  * fires. Convergence ends when collect returns 0. */
                 pending_query_start = 0;
                 addr_query_iter_count = 1;
-                send_addr_query_response(SNAP_REQ_LEN);
+                send_addr_query_response();
             } else if (g_watchlist_pending) {
                 // Notify GC: new watchlist ready
                 uint16_t num_chunks = RA_WATCHLIST_NUM_CHUNKS(g_watchlist_count);
@@ -1685,7 +1521,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 uint8_t buf[sizeof(ra_esp_header_t) + sizeof(notify)];
                 memcpy(buf, &resp, sizeof(resp));
                 memcpy(buf + sizeof(resp), &notify, sizeof(notify));
-                send_padded_response(buf, sizeof(buf), SNAP_REQ_LEN);
+                send_response(buf, sizeof(buf));
                 new_snapshot = true;  // no missing addrs, process immediately
             } else {
                 // No missing addresses, no watchlist update. Process immediately.
@@ -1697,12 +1533,12 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     uint8_t buf[sizeof(ra_esp_header_t) + RA_MAX_RESPONSE_DATA];
                     memcpy(buf, &resp, sizeof(resp));
                     memcpy(buf + sizeof(resp), (void*)evt->data, evt->data_len);
-                    send_padded_response(buf, sizeof(resp) + evt->data_len, SNAP_REQ_LEN);
+                    send_response(buf, sizeof(resp) + evt->data_len);
                     pop_event();
                 } else {
                     resp.event_type = RA_EVT_NONE;
                     resp.data_len   = 0;
-                    send_padded_response((uint8_t*)&resp, sizeof(resp), SNAP_REQ_LEN);
+                    send_response((uint8_t*)&resp, sizeof(resp));
                 }
             }
             break;
@@ -1720,16 +1556,19 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             uint16_t resp_count = ra_be16_to_host(ar->addr_count);
             const uint8_t *resp_values = rx_data + sizeof(ra_gc_header_t) + sizeof(ra_addr_response_t);
 
-            /* DIAG v0.18.8: UNTHROTTLED — log every ADDR_RESP entry so we
-             * can correlate exactly which round the freeze happens in. */
+            /* Throttled trace — useful when multi-pass is active. At 1s
+             * cadence we see the rounds firing during chain discovery but
+             * stay silent in steady state. */
             {
-                Serial.printf("DEBUG=<<ADDR_RESP entry: aqp=%d qc=%u pending_start=%u resp_count=%u first_qa=0x%08lX peek_miss=%u iter=%u\r\n",
-                              (int)addr_query_pending,
-                              (unsigned)query_count, (unsigned)pending_query_start,
-                              (unsigned)resp_count,
-                              query_count > 0 ? (unsigned long)query_addrs[0] : 0UL,
-                              (unsigned)peek_miss_count,
-                              (unsigned)addr_query_iter_count);
+                static uint32_t last_resp_log = 0;
+                uint32_t now_resp = millis();
+                if (now_resp - last_resp_log >= 1000) {
+                    last_resp_log = now_resp;
+                    Serial.printf("DEBUG=<<ADDR_RESP qc=%u resp_count=%u iter=%u first_qa=0x%08lX\r\n",
+                                  (unsigned)query_count, (unsigned)resp_count,
+                                  (unsigned)addr_query_iter_count,
+                                  query_count > 0 ? (unsigned long)query_addrs[0] : 0UL);
+                }
             }
 
             /* Values land at the offset where the most recent round of
@@ -1740,17 +1579,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             }
 
             addr_query_pending = false;
-            Serial.printf("DEBUG=  aqp <- false (ADDR_RESP processed)\r\n");
-
-            /* Padding for the ack/next-query response. ra-module v0.15+
-             * pads ALL its writes to the SNAPSHOT canonical length so
-             * the read offset stays stable regardless of which command
-             * was last sent. We MUST mirror that here: pad with
-             * last_snap_req_len, NOT the actual ADDR_RESPONSE request
-             * size (which would be smaller). See [[project-ra-module-
-             * write-len-padding]] for the architectural rationale. */
-            const size_t ADDR_RESP_REQ_LEN = last_snap_req_len;
-            (void)resp_count;  /* no longer used for padding */
+            (void)resp_count;  /* parsed above but unused after Phase B */
 
             /* Run next convergence pass — peek_from_snapshot now sees
              * the values we just received, so deeper pointer chains
@@ -1764,7 +1593,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 /* Another round needed — send ADDR_QUERY for just the
                  * new addresses. ra-module sees event_type=ADDR_QUERY
                  * and loops back with another ADDR_RESPONSE. */
-                send_addr_query_response(ADDR_RESP_REQ_LEN);
+                send_addr_query_response();
             } else {
                 /* Converged (or iteration cap hit). Commit query_addrs/
                  * query_values to the permanent watchlist FIRST, THEN set
@@ -1803,9 +1632,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 /* Phase A.5 — REMOVE takes priority over WATCHLIST_APPEND.
                  * If watchlist_append() crossed HIGH_WATER it called
                  * evict_lru() which queued specific addresses in
-                 * pending_remove_addrs[]. Emit REMOVE with canonical pad
-                 * for ra-module's NEXT TX (= 10 + ra_module_expected_count
-                 * which evict_lru already decremented). */
+                 * pending_remove_addrs[]. */
                 if (pending_remove_count > 0) {
                     uint16_t n = pending_remove_count;
                     uint16_t data_len = sizeof(ra_watchlist_remove_t) + n * 4;
@@ -1824,24 +1651,10 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     memcpy(buf + sizeof(evt), &wr, sizeof(wr));
                     memcpy(buf + sizeof(evt) + sizeof(wr),
                            pending_remove_addrs, n * 4);
-                    /* Phase A.5 canonical padding (CORRECTED): pad with the
-                     * CURRENT ra-module count (= ADDR_RESP_REQ_LEN). NOTE:
-                     * evict_lru() already decremented ra_module_expected_count
-                     * by n. So the CURRENT (pre-REMOVE-parse) ra-module count
-                     * is (ra_module_expected_count + n). We use ADDR_RESP_REQ_LEN
-                     * which was last_snap_req_len set by SNAPSHOT — that's
-                     * pre-REMOVE count (because SNAPSHOT was processed before
-                     * we called evict_lru in watchlist_append). */
-                    send_padded_response(buf, sizeof(evt) + data_len, ADDR_RESP_REQ_LEN);
-                    last_snap_req_len = sizeof(ra_gc_header_t)
-                                      + sizeof(ra_snapshot_header_t)
-                                      + ra_module_expected_count;
-                    Serial.printf("DEBUG=CONVERGE sending WATCHLIST_REMOVE n=%u (ra_expected_post=%u, esp_watch=%u)\r\n",
-                                  (unsigned)n, (unsigned)ra_module_expected_count,
-                                  (unsigned)watch_count);
+                    send_response(buf, sizeof(evt) + data_len);
+                    Serial.printf("DEBUG=CONVERGE WATCHLIST_REMOVE n=%u (esp_watch=%u)\r\n",
+                                  (unsigned)n, (unsigned)watch_count);
                     pending_remove_count = 0;
-                    snap_post_remove_armed = true;
-                    snap_post_remove_expected = ra_module_expected_count;
                 } else if (new_addr_count > 0) {
                     static uint32_t last_app_log = 0;
                     uint32_t now_a = millis();
@@ -1884,28 +1697,16 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                         uint32_t a = ra_host_to_be32(watch_addresses[base_idx + i]);
                         memcpy(addr_dst + i * 4, &a, 4);
                     }
-                    /* Phase A.5 canonical padding (CORRECTED): pad with the
-                     * CURRENT ra-module count (= last_snap_req_len). ra-module
-                     * READS this APPEND with its TX still at the OLD width —
-                     * it only grows its count AFTER parsing this response.
-                     * Update expected_count AFTER the emit so subsequent
-                     * responses (which ra-module reads in later txs, post-
-                     * APPEND-parse) use the new width. */
-                    send_padded_response(buf, sizeof(evt) + data_len, ADDR_RESP_REQ_LEN);
-                    ra_module_expected_count += new_addr_count;
-                    last_snap_req_len = sizeof(ra_gc_header_t)
-                                      + sizeof(ra_snapshot_header_t)
-                                      + ra_module_expected_count;
+                    send_response(buf, sizeof(evt) + data_len);
                 } else {
-                    /* No new addrs to announce — plain ack. ra-module's
-                     * count doesn't change so pad = 10 + expected_count. */
+                    /* No new addrs to announce — plain ack. */
                     ra_esp_header_t ack;
                     ack.magic       = RA_MAGIC_ESP_TO_GC;
                     ack.status      = (uint8_t)state;
                     ack.event_type  = RA_EVT_NONE;
                     ack.event_count = 0;
                     ack.data_len    = 0;
-                    send_padded_response((uint8_t*)&ack, sizeof(ack), ADDR_RESP_REQ_LEN);
+                    send_response((uint8_t*)&ack, sizeof(ack));
                 }
 
                 if (addr_query_iter_count >= ADDR_QUERY_MAX_ITERATIONS && new_missing > 0) {
@@ -2239,7 +2040,6 @@ static void watchlist_update_if_changed(uint32_t new_count) {
      * region and is LRU-evictable. */
     static_watch_count = expanded;
     pending_remove_count = 0;
-    ra_module_expected_count = expanded;  /* truth at boot */
     lru_clock = 1;
 
     // Publish into dedicated watchlist buffer for chunked delivery
@@ -2258,9 +2058,8 @@ static void watchlist_update_if_changed(uint32_t new_count) {
  * [static_watch_count..watch_count-1] with the SMALLEST last_used_frame
  * values (= least recently touched). Removes them from the hash, defrags
  * watch_addresses/memory_data/last_used_frame (shifts survivors down),
- * queues their addresses (BE-encoded) in pending_remove_addrs[] for
- * emission via RA_EVT_WATCHLIST_REMOVE, and updates ra_module_expected_count
- * so subsequent canonical padding aligns with ra-module's post-REMOVE TX.
+ * and queues their addresses (BE-encoded) in pending_remove_addrs[] for
+ * emission via RA_EVT_WATCHLIST_REMOVE.
  *
  * Static entries (last_used_frame == LRU_PROTECTED) are NEVER picked,
  * preserving chain[0]/chain[1] byte-fanouts that the trigger evaluator
@@ -2296,7 +2095,7 @@ static void evict_lru(void) {
 
     /* Queue evicted addresses in BE wire order BEFORE defrag (otherwise
      * indices shift). Dedup as we go AND log any duplicates found —
-     * the off-by-N forensic loop (v0.19.3-60hz showed exact off-by-2
+     * the off-by-N forensic loop (v0.21.0-cleanup showed exact off-by-2
      * even at 10Hz so it can't be a timing race; if duplicates exist in
      * watch_addresses they'd show up here). */
     pending_remove_count = 0;
@@ -2367,7 +2166,7 @@ static void evict_lru(void) {
      * watchlist_append to add duplicates of already-present addresses,
      * which then propagated into pending_remove_addrs as duplicates, then
      * into REMOVE events that ra-module could only partially honor →
-     * silent off-by-N desync after eviction (observed v0.19.3-60hz 2026-06-01,
+     * silent off-by-N desync after eviction (observed v0.21.0-cleanup 2026-06-01,
      * off-by-2 froze multi-pass). Instead, REBUILD the hash from scratch
      * after the defrag completes. O(N) but N≤1024 → ~50µs. */
     uint16_t write_idx = dyn_start;
@@ -2390,20 +2189,9 @@ static void evict_lru(void) {
         hash_insert(watch_addresses[i], i);
     }
 
-    /* Update ra-module expected count — ra-module will shrink by the same N
-     * when it parses REMOVE. */
-    ra_module_expected_count -= pending_remove_count;
-
-    /* Clear reject_set — addresses that hit reject before might be valid
-     * now that there's room (not strictly needed in v0.18 since we no
-     * longer mark_rejected in watchlist_append). */
-    reject_count = 0;
-    reject_write_idx = 0;
-
-    Serial.printf("DEBUG=evict_lru: %u → %u (dropped %u dynamic, ra_expected=%u)\r\n",
+    Serial.printf("DEBUG=evict_lru: %u → %u (dropped %u dynamic)\r\n",
                   (unsigned)before, (unsigned)write_idx,
-                  (unsigned)pending_remove_count,
-                  (unsigned)ra_module_expected_count);
+                  (unsigned)pending_remove_count);
 }
 
 // ============================================================================
@@ -2734,7 +2522,7 @@ void taskCore1(void *pvParameters) {
             int cs = gpio_get_level((gpio_num_t)EXI_PIN_CS);
             /* Echo firmware version + build stamp in every heartbeat so we can
              * confirm a flashed binary is current without needing the boot log. */
-            Serial.printf("DEBUG=fw v0.19.3-60hz build=%s %s\n", __DATE__, __TIME__);
+            Serial.printf("DEBUG=fw v0.21.0-cleanup build=%s %s\n", __DATE__, __TIME__);
             Serial.printf("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d\n",
                           cs, (unsigned long)exi_spi_get_transaction_count(),
                           (unsigned long)exi_spi_get_total_bytes_rx(), (int)state);
@@ -2805,7 +2593,7 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    Serial.printf("WII-RA-ADAPTER v0.19.3-60hz (build %s %s)\n", __DATE__, __TIME__);
+    Serial.printf("WII-RA-ADAPTER v0.21.0-cleanup (build %s %s)\n", __DATE__, __TIME__);
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {

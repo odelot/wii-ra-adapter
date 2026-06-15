@@ -583,9 +583,27 @@ static bool mut_deliver_next(void) {
 #else
 #define WATCHLIST_HIGH_WATER 4608   /* v0.31: 75% of RA_MAX_WATCH_ADDRS=6144 — eviction trigger (was 5888, ~never hit before the cap froze the list) */
 #endif
+
+/* v0.32.1 PERIODIC GARBAGE COLLECTOR. Two eviction modes now:
+ *   - PRESSURE (watch_count > WATCHLIST_HIGH_WATER): emergency, reclaim half,
+ *     relax age 1800→120→30. Unchanged.
+ *   - PERIODIC GC (every GC_PERIOD_FRAMES): gentle, remove ONLY entries cold
+ *     for ≥ GC_MIN_AGE (genuine dead weight). No target/relax — evicts nothing
+ *     if nothing is that cold (cheap scan + early return, no hash rebuild).
+ * Keeps the watchlist lean BELOW the high-water so snapshots stay small (less
+ * EXI stress, smaller upd) without the aggressive half-dump.
+ * NOTE on units: lru_clock ticks one per GAME FRAME (~60Hz), so 600 frames ≈
+ * 10s and 3600 ≈ 1 min. The period is a cheap CHECK every ~10s; the age floor
+ * is ~1 real minute (genuinely dead → minimal churn, matches "garbage
+ * collector"). Both tunable; drop GC_MIN_AGE toward 600 for a leaner-but-
+ * churnier list, raise it to trim less. */
+#define GC_PERIOD_FRAMES 600u   /* run the periodic GC every ~10s of game frames */
+#define GC_MIN_AGE       3600u  /* periodic GC evicts entries cold for ≥ ~1 min */
+
 /* Forward decl. evict_lru lives near watchlist_update_if_changed; the trigger
- * is at the SNAPSHOT handler (converged state, before resolution) since v0.31. */
-static void evict_lru(void);
+ * is at the SNAPSHOT handler (converged state, before resolution) since v0.31.
+ * pressure=true → HIGH_WATER emergency; pressure=false → periodic GC. */
+static void evict_lru(bool pressure);
 
 // Prefetch and watchlist state — used for two-pass processing
 #define PREFETCH_MAX 4096   /* rc_memrefs_get_addresses returns (addr,size) pairs; 1024 was too small for SSBM, 2048 risky for SMG's 119-cheevo set (silent truncation = permanently-missing addrs) */
@@ -1598,10 +1616,10 @@ static void json_keep_first_set(PsramStream &buf) {
  * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
  * ─────────────────────────────────────────────────────────────────────── */
 #ifndef CAP_TOTAL_OPERATIONS
-#define CAP_TOTAL_OPERATIONS 1            // 1 = on, 0 = keep every achievement
+#define CAP_TOTAL_OPERATIONS 0            // 1 = on, 0 = keep every achievement
 #endif
 #ifndef MAX_TOTAL_OPERATIONS
-#define MAX_TOTAL_OPERATIONS 16000        // target ceiling (~half of SMG's 32768)
+#define MAX_TOTAL_OPERATIONS 13000        // target ceiling (~half of SMG's 32768)
 #endif
 
 /* Count rcheevos "operations" (conditions) in one achievement object's
@@ -2614,9 +2632,22 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                  * The REMOVE ships via the existing convergence mut_deliver; the
                  * seq machinery drains multi-batch in order. Only fires under
                  * watchlist pressure — light games (Kirby ~978 << 4608) never
-                 * hit it. d2x unchanged (REMOVE_IDX handler already in v0.30). */
-                if (state == STATE_ACTIVE && watch_count > WATCHLIST_HIGH_WATER) {
-                    evict_lru();
+                 * hit it. d2x unchanged (REMOVE_IDX handler already in v0.30).
+                 *
+                 * v0.32.1 — TWO triggers now, same safe (converged, pre-
+                 * resolution) placement. PRESSURE first (emergency half-dump);
+                 * else the PERIODIC GC every GC_PERIOD_FRAMES (gentle dead-weight
+                 * sweep, age ≥ GC_MIN_AGE). last_gc_frame resets on either so the
+                 * GC clock restarts after a pressure dump too. */
+                if (state == STATE_ACTIVE) {
+                    static uint32_t last_gc_frame = 0;
+                    if (watch_count > WATCHLIST_HIGH_WATER) {
+                        evict_lru(true);            /* pressure: reclaim half */
+                        last_gc_frame = frame_counter;
+                    } else if ((uint32_t)(frame_counter - last_gc_frame) >= GC_PERIOD_FRAMES) {
+                        last_gc_frame = frame_counter;
+                        evict_lru(false);           /* periodic GC: dead weight only */
+                    }
                 }
                 query_count = 0;
                 pending_query_start = 0;
@@ -3223,14 +3254,12 @@ static void watchlist_update_if_changed(uint32_t new_count) {
  * preserving chain[0]/chain[1] byte-fanouts that the trigger evaluator
  * depends on. Insertion order of survivors is preserved → ra-module's
  * single-pass index compaction arrives at the same array. */
-static void evict_lru(void) {
+static void evict_lru(bool pressure) {
     if (watch_count <= static_watch_count) return;
 
     uint16_t dyn_start = static_watch_count;
     uint16_t dyn_count = watch_count - dyn_start;
     if (dyn_count == 0) return;
-
-    g_vblank_stats.had_cleanup = 1;  /* signal per-vblank stats */
 
     /* v0.26.3 — RECLAIM HALF, ADAPTIVELY. The v0.25 single-256-batch +
      * fixed 10s age floor lost the race on SMG: galaxy transitions append
@@ -3253,21 +3282,34 @@ static void evict_lru(void) {
      * Values are tombstoned so a later re-touch peeks the last real
      * value instead of 0. */
     #define EVICT_MUT_MAX 4   /* ≤4 mutations per call; MUT_RING=8 keeps room for appends */
-    uint16_t target = dyn_count / 2;
-    if (target < EVICT_BATCH_SIZE) target = EVICT_BATCH_SIZE;
-    if (target > EVICT_BATCH_SIZE * EVICT_MUT_MAX)
+    uint16_t target;
+    uint32_t age_tiers[3];
+    int num_tiers;
+    if (pressure) {
+        /* HIGH_WATER emergency: reclaim HALF, relaxing age under pressure.
+         * Top tier 1800 (30s-cold); relaxes to 2s/0.5s only under burst
+         * pressure (cap safety, per the v0.26.3 "galaxy appends thousands
+         * young" lesson). */
+        target = dyn_count / 2;
+        if (target < EVICT_BATCH_SIZE) target = EVICT_BATCH_SIZE;
+        if (target > EVICT_BATCH_SIZE * EVICT_MUT_MAX)
+            target = EVICT_BATCH_SIZE * EVICT_MUT_MAX;
+        age_tiers[0] = 1800u; age_tiers[1] = 120u; age_tiers[2] = 30u;
+        num_tiers = 3;
+    } else {
+        /* Periodic GC: a SINGLE age floor (GC_MIN_AGE), NO target and NO
+         * relaxation. Evicts every dead-weight entry up to the per-call cap;
+         * if none qualifies, the scan finds nothing and we early-return below
+         * (no hash rebuild = no soluço). */
         target = EVICT_BATCH_SIZE * EVICT_MUT_MAX;
-
-    /* v0.31: top tier 1800 (30s-cold, user-specified conservative floor — an
-     * addr unread for 30s is almost certainly dead; avoids churning level-cycle
-     * addrs that return within ~10-30s). Relaxes to 2s/0.5s only under burst
-     * pressure (cap safety, per the v0.26.3 "galaxy appends thousands young" lesson). */
-    uint32_t age_tiers[3] = { 1800u, 120u, 30u };
+        age_tiers[0] = GC_MIN_AGE;
+        num_tiers = 1;
+    }
     uint16_t evicted_total = 0;
     uint16_t mutations = 0;
     uint16_t before_all = watch_count;
 
-    for (int tier = 0; tier < 3 && evicted_total < target
+    for (int tier = 0; tier < num_tiers && evicted_total < target
                        && mutations < EVICT_MUT_MAX; tier++) {
         uint32_t min_age = age_tiers[tier];
 
@@ -3352,10 +3394,14 @@ static void evict_lru(void) {
     }
 
     if (evicted_total == 0) {
-        LOG_DBG("DEBUG=evict_lru: nothing evictable (dyn=%u, all age<%u)\r\n",
-                (unsigned)dyn_count, (unsigned)age_tiers[2]);
+        /* Common for the periodic GC in steady state — nothing is dead yet.
+         * No hash rebuild past this point, so this path is cheap (no soluço). */
+        LOG_DBG("DEBUG=evict_lru[%s]: nothing evictable (dyn=%u, all age<%u)\r\n",
+                pressure ? "press" : "gc",
+                (unsigned)dyn_count, (unsigned)age_tiers[num_tiers - 1]);
         return;
     }
+    g_vblank_stats.had_cleanup = 1;  /* cln=1 only when we actually evicted */
     /* v0.31.1: rebuild the hash ONCE after all batches, not per-batch. Only the
      * final array needs a correct hash (before the next collect_missing /
      * read_memory); the batches in between never hash_lookup. Cuts the ~40ms
@@ -3363,7 +3409,8 @@ static void evict_lru(void) {
     hash_clear();
     for (uint16_t i = 0; i < watch_count; i++)
         hash_insert(watch_addresses[i], i);
-    LOG_DBG("DEBUG=evict_lru: %u → %u (dropped %u in %u mutations, target=%u, seq=%u)\r\n",
+    LOG_DBG("DEBUG=evict_lru[%s]: %u → %u (dropped %u in %u mutations, target=%u, seq=%u)\r\n",
+            pressure ? "press" : "gc",
             (unsigned)before_all, (unsigned)watch_count,
             (unsigned)evicted_total, (unsigned)mutations,
             (unsigned)target, (unsigned)wl_seq);
@@ -4073,7 +4120,7 @@ void taskCore1(void *pvParameters) {
             int cs = gpio_get_level((gpio_num_t)EXI_PIN_CS);
             /* Echo firmware version + build stamp in every heartbeat so we can
              * confirm a flashed binary is current without needing the boot log. */
-            LOG_DBG("DEBUG=fw v0.32.0-gate build=%s %s\n", __DATE__, __TIME__);
+            LOG_DBG("DEBUG=fw v0.32.2-wsteal build=%s %s\n", __DATE__, __TIME__);
             LOG_DBG("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d | heap=%u maxblk=%u\n",
                     cs, (unsigned long)exi_spi_get_transaction_count(),
                     (unsigned long)exi_spi_get_total_bytes_rx(), (int)state,
@@ -4199,7 +4246,7 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    Serial.printf("WII-RA-ADAPTER v0.32.0-gate (build %s %s)\n", __DATE__, __TIME__);
+    Serial.printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {

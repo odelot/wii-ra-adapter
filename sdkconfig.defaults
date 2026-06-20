@@ -1,0 +1,94 @@
+# =============================================================================
+# wii-ra-adapter  —  ESP-IDF v5.1 / arduino-esp32 3.0.x  —  ESP32-S3-WROOM-1 N16R8
+#
+# STAGE 1 (this file): replicate the Arduino build config EXACTLY (data cache
+# still 32KB/32B). Goal: prove the IDF build runs identical to v0.32.2-wsteal
+# (60fps @ 13k, achievement unlocks). NO perf change expected here.
+#
+# STAGE 2: flip CONFIG_ESP32S3_DATA_CACHE -> 64KB + LINE_64B (the whole point —
+# the ~42KB of memref values thrash a 32KB cache but fit a 64KB one).
+#
+# Values mirrored from arduino-esp32 3.0.7 sdkconfig (idf-release_v5.1).
+# =============================================================================
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Flash: 16MB, QIO. STAGE 3: 80->120MHz. NOT a perf goal — it's a HARD
+#     co-requirement of PSRAM 120MHz: octal PSRAM @120M runs DTR, which forces
+#     the shared MSPI core clock to 240MHz; flash & PSRAM share that core clock,
+#     and IDF only ships a flash timing-tuning table for the 240M-core/120M-flash
+#     combo (none for 240M-core/80M-flash) -> build error without this. Flash 120M
+#     is also experimental (gated behind IDF_EXPERIMENTAL_FEATURES, set below). ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# 2026-06-18: TEMPORARILY back to 120M as a DETERMINISTIC-REPRO tool for the galaxy
+# deadlock investigation (80M makes it intermittent; 120M "always froze"). The
+# WDOG-FREEZE forensics validate it's the SAME deadlock (bad-magic=0 + srv=+0) and
+# not 120M wire corruption (bad-magic flood). Co-req of PSRAM 120M (see note above).
+# Revert to _80M when done unless the deadlock fix makes 120M stable (perf bonus).
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+
+# --- PSRAM: N16R8 = Octal (OPI) 8MB. STAGE 3: 80->120MHz (1.5x bandwidth, the
+#     lever for the eval's 763KB condition-struct streaming). EXPERIMENTAL on
+#     octal — the 120M choice is gated behind IDF_EXPERIMENTAL_FEATURES; timing
+#     margins are tight, so watch for instability (revert to SPEED_80M if flaky). ---
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+# 2026-06-18: 120M re-enabled for deterministic deadlock repro (see flash note).
+CONFIG_SPIRAM_SPEED_120M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# CRITICAL mem-balance — the .ino's SRAM/PSRAM tuning (and the mbedTLS handshake
+# headroom) was built against these EXACT values. Do not change in stage 1.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+
+# --- Caches — STAGE 2: data cache 32->64KB + line 32->64B (the whole point of
+#     the IDF migration). The ~84KB of SMG memref values thrash a 32KB cache;
+#     64KB holds ~76% → fewer random-access misses on upd + the eval's memref
+#     reads. Instruction cache left at the Arduino default (16KB/32B). ---
+CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+# --- Partition table: 3MB APP / 9.9MB FATFS ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Arduino as component: autostart setup()/loop() ---
+CONFIG_AUTOSTART_ARDUINO=y
+CONFIG_ARDUINO_LOOP_STACK_SIZE=8192
+
+# --- FreeRTOS 1000 Hz tick (Arduino millis()/delay() semantics) ---
+CONFIG_FREERTOS_HZ=1000
+
+# --- CPU 240 MHz ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Console UART baud = 250000 to match the app's Serial.begin(250000), so the
+#     IDF boot/ESP_LOG output and the Arduino app logs share one baud (one monitor
+#     baud for everything; the ROM's first line stays 115200 — unavoidable). ---
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=250000
+
+# --- Task watchdog: DON'T watch IDLE on CPU1 (matches Arduino, which only checks
+#     CPU0). The loopTask runs on CPU1 and legitimately hogs it for >5s during the
+#     full-SMG achievement parse (rc_client_copy_achievements: 32k conditions) and
+#     for the ~30ms do_frame — starving IDLE1 is expected, not a fault. ---
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# --- Compiler: -Os to match Arduino in stage 1 (try -O2 as a later experiment) ---
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# --- TLS for HTTPClient (RetroAchievements server over HTTPS) ---
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# PSK ciphersuites — arduino-esp32's ssl_client.cpp (NetworkClientSecure, used by
+# HTTPClient for HTTPS) compiles its ENTIRE implementation only when a PSK key-
+# exchange is enabled; without these the SSL symbols are absent → link errors
+# (undefined start_ssl_client/ssl_init/...). Matches the Arduino default config.
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_PSK=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_RSA_PSK=y

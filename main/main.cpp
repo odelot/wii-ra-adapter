@@ -249,7 +249,7 @@ static void ralog_drain_task(void *pv) {
  * normal operation, yet every spike comes with full before/after context.
  * Toggle RA_FLIGHT_RECORDER 0 to revert to always-print. ~3KB .bss. */
 #ifndef RA_FLIGHT_RECORDER
-#define RA_FLIGHT_RECORDER 0
+#define RA_FLIGHT_RECORDER 1
 #endif
 #if RA_FLIGHT_RECORDER
 #include <stdarg.h>
@@ -1850,19 +1850,19 @@ static void json_keep_first_set(PsramStream &buf) {
  *
  * Run AFTER every other strip, this pass removes achievements from the
  * HEAVIEST (most operations) to the lightest until the running total drops
- * to <= MAX_TOTAL_OPERATIONS (~13000, about half of SMG), buying frame
+ * to <= MAX_TOTAL_OPERATIONS (~20000, ~60% of SMG), buying frame
  * headroom at the cost of a handful of the most expensive achievements.
- * It prints how many were dropped.
+ * It logs (INFO) how many were dropped and names each one.
  *
  * Operation count = conditions in MemAddr: +1 per '_' (AND within a group),
  * +1 per 'S' group separator (NOT the '0xS' bit6 size prefix — that S is
  * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
  * ─────────────────────────────────────────────────────────────────────── */
 #ifndef CAP_TOTAL_OPERATIONS
-#define CAP_TOTAL_OPERATIONS 0            // 1 = on, 0 = keep every achievement
+#define CAP_TOTAL_OPERATIONS 1            // 1 = on, 0 = keep every achievement
 #endif
 #ifndef MAX_TOTAL_OPERATIONS
-#define MAX_TOTAL_OPERATIONS 13000        // target ceiling (~half of SMG's 32768)
+#define MAX_TOTAL_OPERATIONS 20000        // target ceiling (~60% of SMG's 32768)
 #endif
 
 /* Count rcheevos "operations" (conditions) in one achievement object's
@@ -1887,6 +1887,49 @@ static int count_mem_ops(const char* data, int objStart, int objEnd) {
     return ops;
 }
 
+/* Copy the "Title" value of one achievement object's [objStart,objEnd] span into
+ * out (NUL-terminated, truncated to outsize). Used to name the achievements the
+ * op-cap drops so the INFO log lists exactly what was removed. */
+static void cap_extract_title(const char* data, int objStart, int objEnd,
+                              char* out, int outsize) {
+    static const char* KEY  = "\"Title\":\"";
+    static const int   KLEN = 9;
+    int p = -1, w = 0;
+    for (int i = objStart; i <= objEnd - KLEN; i++) {
+        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
+    }
+    if (p != -1) {
+        for (int i = p; i < objEnd && w < outsize - 1; i++) {
+            char c = data[i];
+            if (c == '\\') { if (i + 1 < objEnd && w < outsize - 1) out[w++] = data[++i]; continue; }
+            if (c == '"') break;            // closing quote → end of value
+            out[w++] = c;
+        }
+    }
+    out[w] = '\0';
+    if (w == 0) snprintf(out, outsize, "(no title)");
+}
+
+/* Achievements whose Type is "progression" (RA needs ALL) or "win_condition"
+ * (RA needs ANY) gate beaten-game / mastery detection — the op-cap must NEVER
+ * drop these, even when heavy, or the player can't get credit for finishing.
+ * The patch is whitespace-stripped before the cap runs ("Type":"progression"),
+ * but tolerate an optional space for safety. Type core/bonus/null = droppable. */
+static bool cap_is_protected(const char* data, int objStart, int objEnd) {
+    static const char* KEY  = "\"Type\":";
+    static const int   KLEN = 7;
+    int p = -1;
+    for (int i = objStart; i <= objEnd - KLEN; i++) {
+        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
+    }
+    if (p == -1) return false;
+    while (p < objEnd && (data[p] == ' ' || data[p] == '\t')) p++;
+    if (p >= objEnd || data[p] != '"') return false;   // null / non-string => droppable
+    p++;
+    return strncmp(data + p, "progression\"",  12) == 0
+        || strncmp(data + p, "win_condition\"", 14) == 0;
+}
+
 static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     json_remove_whitespace(buf);
     char* data = buf.data();
@@ -1896,13 +1939,15 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     int arrayEnd   = buf.indexOf("]", arrayStart);
     if (arrayStart == -1 || arrayEnd == -1) return;
 
-    /* Pass 1 — enumerate achievement objects: span + operation count. */
-    struct AchSpan { int start, end, ops; bool removed; };
+    /* Pass 1 — enumerate achievement objects: span + operation count + whether
+     * it's a protected (progression/win_condition) achievement the cap can't drop. */
+    struct AchSpan { int start, end, ops; bool removed; bool prot; };
     const int MAX_ACH = 512;               // SMG core = 161; generous headroom
     AchSpan* spans = (AchSpan*) ps_malloc(sizeof(AchSpan) * MAX_ACH);
     if (!spans) { LOG_ERR("ERROR=cap_ops: ps_malloc failed, skipping\r\n"); return; }
 
     int count = 0, total_ops = 0, pos = arrayStart + 1;
+    int prot_count = 0, prot_ops = 0;
     while (pos < arrayEnd && count < MAX_ACH) {
         int objStart = buf.indexOf("{", pos);
         if (objStart == -1 || objStart > arrayEnd) break;
@@ -1913,32 +1958,57 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
             else if (data[objEnd] == '}') braces--;
         }
         if (objEnd >= arrayEnd) break;
-        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false };
+        bool prot = cap_is_protected(data, objStart, objEnd);
+        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false, prot };
         total_ops += spans[count].ops;
+        if (prot) { prot_count++; prot_ops += spans[count].ops; }
         count++;
         pos = objEnd + 1;
     }
 
-    LOG_DBG("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d)\r\n",
-             count, total_ops, target_ops);
+    LOG_DBG("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d), %d protected (%d ops)\r\n",
+             count, total_ops, target_ops, prot_count, prot_ops);
     if (total_ops <= target_ops) {
         LOG_DBG("DEBUG=cap_ops: already under target, removed 0 achievements\r\n");
         free(spans);
         return;
     }
 
-    /* Pass 2 — greedily mark the heaviest achievement until the running
-     * total drops to <= target. count is small, so a simple O(n^2) max-find. */
-    int removed = 0, removed_ops = 0;
+    /* Pass 2 — greedily mark the heaviest DROPPABLE achievement until the running
+     * total drops to <= target. Protected (progression/win_condition) achievements
+     * are NEVER candidates — if only protected remain, we stop above target (better
+     * to overshoot the op budget than break beaten-game detection). O(n^2) max-find. */
+    int removed = 0, removed_ops = 0, min_removed_ops = -1;
     while (total_ops > target_ops) {
         int maxIdx = -1, maxOps = -1;
         for (int i = 0; i < count; i++)
-            if (!spans[i].removed && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
-        if (maxIdx == -1) break;           // nothing left to remove
+            if (!spans[i].removed && !spans[i].prot && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
+        if (maxIdx == -1) break;           // nothing droppable left (rest are protected)
         spans[maxIdx].removed = true;
         total_ops   -= spans[maxIdx].ops;
         removed_ops += spans[maxIdx].ops;
         removed++;
+        if (min_removed_ops < 0 || spans[maxIdx].ops < min_removed_ops) min_removed_ops = spans[maxIdx].ops;
+        /* Name each dropped achievement (INFO). data offsets are still valid here —
+         * the physical removeRange happens in Pass 3 below. Heaviest dropped first. */
+        {
+            char title[80];
+            cap_extract_title(data, spans[maxIdx].start, spans[maxIdx].end, title, sizeof(title));
+            LOG_INFO("DEBUG=cap_ops removed: \"%s\" (%d ops)\r\n", title, spans[maxIdx].ops);
+        }
+    }
+
+    /* Surface the protected achievements that protection actually saved — i.e.
+     * ones at least as heavy as the lightest we dropped, which the greedy pass
+     * WOULD have cut if they weren't progression/win_condition. */
+    if (removed > 0) {
+        for (int i = 0; i < count; i++) {
+            if (spans[i].prot && spans[i].ops >= min_removed_ops) {
+                char title[80];
+                cap_extract_title(data, spans[i].start, spans[i].end, title, sizeof(title));
+                LOG_INFO("DEBUG=cap_ops KEPT (progression/win): \"%s\" (%d ops)\r\n", title, spans[i].ops);
+            }
+        }
     }
 
     /* Pass 3 — physically delete the marked objects, HIGHEST offset first so
@@ -1954,8 +2024,9 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     }
 
     free(spans);
-    LOG_DBG("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops)\r\n",
-             removed, removed_ops, count - removed, total_ops);
+    LOG_INFO("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops), %d protected kept%s\r\n",
+             removed, removed_ops, count - removed, total_ops, prot_count,
+             (total_ops > target_ops) ? " [target unreachable — protected floor]" : "");
 }
 
 // Apply all strips to a patch.php response held in PSRAM

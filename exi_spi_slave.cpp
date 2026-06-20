@@ -18,6 +18,7 @@
 #include "exi_spi_slave.h"
 #include "driver/spi_slave.h"
 #include "driver/gpio.h"
+#include "soc/gpio_reg.h"      /* GPIO_OUT_W1TC_REG — ISR-safe INT assert */
 #include <string.h>
 #include <Arduino.h>
 
@@ -102,6 +103,23 @@ static void IRAM_ATTR spi_pre_setup_cb(spi_slave_transaction_t *trans)
 
     if (response_len > 0) {
         memcpy(tx_buf, response_buf, response_len);
+    }
+
+    /* Phase B v2 (v0.23.0): assert INT HERE, not in exi_spi_arm. This
+     * callback fires when the ESP-IDF driver has actually loaded the
+     * transaction into the SPI peripheral (registers + DMA descriptors
+     * armed), so "INT low" now means "the read CS-low may start right
+     * now". This removes the race that forced the Wii-side 1ms SETTLE
+     * sleep between wait_int and the read CS-low: previously the assert
+     * happened right after spi_slave_queue_trans() returned, which is
+     * before the driver task had armed the DMA — large responses
+     * (>=520 B) clocked out idle 0xFF instead of tx_buf.
+     *
+     * ISR context: write the w1tc register directly (gpio_set_level is
+     * not IRAM-safe). EXI_PIN_INT=14 < 32 → GPIO_OUT_W1TC_REG. */
+    if (g_response_prepared) {
+        g_response_prepared = false;
+        REG_WRITE(GPIO_OUT_W1TC_REG, 1U << EXI_PIN_INT);
     }
 }
 
@@ -276,16 +294,13 @@ void exi_spi_arm(void)
      * etc.) instead of the default_ack fallback that exi_spi_poll wrote. */
     spi_slave_queue_trans(SPI2_HOST, &current_trans, portMAX_DELAY);
 
-    /* Phase B: signal the Wii. The assert MUST come AFTER queue_trans so
-     * the SPI peripheral is genuinely armed when the Wii opens the read
-     * CS-low. If we asserted earlier the Wii could clock out stale bytes
-     * from before the queue. Only assert if a real response was prepared
-     * — otherwise we'd be telling the Wii "come read" when tx_buf is the
-     * default_ack fallback and there's nothing new to deliver. */
-    if (g_response_prepared) {
-        g_response_prepared = false;
-        gpio_set_level((gpio_num_t)EXI_PIN_INT, 0);
-    }
+    /* Phase B v2 (v0.23.0): the INT assert moved into spi_pre_setup_cb
+     * (the driver's post_setup callback), which fires only when the
+     * peripheral is genuinely armed. Asserting here — right after
+     * queue_trans returns — was too early: the driver task arms the DMA
+     * asynchronously, and the Wii (with the SETTLE sleep removed) would
+     * open the read CS-low against an unarmed slave. g_response_prepared
+     * set by prepare_response is consumed inside the callback. */
 }
 
 void exi_spi_prepare_response(const uint8_t *data, size_t len)

@@ -15,8 +15,14 @@
  *     ACTIVE so WiiFlow can detect "ready to boot" without waiting for
  *     the first SNAPSHOT.
  *
- * Core 0: loop() -> processSnapshot() -> rc_client_do_frame()
- * Core 1: taskCore1() -> processEXI() -> SPI slave communication
+ * Core layout (v0.24.0 — requires Arduino IDE: "Arduino Runs On" = Core 1;
+ * recommend "Events Run On" = Core 0):
+ *   Core 1 (realtime): loop() -> processSnapshot()/rc_client_do_frame()
+ *                      + taskCore1() -> processEXI() (SPI slave)
+ *   Core 0 (network):  WiFi/lwIP tasks + httpTask() — ALL blocking HTTP/
+ *                      TLS/JSON-strip work. server_call only enqueues;
+ *                      rc_client callbacks run on loop() via
+ *                      http_drain_done(). Core 1 never waits on the net.
  * 
  * 
  * 
@@ -39,15 +45,7 @@ Pin 3  CS   ──────────────────── GPIO10 
 Pin 4  CLK  ──────────────────── GPIO12  (EXI_PIN_CLK)
 Pin 5  DI   ──────────────────── GPIO11  (EXI_PIN_MOSI)
 Pin 6  DO   ──────────────────── GPIO13  (EXI_PIN_MISO)
-Pin 2  INT  ──── não conecta
-
-
-roxo
-laranja
-verde
-marrom
-vermelho
-preto
+Pin 2  INT  ──────────────────── GPIO14
 
 
  */
@@ -66,6 +64,7 @@ preto
 // Project headers
 #include "gc_ra_protocol.h"
 #include "exi_spi_slave.h"
+#include "ra_http.h"
 #include "wii_game_hashes.h"
 #include "driver/gpio.h"
 #include "PsramStream.h"
@@ -74,9 +73,102 @@ preto
 extern "C" {
   #include "rc_internal.h"
   const rc_memrefs_t* rc_client_get_memrefs(const rc_client_t* client);
+  /* do_frame profiling split (set in rc_client.c rc_client_do_frame):
+   * upd = rc_client_update_memref_values (resolve pointer chains),
+   * evl = condition evaluation (achievement loop). */
+  extern volatile uint32_t g_rc_update_us;
+  extern volatile uint32_t g_rc_eval_us;
+  /* v0.29.1 — parallel-eval diag: a=core-1 half, b=core-0 worker half, runs=worker fires. */
+  extern volatile uint32_t g_par_a_us;
+  extern volatile uint32_t g_par_b_us;
+  extern volatile uint32_t g_par_runs;
+  /* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
+   * rc_client_do_frame runs the memref UPDATE, then calls g_rc_doframe_primed_cb;
+   * if it returns 0 it rolls the values back (into save_buf) and sets
+   * g_rc_doframe_deferred=1 WITHOUT evaluating any condition. */
+  uint32_t rc_client_memref_count(const rc_client_t* client);
+  extern int (*g_rc_doframe_primed_cb)(void);
+  extern rc_memref_value_t* g_rc_doframe_save_buf;
+  extern uint32_t g_rc_doframe_save_cap;
+  extern volatile int g_rc_doframe_gate_enabled;
+  extern volatile int g_rc_doframe_deferred;
 }
 
 #define DEBUG 1
+
+/* ----------------------------------------------------------------------
+ * Log levels (v0.24.1). Serial is SHARED by all tasks on both cores and
+ * the UART drains at 250000 baud ≈ 25 KB/s; when the TX ring buffer
+ * fills, Serial.printf BLOCKS the calling task — including the EXI task
+ * and loop() on Core 1. The award/load windows used to burst hundreds of
+ * chars (URLs, HTTP bodies, rcheevos verbose, KIRBY diag) and that burst
+ * showed up as dropped SNAP fires ("Serial pressure breaks SPI timing").
+ *
+ *   0 = errors only
+ *   1 = info: heartbeat, state transitions, milestones (default)
+ *   2 = debug: HTTP traces, rcheevos verbose, KIRBY chain diag, SNAP_HDR
+ *
+ * Raise to 2 only while investigating. Combined with the enlarged UART
+ * TX buffer in setup(), level 1 keeps hot windows burst-free. */
+#ifndef RA_LOG_LEVEL
+#define RA_LOG_LEVEL 0
+#endif
+#define LOG_ERR(...)  do { Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_INFO(...) do { if (RA_LOG_LEVEL >= 1) Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_DBG(...)  do { if (RA_LOG_LEVEL >= 2) Serial.printf(__VA_ARGS__); } while (0)
+
+/* LOG_FRAME: per-vblank summary line (one per processed frame).
+ * Emitted independently of RA_LOG_LEVEL.
+ * "Minimum-noise" mode: RA_LOG_LEVEL 0  +  RA_LOG_FRAME_STATS 1.
+ *
+ * Fields printed:
+ *   seq    - frame sequence number (PPC VBI counter, sent by d2x)
+ *   ok     - Phase D2 integrity: seq+count matched, values accepted (1=ok, 0=skip)
+ *   sa     - addr_count from the first SNAPSHOT message (d2x → ESP32)
+ *   ms     - all new addresses queued this vblank across every collect_missing_
+ *            addresses() call (addAddress resolver + peek_miss safety net).
+ *   cm     - cache misses while RESOLVING addAddress chains this vblank: bytes
+ *            the resolver could not find in the hash and queued for ADDR_QUERY.
+ *            Invariant: next frame's sa == this frame's sa + Σcm (proves the
+ *            whole frame resolved in-frame). sa_delta > Σcm means the peek_miss
+ *            net caught a chain shape the resolver missed.
+ *   it     - addAddress resolution depth (number of ADDR_QUERY round-trips)
+ *   mut    - 1 if a watchlist mutation (APPEND or REMOVE_IDX) was minted
+ *   cln    - 1 if evict_lru fired this vblank (LRU cleanup)
+ *   ap_us  - address processing time µs (SNAPSHOT receipt → new_snapshot=true)
+ *   df     - 1 if rc_client_do_frame ran this frame
+ *   df_us  - rc_client_do_frame total duration µs
+ */
+#ifndef RA_LOG_FRAME_STATS
+#define RA_LOG_FRAME_STATS 1
+#endif
+#define LOG_FRAME(...) do { if (RA_LOG_FRAME_STATS) Serial.printf(__VA_ARGS__); } while (0)
+
+/* Execution path for rc_client_do_frame / processSnapshot().
+ *
+ *   0 (default) — inline in taskCore1 immediately after the vblank snapshot
+ *                 is processed. Minimum latency but blocks EXI for the
+ *                 duration of do_frame (~26ms on SMG). Acceptable when
+ *                 do_frame fits the budget (~16.6ms); a missed SPI window
+ *                 only delays by 1 frame.
+ *
+ *   1           — in the low-priority loop() task (original behaviour).
+ *                 EXI never blocks at the cost of ~1ms extra scheduling
+ *                 latency. Use when do_frame routinely overruns the budget. */
+#ifndef RC_DO_FRAME_IN_LOW_PRIO_TASK
+/* 1 since 2026-06-14 — this WAS the nº1 bottleneck. The do_frame is ~26ms,
+ * OVERRUNNING the 16.6ms budget, so mode 0's "Acceptable when do_frame fits"
+ * premise was violated: the 26ms do_frame on the EXI critical path (prio-19)
+ * starved the SPI/handshake service, so the ra-module fired only ~12×/s
+ * (losing 4 of every 5 VBI edges) and the ESP ran ~5.4 do_frames/s.
+ * MEASURED A/B (wii.log mode-0 vs wii2.log mode-1): cyc_us median 143→28ms
+ * (5x), ra-module fire 12→59/s (locked to the 60Hz game), 95.5% of frames
+ * <40ms. Cost: do_frame wall-clock inflates (preempted by the EXI task —
+ * harmless, CPU-time unchanged) and ~2% of frames spike >80ms (low-prio
+ * task occasionally starved). With cycle now ≈ do_frame, the do_frame is
+ * finally the thing worth parallelizing. Do NOT flip back to 0. */
+#define RC_DO_FRAME_IN_LOW_PRIO_TASK 1
+#endif
 
 /* When 0, the patch response is passed to rcheevos as-is (no field stripping).
  * Useful for isolating whether a parse failure is caused by the strip helpers
@@ -164,11 +256,76 @@ uint8_t *memory_data = NULL;          // Current values for each watched address
 volatile bool new_snapshot = false;    // Flag: new snapshot received from GC
 volatile uint32_t frame_counter = 0;
 
+/* Frame-debt catch-up telemetry (v0.27.2) — see processSnapshot. */
+static uint32_t g_doframe_count = 0;       // ACTUAL do_frame calls since last CATCHUP log (was += run; catch-up loop is disabled so exactly 1 runs per processSnapshot)
+static uint32_t g_ok0_skips     = 0;       // snapshots rejected by Phase D2 (mutation lag / catch-up) since last CATCHUP log
+static uint32_t g_df_prev_gameframe = 0;   // frame_counter at last CATCHUP log
+/* Profiling (v0.27.3): accumulated µs + counts, reset each CATCHUP log. */
+static uint32_t g_df_us = 0, g_df_n = 0;       // do_frame
+static uint32_t g_cm_us = 0, g_cm_n = 0;       // collect_missing_addresses
+static uint32_t g_cm_skipped = 0;              // collect calls skipped (steady state)
+/* v0.28.5 — memory-access volume during do_frame. g_rm_bytes counts every
+ * byte read_memory_ingame serves (== one hash_lookup each); comparing it to
+ * df_us tells whether do_frame is memory-bound (worth moving hash/cache to
+ * SRAM) or CPU-bound (trigger eval — SRAM won't help). Reset each CATCHUP. */
+static uint32_t g_rm_bytes = 0;
+/* v0.28.7 — wall-clock between consecutive processSnapshot bodies (the real
+ * processing cycle). cycle = gap + ap_us + df_us, where gap is the overhead
+ * NOT spent in our code: ra-module producing/transferring the next SNAPSHOT
+ * + EXI wire + handshake. Steady-state timestamps imply cycle ~134ms with
+ * df_us only 26ms — gap (~108ms) is the hidden bottleneck capping us at
+ * ~7.4 do_frames/s vs the game's 59. This pins it precisely per-frame. */
+static uint32_t g_cycle_us = 0;
+
+/* Per-vblank telemetry for LOG_FRAME stats.
+ * Written by the EXI task (Core 1) during SNAPSHOT/ADDR_RESPONSE handling;
+ * read by processSnapshot (loop task). Each field is uint8/16/32 and
+ * volatile so cross-core writes are not cached by the compiler. */
+typedef struct {
+    uint8_t  data_ok;                /* Phase D2: seq+count matched, values accepted */
+    uint16_t snap_addr_count;        /* addr_count from the first SNAPSHOT of the vblank */
+    uint16_t collect_cm;             /* cm= : cache misses inside collect_missing
+                                      * (peek_from_snapshot calls that hit no cached
+                                      * value) this vblank, BEFORE do_frame. The raw
+                                      * count of unresolved peeks driving ADDR_QUERY. */
+    uint16_t pre_doframe_miss_count; /* peek_miss_count at convergence (before do_frame) */
+    uint16_t collect_miss_total;     /* total new addresses discovered by collect_missing_addresses()
+                                      * across all ADDR_QUERY iterations this vblank.
+                                      * Each one was a watchlist miss: not in hash, queried via ADDR_QUERY.
+                                      * Should equal sa_delta between consecutive mut=1 frames. */
+    uint8_t  iter_depth;             /* addr_query_iter_count at convergence */
+    uint8_t  collect_round;          /* increments on each collect_missing call this vblank */
+    uint16_t cm_by_round[8];         /* resolver (part-1) bytes queued in each round —
+                                      * round ≈ addAddress chain level, since each round
+                                      * commits its level and the next descends. Lets us
+                                      * see WHERE the cascade stalls vs. where peek_miss
+                                      * picks up the slack (cmr= in LOG_FRAME). */
+    uint8_t  had_mutation;           /* wl_seq changed this vblank (APPEND or REMOVE_IDX) */
+    uint8_t  had_cleanup;            /* evict_lru fired this vblank */
+    uint32_t addr_proc_us;           /* µs from SNAPSHOT receipt to new_snapshot=true
+                                      * (WALL CLOCK — includes EXI round-trip waits) */
+    uint32_t cm_cpu_us;              /* µs of CPU actually spent inside collect_missing_
+                                      * addresses() this vblank (the resolver walk). The
+                                      * rest of ap_us (ap_us - cm_cpu_us) is EXI round-trip
+                                      * latency + commit — tells CPU-bound from IO-bound. */
+    uint32_t snap_start_us;          /* esp_timer timestamp at SNAPSHOT receipt */
+    uint16_t wl_seq_at_snap_start;   /* wl_seq when SNAPSHOT arrived */
+} vblank_stats_t;
+static volatile vblank_stats_t g_vblank_stats;
+/* Frozen converged-frame copy for processSnapshot's LOG_FRAME, captured at
+ * set_new_snapshot(). Without it, ok=0 snapshots arriving between convergence
+ * and the loop task reading the stats reset data_ok/seq/snap_addr_count and
+ * splice a stale ap_us onto a later seq (the phantom 432ms "resync" that
+ * wasn't). set_new_snapshot is reached ONLY on a converged frame, so this
+ * always reflects a real do_frame (data_ok=1). */
+static vblank_stats_t g_frame_log;
+static uint32_t       g_frame_log_fc;   /* frame_counter frozen with g_frame_log */
+
 /* Phase A.5 — LRU tracking. last_used_frame[i] stores the value of
  * lru_clock at the last hash-hit for watch_addresses[i]. Static entries
  * (and their byte-fanouts) get UINT32_MAX so they're never evicted. */
 static uint32_t *last_used_frame = NULL;
-static uint32_t lru_clock = 0;  /* monotonic, ticks each SNAPSHOT */
+static uint32_t lru_clock = 0;  /* = PPC VBI frame_counter (real game frames) since v0.28.8 */
 #define LRU_PROTECTED 0xFFFFFFFFu
 
 /* Phase A.5 — STATIC region [0..static_watch_count-1] holds the rcheevos
@@ -179,38 +336,277 @@ static uint32_t lru_clock = 0;  /* monotonic, ticks each SNAPSHOT */
  * multi-pass; subject to LRU eviction when watch_count > WATCHLIST_HIGH_WATER. */
 static uint16_t static_watch_count = 0;
 
+/* Diagnostic: dump the whole watchlist with per-entry LRU age. Called every
+ * N frames from processSnapshot. Age = lru_clock - last_used_frame[i], now
+ * in real PPC VBI game-frames (v0.28.8 — lru_clock mirrors frame_counter;
+ * static entries are LRU_PROTECTED and have no age). This is HEAVY: it prints
+ * thousands of lines and WILL stall SPI timing for a few seconds — only run
+ * it sparingly (the user accepts the disruption for debugging). Yields every
+ * 64 lines so the Serial backpressure doesn't trip the task watchdog. */
+static void dump_cache_lru(void) {
+    if (!watch_addresses || !memory_data) return;
+
+    /* Fine-grained age histogram over DYNAMIC entries. age = lru_clock -
+     * last_used_frame[i], in PPC VBI game-frames (~60/s). Buckets:
+     *   lo[0]=age0  lo[1]=1-9  lo[2]=10-99      (hot working set lives here)
+     *   c[0..8] = 100..999 in decades of 100   (c[0]=100-199 ... c[8]=900-999)
+     *   k[0..8] = >=1000 in 250-frame bins      (k[0]=1000-1249 ... k[7]=2750-2999,
+     *             k[8]=>=3000)
+     * The c[]/k[] tail is COLD dead-weight: the ra-module still reads each of
+     * those addresses from MEM1 and ships them in EVERY snapshot, but the
+     * evaluator hasn't touched them in 1.6s..50s. This quantifies the transfer
+     * we pay for data we no longer look at. */
+    uint32_t lo[3] = {0,0,0};
+    uint32_t c[9]  = {0,0,0,0,0,0,0,0,0};
+    uint32_t k[9]  = {0,0,0,0,0,0,0,0,0};
+    for (uint16_t i = static_watch_count; i < watch_count; i++) {
+        uint32_t luf = last_used_frame ? last_used_frame[i] : 0;
+        if (luf == LRU_PROTECTED) continue;
+        /* clamp: frame_counter can reset on game restart → lru_clock < luf */
+        uint32_t age = (lru_clock >= luf) ? (lru_clock - luf) : 0;
+        if      (age == 0)   lo[0]++;
+        else if (age < 10)   lo[1]++;
+        else if (age < 100)  lo[2]++;
+        else if (age < 1000) c[(age - 100) / 100]++;
+        else { uint32_t b = (age - 1000) / 250; if (b > 8) b = 8; k[b]++; }
+    }
+    LOG_FRAME("=== CACHE DUMP watch=%u static=%u dyn=%u lru_clock=%lu ===\r\n",
+              (unsigned)watch_count, (unsigned)static_watch_count,
+              (unsigned)(watch_count - static_watch_count), (unsigned long)lru_clock);
+    LOG_FRAME("  hot: age0=%lu 1-9=%lu 10-99=%lu\r\n",
+              (unsigned long)lo[0], (unsigned long)lo[1], (unsigned long)lo[2]);
+    LOG_FRAME("  100s: 1xx=%lu 2xx=%lu 3xx=%lu 4xx=%lu 5xx=%lu 6xx=%lu 7xx=%lu 8xx=%lu 9xx=%lu\r\n",
+              (unsigned long)c[0], (unsigned long)c[1], (unsigned long)c[2],
+              (unsigned long)c[3], (unsigned long)c[4], (unsigned long)c[5],
+              (unsigned long)c[6], (unsigned long)c[7], (unsigned long)c[8]);
+    LOG_FRAME("  1k+: 1.00k=%lu 1.25k=%lu 1.50k=%lu 1.75k=%lu 2.00k=%lu 2.25k=%lu 2.50k=%lu 2.75k=%lu 3k+=%lu\r\n",
+              (unsigned long)k[0], (unsigned long)k[1], (unsigned long)k[2],
+              (unsigned long)k[3], (unsigned long)k[4], (unsigned long)k[5],
+              (unsigned long)k[6], (unsigned long)k[7], (unsigned long)k[8]);
+
+//     for (uint16_t i = 0; i < watch_count; i++) {
+//         uint32_t luf = last_used_frame ? last_used_frame[i] : 0;
+//         const char *region = (i < static_watch_count) ? "S" : "D";
+//         if (luf == LRU_PROTECTED)
+//             LOG_FRAME("%u %s 0x%08lX=%02X prot\r\n", (unsigned)i, region,
+//                       (unsigned long)watch_addresses[i], (unsigned)memory_data[i]);
+//         else
+//             LOG_FRAME("%u %s 0x%08lX=%02X age=%lu\r\n", (unsigned)i, region,
+//                       (unsigned long)watch_addresses[i], (unsigned)memory_data[i],
+//                       (unsigned long)(lru_clock - luf));
+//         if ((i & 0x3F) == 0x3F) vTaskDelay(1);   /* yield every 64 lines */
+//     }
+//     LOG_FRAME("=== END CACHE DUMP ===\r\n");
+}   /* per-entry dump above intentionally disabled — histogram is enough */
+
 /* When > 0, pending REMOVE event payload waiting to be emitted on the
  * next response. Holds the addresses (BE wire order) to be removed.
  * Sized for one batch (EVICT_BATCH_SIZE). */
 #define EVICT_BATCH_SIZE 256
-static uint32_t pending_remove_addrs[EVICT_BATCH_SIZE];  /* BE-encoded */
+/* v0.25.0: removal is INDEX-based (RA_EVT_WATCHLIST_REMOVE_IDX). Both
+ * replicas are identical pre-removal, so array indices identify entries
+ * unambiguously — no address searching on the Wii (was O(R*N) ≈ 25-30ms
+ * at N=6144) and no duplicate-address ambiguity class. Host order here;
+ * converted to BE u16 at emission. Ascending by construction. */
+static uint16_t pending_remove_idx[EVICT_BATCH_SIZE];
 static uint16_t pending_remove_count = 0;
 
-#ifndef WATCHLIST_HIGH_WATER
+/* v0.25.0 — tombstone cache: last known value of recently-evicted
+ * addresses. On a peek MISS the evaluator gets the last real value
+ * instead of 0, so Delta==Mem → no false "value changed" transitions
+ * (the SMG comet/library false unlocks); the miss is still recorded so
+ * the multi-pass re-fetches, and the REAL transition lands one frame
+ * later with real values. PSRAM (calloc in setup), task-context only. */
+#define TOMB_SIZE 4096   /* power of 2 */
+#define TOMB_MASK (TOMB_SIZE - 1)
+typedef struct {
+    uint32_t addr;
+    uint8_t  value;
+    uint8_t  used;
+} tomb_entry_t;
+static tomb_entry_t *tomb = NULL;
+
+static void tomb_put(uint32_t addr, uint8_t value) {
+    if (!tomb) return;
+    uint32_t h = (addr * 0x9E3779B9u) & TOMB_MASK;
+    for (uint32_t p = 0; p < 8; p++) {
+        uint32_t s = (h + p) & TOMB_MASK;
+        if (!tomb[s].used || tomb[s].addr == addr) {
+            tomb[s].addr = addr; tomb[s].value = value; tomb[s].used = 1;
+            return;
+        }
+    }
+    /* All 8 probe slots busy — overwrite the home slot (LRU-ish enough
+     * for a best-effort stale-value cache). */
+    tomb[h].addr = addr; tomb[h].value = value; tomb[h].used = 1;
+}
+
+static bool tomb_get(uint32_t addr, uint8_t *out) {
+    if (!tomb) return false;
+    uint32_t h = (addr * 0x9E3779B9u) & TOMB_MASK;
+    for (uint32_t p = 0; p < 8; p++) {
+        uint32_t s = (h + p) & TOMB_MASK;
+        if (!tomb[s].used) return false;
+        if (tomb[s].addr == addr) { *out = tomb[s].value; return true; }
+    }
+    return false;
+}
+
+static void tomb_clear(void) {
+    if (tomb) memset(tomb, 0, TOMB_SIZE * sizeof(tomb_entry_t));
+}
+
+/* ============================================================================
+ * Phase D2 (v0.26.0) — VERIFIED watchlist sync via mutation sequence numbers.
+ *
+ * Every watchlist mutation (APPEND / REMOVE_IDX / full load) gets a
+ * monotonic u16 seq. The Wii applies a mutation iff seq == ra_seq+1
+ * (anything else is dropped — duplicates and reordering are impossible
+ * BY CONSTRUCTION) and echoes its applied seq in every SNAPSHOT header.
+ * The ESP therefore KNOWS the Wii's exact position in the mutation
+ * stream instead of inferring it from count equality:
+ *
+ *   ra behind  → deliver exactly the next mutation from the ring
+ *                (idempotent — replaces the count-mismatch resender and
+ *                 its streak heuristics, deleted in v0.26.0)
+ *   impossible → full RESYNC (WATCHLIST_UPDATE + chunk re-fetch in-game)
+ *
+ * Mutations are RECORDED at mutation time (evict_lru / watchlist_append
+ * build the complete event response into the ring) and DELIVERED whenever
+ * a response slot is free and the Wii is behind — first delivery and
+ * re-delivery are the same code path.
+ * ========================================================================= */
+/* ----------------------------------------------------------------------
+ * Warm-up gate (v0.26.3). The v0.26.2 fastboot starts evaluation ~1s
+ * after the game's first VI retrace — which removed an ACCIDENTAL
+ * protection: the old ~27s LED boot theater meant the first do_frame ran
+ * long after game memory had settled. With fastboot, do_frame runs
+ * during the boot discovery storm, where every newly-found masked byte
+ * reads 0 then flips to its real value one frame later — "value
+ * changed" conditions mass-fired 5 false unlocks 4s into a session
+ * (2026-06-12 19:21:55).
+ *
+ * The fix is NOT to delay do_frame (masked-byte discovery NEEDS the
+ * evaluator running — pausing it deadlocks the convergence). Instead:
+ * run the warm-up in rcheevos SPECTATOR MODE (no server submissions),
+ * swallow trigger events locally (no LED/serial), and when the window
+ * ends call rc_client_reset() — every trigger returns to WAITING with
+ * hit counts cleared and deltas re-primed from the now-fully-resident
+ * memory. Clean start, ~10s after boot, all invisible to the player. */
+static bool     g_warmup_active = false;
+static uint32_t g_warmup_end_frame = 0;
+#define WARMUP_GAME_FRAMES 600u   /* ~10s at 60fps */
+
+static uint16_t wl_seq = 0;       /* last mutation seq applied locally (ESP) */
+static uint16_t ra_seq_view = 0;  /* our view of the Wii's applied seq:
+                                   * authoritative from the snapshot echo,
+                                   * advanced optimistically on delivery */
+
+#define MUT_RING 16               /* power of 2 not required; seq % MUT_RING.
+                                   * Was 8 — raised to 16 to accommodate per-round
+                                   * watchlist_append() calls during multi-level
+                                   * pointer chain discovery (up to ADDR_QUERY_MAX_ITERATIONS
+                                   * = 12 mutations per convergence pass). */
+/* Largest mutation response = APPEND at ADDR_QUERY_MAX=512:
+ *   hdr(6) + append_hdr(4) + 512*4 = 2058 bytes  (REMOVE_IDX max = 522).
+ * Was 532, sized for ADDR_QUERY_MAX=128. At 16 slots the ring is now ~33KB,
+ * so it is PSRAM-allocated in setup() (calloc, after the extmem threshold)
+ * instead of static .bss — it is task-context only (written by mut_record on
+ * the EXI task, read by mut_deliver_next, copied into the ISR tx_buf by
+ * send_response; never touched by the ISR itself), so PSRAM is safe and keeps
+ * SRAM free for mbedTLS's ~45KB handshake. v0.28.7 reverted a naked 512 bump
+ * precisely because the old resp[532] could not hold this APPEND. */
+#define MUT_RESP_SZ 2068
+typedef struct {
+    uint16_t seq;
+    uint16_t resp_len;            /* 0 = slot empty/overwritten */
+    uint8_t  resp[MUT_RESP_SZ];   /* full event response: hdr + payload */
+} mut_entry_t;
+static mut_entry_t *mut_ring = NULL;   /* [MUT_RING] — calloc'd to PSRAM in setup() */
+
+static void send_response(const uint8_t *data, size_t len);  /* fwd decl */
+
+static void mut_record(uint16_t seq, const uint8_t *resp, uint16_t len) {
+    if (!mut_ring) return;
+    mut_entry_t *m = &mut_ring[seq % MUT_RING];
+    if (len > sizeof(m->resp)) { m->resp_len = 0; return; }
+    m->seq = seq;
+    m->resp_len = len;
+    memcpy(m->resp, resp, len);
+}
+
+static void mut_ring_clear(void) {
+    if (!mut_ring) return;
+    for (int i = 0; i < MUT_RING; i++) mut_ring[i].resp_len = 0;
+}
+
+/* Deliver the next mutation the Wii is missing (ra_seq_view+1), if we
+ * still hold it. Returns true if a response was sent (slot consumed). */
+static bool mut_deliver_next(void) {
+    if (!mut_ring || ra_seq_view == wl_seq) return false;  /* nothing pending */
+    uint16_t want = (uint16_t)(ra_seq_view + 1);
+    mut_entry_t *m = &mut_ring[want % MUT_RING];
+    if (m->seq != want || m->resp_len == 0) return false;  /* ring lost it */
+    send_response(m->resp, m->resp_len);
+    ra_seq_view = want;  /* optimistic; the next snapshot echo corrects */
+    return true;
+}
+
+/* trigger_watchlist_resync lives further down (after the g_watchlist_*
+ * declarations it references — the Arduino preprocessor hoists function
+ * prototypes but not variable declarations). */
+
 /* Phase A.5 LRU eviction high-water mark. When watch_count would exceed
  * this on watchlist_append, evict_lru drops up to EVICT_BATCH_SIZE=256
- * LRU dynamic entries (chain-root-safe), leaving headroom before the
- * next eviction.
+ * age-cold dynamic entries, leaving headroom before the next eviction.
  *
- * 900 fits Kirby RtDL's full chain navigation (359 static + 4 chain[0]
- * + 128 chain[1] + 128 chain[2] + ~1-4 chain[3] ≈ 620-625 worst case)
- * with comfortable headroom and still activates eviction long before
- * hitting RA_MAX_WATCH_ADDRS=1024. v0.19.2-no-evict raised this from
- * 500 (artificially low during the off-by-N debug push) after Phase B
- * stabilized SPI delivery. See [[project-milestone-phase-b-success]]
- * for the LRU-thrashing rationale. */
-#define WATCHLIST_HIGH_WATER 900
+ * History: 900 fit Kirby under MAX=1024; 1800 under MAX=2048 thrashed
+ * on SMG; 3800 under MAX=4096 ALSO livelocked — SMG's live working set
+ * is ~3700 (119 active cheevos x ~30 chain bytes), i.e. demand sat ON
+ * the ceiling and the exact-LRU eviction dropped live bytes that got
+ * re-requested next frame (3698->3442->3570 cycle) while masked-chain
+ * bytes read 0 on miss and false-fired unlocks. Since v0.25.0 the
+ * eviction is age-gated (LRU_MIN_AGE) + index-based + tombstoned, and
+ * HIGH_WATER is a "start reclaiming above this" line, not a hard
+ * ceiling — RA_MAX_WATCH_ADDRS=6144 is the only hard cap.
+ *
+ * STRESS_TEST_HIGH_WATER reproduces the exact eviction pressure of the
+ * failed v0.24.6 SMG run (HW=3800, demand ~3700 sitting on the line) —
+ * the A/B harness for validating Phase D1 under fire. The Wii side
+ * (sized for 6144) needs NO rebuild between configs. Expected under
+ * stress: REMOVE_IDX evictions logged ("only N/256 cold enough" is
+ * normal), ZERO "mismatch PERSISTED", ZERO false unlocks, fires high.
+ * After validation, set to 0 for the release config (HW=5888). */
+#define STRESS_TEST_HIGH_WATER 0   /* release config — D1/D2 validated under stress 2026-06-12 */
+#if STRESS_TEST_HIGH_WATER
+#define WATCHLIST_HIGH_WATER 3800
+#else
+#define WATCHLIST_HIGH_WATER 4608   /* v0.31: 75% of RA_MAX_WATCH_ADDRS=6144 — eviction trigger (was 5888, ~never hit before the cap froze the list) */
 #endif
-/* Forward decl — watchlist_append calls evict_lru, but evict_lru lives
- * near watchlist_update_if_changed (after the watchlist_append def). */
+/* Forward decl. evict_lru lives near watchlist_update_if_changed; the trigger
+ * is at the SNAPSHOT handler (converged state, before resolution) since v0.31. */
 static void evict_lru(void);
 
 // Prefetch and watchlist state — used for two-pass processing
-#define PREFETCH_MAX 2048   /* rc_memrefs_get_addresses returns (addr,size) pairs; 1024 was too small for SSBM */
-static uint32_t prefetch_addrs[PREFETCH_MAX];
-static uint8_t  prefetch_sizes[PREFETCH_MAX];
+#define PREFETCH_MAX 4096   /* rc_memrefs_get_addresses returns (addr,size) pairs; 1024 was too small for SSBM, 2048 risky for SMG's 119-cheevo set (silent truncation = permanently-missing addrs) */
+/* v0.24.7: heap-allocated in setup() (≥256B → PSRAM via the extmem
+ * threshold) instead of static .bss — 20KB of internal RAM that mbedTLS
+ * needs more than we do. Task-context use only (loop/Core 1), never ISR. */
+static uint32_t *prefetch_addrs = NULL;
+static uint8_t  *prefetch_sizes = NULL;
 
-#define ADDR_QUERY_MAX 128  // max addresses per real-time query
+#define ADDR_QUERY_MAX 512  // max addresses per real-time query.
+                            // v0.29.2 RE-RAISED to 512 (was 128 since v0.28.7's revert):
+                            // the mut_ring blocker is fixed — resp[] is now MUT_RESP_SZ
+                            // (2068, holds the 2058-byte APPEND) and the ring lives in
+                            // PSRAM (calloc in setup). EXI buffers are all 8192 and
+                            // send_addr_query_response mallocs per-round, so the 512-wide
+                            // request (2058B) fits everywhere. d2x already at
+                            // RA_ADDR_QUERY_MAX=512 (ra_snap_rx_buf=2080 >= 2058).
+                            // CAVEAT: 512 only helps WIDTH-limited transitions (a single
+                            // chain level resolving >128 NEW addrs). SMG/Kirby are
+                            // narrow-deep (sequential pointer chains) → ~no-op there; the
+                            // win is for wide-fanout games. Drop back to 128 if it regresses.
 uint32_t query_addrs[ADDR_QUERY_MAX];
 uint8_t  query_values[ADDR_QUERY_MAX];
 uint16_t query_count = 0;
@@ -227,10 +623,57 @@ static volatile bool addr_query_pending = false;
 static uint32_t peek_miss_addrs[PEEK_MISS_MAX];
 static uint16_t peek_miss_count = 0;
 
+/* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
+ * g_update_miss_count is reset right before each rc_client_do_frame and bumped
+ * by read_memory_ingame on a NO-TOMBSTONE valid miss (a read that would return
+ * 0 — the only thing that can pollute a Delta into a false "became X"). The
+ * gate predicate (doframe_primed_cb) defers the frame when it's > 0. A
+ * tombstone miss does NOT bump it: that read returns the last real value
+ * (Delta==Mem, no fake edge), so it's safe to evaluate while the refresh is
+ * resolved in the background. Touched ONLY by read_memory_ingame (loop task)
+ * so there is no cross-task race with the EXI task's peek_from_snapshot. */
+static volatile uint32_t g_update_miss_count = 0;
+static uint32_t g_doframe_deferred_total = 0;   /* CATCHUP telemetry: frames deferred since last log */
+/* PSRAM rollback buffer for the gate — sized to the memref count at game load.
+ * Holds one rc_memref_value_t per memref so a deferred frame's UPDATE leaves
+ * zero trace. ISR never touches it (loop-task only), so PSRAM is fine. */
+static rc_memref_value_t *g_memref_save = NULL;
+
+/* Gate predicate: rc_client_do_frame calls this after the memref UPDATE and
+ * before condition eval. 1 = cache primed (every read hit) -> evaluate;
+ * 0 = a read would have returned 0 -> roll back + defer.
+ * extern "C" so its type matches the C-linkage g_rc_doframe_primed_cb pointer
+ * (GCC rejects assigning a C++-linkage function to a C-linkage pointer). */
+extern "C" int doframe_primed_cb(void) {
+    return g_update_miss_count == 0 ? 1 : 0;
+}
+
 // Dedicated watchlist buffer for chunked delivery
-static uint32_t g_watchlist_addrs[RA_MAX_WATCH_ADDRS];
+/* v0.24.7: heap-allocated (→PSRAM) for the same reason as the prefetch
+ * arrays — 24KB at MAX=6144. Used from GET_CHUNK handling and
+ * watchlist_update_if_changed (task context, never ISR). */
+static uint32_t *g_watchlist_addrs = NULL;
 static uint16_t g_watchlist_count = 0;
 static volatile bool g_watchlist_pending = false;
+
+/* Full watchlist RESYNC (Phase D2) — the repair path for any state the
+ * seq machinery can't walk forward from (Wii ahead of us, ring overrun,
+ * count mismatch at an agreed seq). Publishes the CURRENT list for
+ * chunked re-fetch; the WATCHLIST_UPDATE notify carries wl_seq as the
+ * new agreed base. While g_watchlist_pending is set,
+ * collect_missing_addresses returns 0, so no new mutations are minted
+ * mid-resync. Costs ~300ms once — vs a silently corrupted session. */
+static void trigger_watchlist_resync(const char *reason) {
+    if (g_watchlist_pending) return;   /* already resyncing */
+    if (!g_watchlist_addrs || !watch_addresses) return;
+    memcpy(g_watchlist_addrs, watch_addresses, watch_count * sizeof(uint32_t));
+    g_watchlist_count   = watch_count;
+    g_watchlist_pending = true;
+    mut_ring_clear();                  /* history is moot after a reload */
+    Serial.printf("ERROR=watchlist RESYNC (%s): esp_seq=%u ra_view=%u count=%u\r\n",
+                  reason, (unsigned)wl_seq, (unsigned)ra_seq_view,
+                  (unsigned)watch_count);
+}
 
 /* ============================================================================
  * Address → watch_index hash table — O(1) lookup instead of linear search
@@ -239,11 +682,28 @@ static volatile bool g_watchlist_pending = false;
  * (391 addrs + up to 128 query_addrs) blows past the budget and ra-module
  * reads a stale/empty SPI descriptor on the next transaction.
  *
- * Open-addressing with linear probing. Size is power-of-two = 2x the
- * worst-case watchlist so fill ratio stays ~25% and avg probe is ~1.25.
- * Empty bucket marker: watch_index == HASH_EMPTY (0xFFFF).
- * ========================================================================= */
-#define HASH_SIZE 4096
+ * Open-addressing with linear probing. Size is power-of-two, kept well
+ * above the worst-case watchlist so the fill ratio stays low and probes
+ * short. Empty bucket marker: watch_index == HASH_EMPTY (0xFFFF).
+ *
+ * v0.24.7 SIZING LESSON: this was 4096 while RA_MAX_WATCH_ADDRS was also
+ * 4096 — at SMG's ~3700 entries the table ran at ~90% load, where linear
+ * probing degenerates into chains of hundreds of slots per lookup
+ * (x3700 lookups/frame — a hidden contributor to the ~10Hz fire rate),
+ * and a full table makes hash_insert spin forever.
+ *
+ * v0.27.4 EXPERIMENT (reverted): tried 8192 in SRAM to cut do_frame's
+ * random PSRAM access. Result: df_us only fell 27.8→26.1ms (-6%) but
+ * cm_us ROSE 12.6→16.3ms (+29%, the smaller table = longer probe chains
+ * during collect's many lookups). NET NEGATIVE. The lesson: PSRAM was
+ * NOT the bottleneck — the 32KB data cache already absorbs the accesses
+ * (strong temporal locality: catch-up repeats re-read the same addrs).
+ * The real cost is rcheevos trigger-eval CPU (~26ms for SMG's 119-set).
+ * So HASH_SIZE back to 16384 (best probe behavior); ra_hot_alloc lets it
+ * fall to PSRAM (128KB won't fit internal anyway) — the cache makes that
+ * fine. Only memory_data (6KB) stays INTERNAL (cheap, neutral-to-slightly
+ * positive, leaves mbedTLS plenty of headroom). */
+#define HASH_SIZE 16384
 #define HASH_MASK (HASH_SIZE - 1)
 #define HASH_EMPTY 0xFFFF
 
@@ -252,7 +712,27 @@ typedef struct {
     uint16_t watch_index;
 } hash_entry_t;
 
-static hash_entry_t addr_hash[HASH_SIZE];
+static hash_entry_t *addr_hash = NULL;  /* PSRAM (see ra_hot_alloc note) */
+
+/* ra_hot_alloc — was an experiment (v0.27.4) to put hot buffers in
+ * INTERNAL SRAM. REVERTED v0.27.7: the addr_hash (128KB at HASH_SIZE
+ * 16384) fit internal at setup time (before WiFi/rcheevos alloc'd) and
+ * then STARVED mbedTLS — TLS needs ~45KB/handshake, heap fell to 20KB,
+ * the achievement download failed silently, rc_client never reached
+ * GAME_LOADED, and WiiFlow booted the game by timeout (state stuck at 5).
+ * Profiling had already shown SRAM gave only -6% on do_frame (the cost is
+ * trigger-eval CPU, not memory), so it was never worth the internal-RAM
+ * pressure. Now allocates straight from PSRAM — the data cache absorbs
+ * the random access fine. `from_internal` always reports false. */
+static void *ra_hot_alloc(size_t bytes, bool *from_internal) {
+    void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!p) p = malloc(bytes);   /* last-resort fallback */
+    if (from_internal) *from_internal = false;
+    if (p) memset(p, 0, bytes);
+    return p;
+}
+static bool g_hash_internal = false;
+static bool g_memdata_internal = false;
 
 static inline uint32_t hash_addr(uint32_t addr) {
     return (addr * 0x9E3779B9u) & HASH_MASK;  /* Fibonacci hash mod size */
@@ -287,6 +767,18 @@ static inline int32_t hash_lookup(uint32_t addr) {
         h = (h + 1) & HASH_MASK;
     }
     return -1;
+}
+
+/* rc_is_cached_t for rc_memrefs_get_pending_addresses(): every byte in
+ * [addr, addr+num_bytes) must be in the hash for this level to be readable
+ * from cache. If any byte is missing, the chain walk stops here and reports
+ * addr as pending. */
+static int is_cached_cb(uint32_t addr, uint32_t num_bytes, void* ud) {
+    (void)ud;
+    for (uint32_t b = 0; b < num_bytes; b++) {
+        if (hash_lookup(addr + b) < 0) return 0;
+    }
+    return 1;
 }
 
 // ============================================================================
@@ -351,6 +843,7 @@ static void drain_marker_queue(void) {
     while (marker_tail != marker_head) {
         uint32_t m   = marker_queue[marker_tail];
         marker_tail  = (marker_tail + 1) % MARKER_QUEUE_SIZE;
+        if (RA_LOG_LEVEL < 2) continue;  /* drain queue silently */
 
         uint8_t top  = (m >> 24) & 0xFF;
         uint8_t sub  = (m >> 16) & 0xFF;
@@ -434,13 +927,24 @@ void pop_event() {
 // rcheevos callbacks - adapted from fpga-ra-adapter
 // ============================================================================
 static void log_message(const char *message, const rc_client_t *client) {
-    if (DEBUG) Serial.printf("DEBUG=rcheevos: %s\r\n", message);
+    LOG_DBG("DEBUG=rcheevos: %s\r\n", message);
 }
 
 static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
-    if (DEBUG) Serial.printf("DEBUG=event: %d\r\n", event->type);
+    LOG_DBG("DEBUG=event: %d\r\n", event->type);
     switch (event->type) {
         case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED: {
+            /* v0.26.3 warm-up: triggers fired against boot-storm garbage
+             * are swallowed (no Wii LED, no serial ACHIEVEMENT line, no
+             * queue). Spectator mode already blocks the server submit;
+             * rc_client_reset at warm-up end wipes the spent state so a
+             * GENUINE unlock later re-fires cleanly. */
+            if (g_warmup_active) {
+                LOG_DBG("DEBUG=warmup: suppressed trigger %lu (%s)\r\n",
+                        (unsigned long)event->achievement->id,
+                        event->achievement->title);
+                break;
+            }
             const rc_client_achievement_t *ach = event->achievement;
             // Build achievement event data
             ra_achievement_t ach_data;
@@ -482,6 +986,7 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
 static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
                                    uint32_t num_bytes, rc_client_t *client) {
     (void)client;
+    g_rm_bytes += num_bytes;   /* memory-access volume profiling (one hash_lookup/byte) */
     /* Return RAW bytes in address order. rcheevos handles PPC BE-ness
      * INTERNALLY via the RC_MEMSIZE_*_BITS_BE size enums (see memref.c
      * rc_transform_memref_value cases 526-542) — cheevo devs pick the
@@ -490,7 +995,7 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
      * byte-swap here, the BE size's internal swap reverts our swap and
      * produces the LE-pack value (broken). LE-size cheevos work natively
      * because the dev coded against the LE-pack interpretation. Earlier
-     * v0.15.2 BE swap was a misdiagnosis — Kirby v0.21.0-cleanup log 2026-05-31
+     * v0.15.2 BE swap was a misdiagnosis — Kirby v0.22.1-oca-diag log 2026-05-31
      * 20:01:42 showed first_qa=0053F774 = LE-pack of [0x80,0xDC,0x53,0x00]
      * + 0x1AF4, proving cheevo uses RC_MEMSIZE_32_BITS (LE) for pptr. */
     for (uint32_t j = 0; j < num_bytes; j++) {
@@ -507,27 +1012,39 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
             got = true;
         }
 
-        if (!got) {
-            for (uint16_t q = 0; q < query_count; q++) {
-                if (query_addrs[q] == byte_addr) {
-                    buffer[j] = query_values[q];
-                    got = true;
-                    break;
-                }
-            }
-        }
+        /* (query_addrs fallback removed — v0.27.8. read_memory is now a
+         * pure O(1) hash lookup + tombstone; resolved addresses live in
+         * the hash, committed per ADDR_RESPONSE round.) */
 
         if (!got) {
-            buffer[j] = 0;
+            /* v0.25.0 tombstone: a recently-evicted address re-touched by
+             * the evaluator returns its LAST REAL value instead of 0 —
+             * Delta==Mem, no false "value changed" transition. The miss
+             * is still recorded below, so the multi-pass re-fetches and
+             * the genuine transition lands one frame later with real
+             * values. (0-on-miss is what mass-fired the SMG comet/library
+             * false unlocks.) */
+            uint8_t tv;
+            bool has_tomb = tomb_get(byte_addr, &tv);
+            buffer[j] = has_tomb ? tv : 0;
             /* Sanity-checked miss tracking — same rules as peek_from_snapshot. */
             bool valid_ppc_addr = (byte_addr <= 0x017FFFFF)
                                || (byte_addr >= 0x10000000 && byte_addr <= 0x13FFFFFF);
-            if (valid_ppc_addr && peek_miss_count < PEEK_MISS_MAX) {
-                bool dup = false;
-                for (uint16_t k = 0; k < peek_miss_count; k++) {
-                    if (peek_miss_addrs[k] == byte_addr) { dup = true; break; }
+            if (valid_ppc_addr) {
+                /* v0.32 gate: a NO-tombstone miss is a read that returns 0 —
+                 * the only miss that can forge a Delta "became X" edge. Bump
+                 * the gate counter so rc_client_do_frame defers (rolls back,
+                 * no eval) until this address resolves. A tombstone miss is
+                 * safe (last real value, Delta==Mem) and does NOT defer — it
+                 * just gets refreshed via the peek_miss net below. */
+                if (!has_tomb) g_update_miss_count++;
+                if (peek_miss_count < PEEK_MISS_MAX) {
+                    bool dup = false;
+                    for (uint16_t k = 0; k < peek_miss_count; k++) {
+                        if (peek_miss_addrs[k] == byte_addr) { dup = true; break; }
+                    }
+                    if (!dup) peek_miss_addrs[peek_miss_count++] = byte_addr;
                 }
-                if (!dup) peek_miss_addrs[peek_miss_count++] = byte_addr;
             }
         }
     }
@@ -557,27 +1074,30 @@ static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *u
         int32_t widx = hash_lookup(byte_addr);
         if (widx >= 0) {
             buf[j] = memory_data[widx];
-            /* Phase A.5: bump last_used (unless static-protected). */
-            if (last_used_frame && last_used_frame[widx] != LRU_PROTECTED) {
-                last_used_frame[widx] = lru_clock;
-            }
+            /* v0.29.3: do NOT bump last_used_frame here. This is the CHAIN
+             * RESOLVER's peek (rc_memrefs_get_pending_addresses), not the
+             * trigger evaluator. Bumping here kept every resolver-walked
+             * intermediate artificially hot, masking whether the EVALUATOR
+             * actually reads it — and hiding any over-resolution (addresses we
+             * fetch+ship but the triggers never read). LRU recency is now
+             * driven ONLY by read_memory_ingame. Safe today because eviction is
+             * dormant (HIGH_WATER never hit); revisit if eviction is enabled
+             * and a resolver-only intermediate starts to churn. */
             got = true;
         }
 
-        /* Dynamic query cache: linear search (small N <= ADDR_QUERY_MAX,
-         * usually <= 128, cheap relative to ADDR_QUERY round trip). */
-        if (!got) {
-            for (uint16_t q = 0; q < query_count; q++) {
-                if (query_addrs[q] == byte_addr) {
-                    buf[j] = query_values[q];
-                    got = true;
-                    break;
-                }
-            }
-        }
+        /* (query_addrs fallback removed — v0.27.8. Resolved addresses are
+         * committed straight to the hash per ADDR_RESPONSE round, so the
+         * hash lookup above is the single source of truth. query_addrs is
+         * now ONLY the collection buffer for misses → ADDR_QUERY.) */
 
         if (!got) {
             found_all = false;
+            /* v0.25.0 tombstone: stale-but-real value for recently-evicted
+             * addresses (chain resolution continuity); still counted as
+             * missing so the converger re-fetches. */
+            uint8_t tv;
+            if (tomb_get(byte_addr, &tv)) buf[j] = tv;
             /* Record the miss so collect_missing_addresses can queue this
              * address for next frame's ADDR_QUERY. Catches the case where
              * rc_memrefs_get_addresses outputs the wrong (unmasked) address
@@ -608,10 +1128,14 @@ static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *u
      * done in rc_transform_memref_value by rcheevos itself. Mirror this
      * here so peek_from_snapshot and read_memory_ingame agree on the
      * value rcheevos sees. */
+    /* cm= is now accumulated in collect_missing_addresses() as the number of
+     * pending addresses actually appended to the watchlist this vblank (so it
+     * equals sa_delta). peek_from_snapshot no longer counts misses here — its
+     * job is just to serve cached bytes and feed peek_miss_addrs. */
+
     uint32_t val = 0;
     for (uint32_t i = 0; i < num_bytes && i < 4; i++)
         val |= ((uint32_t)buf[i]) << (i * 8);
-    (void)found_all;
     return val;
 }
 
@@ -621,7 +1145,7 @@ static uint32_t read_memory_nop(uint32_t address, uint8_t *buffer, uint32_t num_
 }
 
 static void rc_callback(int result, const char *error_message, rc_client_t *client, void *userdata) {
-    if (DEBUG) Serial.printf("DEBUG=rc_callback: %d\r\n", result);
+    LOG_DBG("DEBUG=rc_callback: %d\r\n", result);
 }
 
 rc_clock_t get_millisecs(const rc_client_t *client) { return millis(); }
@@ -691,6 +1215,36 @@ static void json_remove_field(PsramStream &buf, const char* field) {
     buf.setLength(w);
 }
 
+/* Diagnostic: scan a JSON buffer for the first structural break — the symptom
+ * of a field-clean that miscounts an escaped quote (\") and cuts the wrong
+ * span. Tracks brace/bracket depth honoring strings + escapes. Prints final
+ * depth (0 = balanced), in_str, and the first negative-depth offset + context.
+ * Uses Serial.printf directly so it prints regardless of RA_LOG_LEVEL. */
+static void ra_json_scan(const char *b, size_t len, const char *tag) {
+    int depth = 0; bool in_str = false; bool esc = false;
+    long brk = -1;
+    for (size_t i = 0; i < len; i++) {
+        char c = b[i];
+        if (esc) { esc = false; continue; }
+        if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true;
+        else if (c == '{' || c == '[') depth++;
+        else if (c == '}' || c == ']') { if (--depth < 0) { brk = (long)i; break; } }
+    }
+    Serial.printf("DEBUG=JSONSCAN[%s] len=%u final_depth=%d in_str=%d brk=%ld\r\n",
+                  tag, (unsigned)len, depth, (int)in_str, brk);
+    if (brk >= 0) {
+        size_t s = (brk > 200) ? (size_t)brk - 200 : 0;
+        Serial.printf("DEBUG=JSONSCAN[%s] ctx@%ld: %.260s\r\n", tag, brk, b + s);
+    } else if (depth != 0 && len >= 260) {
+        Serial.printf("DEBUG=JSONSCAN[%s] tail: %.260s\r\n", tag, b + (len - 260));
+    }
+}
+
 static void json_clean_field_str(PsramStream &buf, const char* field) {
     json_remove_whitespace(buf);
     char*  data = buf.data();
@@ -717,24 +1271,67 @@ static void json_clean_field_str(PsramStream &buf, const char* field) {
     buf.setLength(w);
 }
 
+/* Replace "field":[ ...array... ] with "field":[] (empty the array, keep key).
+ *
+ * v0.27.x bug: the old version stopped at the FIRST ']' after the key, with no
+ * nesting/string awareness. Array elements that contain ']' or '[' inside a
+ * string (e.g. a leaderboard title) or a nested array (e.g. the "Mem" field)
+ * made it stop early, removing the wrong span and unbalancing the whole JSON
+ * (observed on Metroid Prime: after "Leaderboards" clean → depth=4, in_str=1).
+ *
+ * Fixed: once inside the array value, track brace/bracket DEPTH while honoring
+ * string state + backslash escapes, and stop only at the MATCHING ']'. */
 static void json_clean_field_array(PsramStream &buf, const char* field) {
     json_remove_whitespace(buf);
     char*  data = buf.data();
     size_t len  = buf.length();
     size_t flen = strlen(field);
-    bool in_str = false, skipping = false, remove_next = false;
+    bool   in_str = false, esc = false, skipping = false, remove_next = false;
+    int    depth = 0;
     size_t r = 0, w = 0;
+
     while (r < len) {
         char c = data[r];
-        if (c == '[' && remove_next) { skipping = true; data[w++] = '['; }
-        if (c == ']' && remove_next) { remove_next = false; skipping = false; }
-        if (c == '"' && json_quote_is_real(data, r)) in_str = !in_str;
-        if (in_str && r + 1 + flen + 1 < len &&
-            strncmp(data + r + 1, field, flen) == 0 &&
-            data[r + flen + 1] == '"') {
-            remove_next = true;
+
+        if (skipping) {
+            /* Inside "field":[ ... ] — drop content until the matching ']'. */
+            if (esc)               { esc = false; }
+            else if (in_str)       { if (c == '\\') esc = true; else if (c == '"') in_str = false; }
+            else if (c == '"')     { in_str = true; }
+            else if (c == '[' || c == '{') { depth++; }
+            else if (c == ']' || c == '}') {
+                if (--depth == 0) {            /* matching close of the array */
+                    skipping = false;
+                    remove_next = false;
+                    data[w++] = ']';           /* keep "field":[] */
+                }
+            }
+            r++;
+            continue;
         }
-        if (!skipping) data[w++] = c;
+
+        if (esc) {
+            esc = false;
+        } else if (in_str) {
+            if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+            /* key match: at the opening quote, is this exactly "field"? */
+            if (r + 1 + flen + 1 < len &&
+                strncmp(data + r + 1, field, flen) == 0 &&
+                data[r + flen + 1] == '"') {
+                remove_next = true;
+            }
+        } else if (remove_next && c == '[') {
+            /* start of the array value — begin removing its contents */
+            data[w++] = '[';
+            skipping = true; depth = 1; in_str = false; esc = false;
+            r++;
+            continue;
+        }
+
+        data[w++] = c;
         r++;
     }
     buf.setLength(w);
@@ -759,6 +1356,7 @@ static void json_keep_only_achievement_id(PsramStream &buf, const uint32_t *targ
      * each independently so the target cheevo is preserved wherever it
      * lives and everything else is dropped. */
     while (search_from < (int)buf.length()) {
+        vTaskDelay(1);  // yield to IDLE0 between achievement-set iterations
         int achvStart = buf.indexOf("\"Achievements\":[", search_from);
         if (achvStart == -1) break;
         char *data = buf.data();
@@ -769,6 +1367,7 @@ static void json_keep_only_achievement_id(PsramStream &buf, const uint32_t *targ
         int kept = 0, removed = 0;
         int pos = arrayStart + 1;
         while (pos < arrayEnd) {
+            vTaskDelay(1);  // yield to IDLE0 between per-achievement iterations
             int objStart = buf.indexOf("{", pos);
             if (objStart == -1 || objStart > arrayEnd) break;
             int objEnd = objStart, braces = 1;
@@ -830,8 +1429,8 @@ static void json_keep_only_achievement_id(PsramStream &buf, const uint32_t *targ
         total_removed += removed;
         search_from   = arrayEnd + 1;
     }
-    Serial.printf("DEBUG=Filtered Achievements (all sets): kept=%d removed=%d\r\n",
-                  total_kept, total_removed);
+        LOG_DBG("DEBUG=Filtered Achievements (all sets): kept=%d removed=%d\r\n",
+                total_kept, total_removed);
 }
 
 static void json_remove_flags5_achievements(PsramStream &buf) {
@@ -874,56 +1473,350 @@ static void json_remove_flags5_achievements(PsramStream &buf) {
     }
 }
 
-// Apply all strips to a patch.php response held in PSRAM
-static void json_strip_patch(PsramStream &buf) {
+/* EXPERIMENT (v0.27.6) — keep only the first N achievements in the set,
+ * to MEASURE how do_frame cost (df_us) scales with achievement count.
+ * The SMG set is 1 "core" set with 161 achievements + 48 leaderboards;
+ * the leaderboards are already stripped, so the ~26ms do_frame is the
+ * 161 achievements' trigger eval. This is a DIAGNOSTIC, not production —
+ * the dropped achievements simply won't be monitored. N=0 keeps all.
+ * Expected: df_us ≈ 26ms × (N/161); find the N where df_us < ~16ms
+ * (df/s ~60) to quantify "cost per achievement" and confirm the ceiling. */
+static void json_keep_first_n_achievements(PsramStream &buf, int n) {
+    if (n <= 0) return;
     json_remove_whitespace(buf);
-    json_clean_field_str(buf,   "Description");
-    json_remove_field(buf,      "Warning");
-    json_remove_field(buf,      "BadgeLockedURL");
-    json_remove_field(buf,      "BadgeURL");
-    json_remove_field(buf,      "ImageIconURL");
-    json_remove_field(buf,      "Rarity");
-    json_remove_field(buf,      "RarityHardcore");
-    json_remove_field(buf,      "Author");
-    json_remove_field(buf,      "RichPresencePatch");
-    json_clean_field_array(buf, "Leaderboards");
-    json_remove_flags5_achievements(buf);
+    char* data = buf.data();
+    int achvStart = buf.indexOf("\"Achievements\":[");
+    if (achvStart == -1) return;
+    int arrayStart = buf.indexOf("[", achvStart);
+    int arrayEnd   = buf.indexOf("]", arrayStart);
+    if (arrayStart == -1 || arrayEnd == -1) return;
+    int objCount = 0, pos = arrayStart + 1;
+    while (pos < arrayEnd) {
+        int objStart = buf.indexOf("{", pos);
+        if (objStart == -1 || objStart > arrayEnd) break;
+        int objEnd = objStart, braces = 1;
+        while (braces > 0 && objEnd < arrayEnd) {
+            objEnd++;
+            if (data[objEnd] == '{') braces++;
+            else if (data[objEnd] == '}') braces--;
+        }
+        if (objEnd >= arrayEnd) break;
+        objCount++;
+        if (objCount >= n) {
+            /* Keep up to & including this object; drop the rest up to ']'. */
+            if (objEnd + 1 < arrayEnd)
+                buf.removeRange(objEnd + 1, arrayEnd - objEnd - 1);
+            LOG_DBG("DEBUG=keep_first_n: kept %d achievements (was more)\r\n", n);
+            return;
+        }
+        pos = objEnd + 1;
+    }
+    LOG_DBG("DEBUG=keep_first_n: set had <= %d achievements, no change\r\n", n);
 }
 
-// HTTP server call (same as fpga-ra-adapter)
-static void server_call(const rc_api_request_t *request, rc_client_server_callback_t callback,
-                        void *callback_data, rc_client_t *rc_client) {
+/* v0.27.6 — keep only the FIRST set in "Sets":[...], dropping bonus/
+ * specialty sets. SMG's full achievementsets response has 2 sets: "core"
+ * (23895, 161 achievements) + "bonus" (36024, ~109). rcheevos monitors
+ * EVERY set's addresses, so the bonus set inflates the watchlist AND the
+ * ~26ms do_frame's trigger-eval. Keeping core-only cuts ~40% of the cost
+ * → df_us ~16ms → df/s ~60 (the timer fix), at the cost of not tracking
+ * bonus-set achievements (a reasonable product choice; core is the main
+ * progression set).
+ *
+ * Robust brace/bracket scan that SKIPS string contents (a stray { } [ ]
+ * inside a Title/Description/Mem would otherwise desync the depth count
+ * across this huge cut). */
+static void json_keep_first_set(PsramStream &buf) {
+    json_remove_whitespace(buf);
+    char* data = buf.data();
+    int len = (int)buf.length();
+    int setsKey = buf.indexOf("\"Sets\":[");
+    if (setsKey == -1) return;
+    int arrayStart = buf.indexOf("[", setsKey);
+    if (arrayStart == -1) return;
+
+    /* 1. End of the FIRST set object: first '{' after '[', then
+     *    string-aware brace-match until it closes. */
+    int i = arrayStart + 1;
+    while (i < len && data[i] != '{') i++;
+    if (i >= len) return;
+    int braces = 0; bool in_str = false; int objEnd = -1;
+    for (; i < len; i++) {
+        char c = data[i];
+        if (in_str) {
+            if (c == '\\') { i++; continue; }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') braces++;
+        else if (c == '}') { if (--braces == 0) { objEnd = i; break; } }
+    }
+    if (objEnd == -1) return;
+
+    /* 2. The ']' that closes the Sets array (bracket-depth from
+     *    arrayStart, string-aware). */
+    int depth = 0; in_str = false; int setsEnd = -1;
+    for (i = arrayStart; i < len; i++) {
+        char c = data[i];
+        if (in_str) {
+            if (c == '\\') { i++; continue; }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '[') depth++;
+        else if (c == ']') { if (--depth == 0) { setsEnd = i; break; } }
+    }
+    if (setsEnd == -1 || setsEnd <= objEnd) return;
+
+    /* 3. Drop everything between the first set's '}' and the closing ']'. */
+    if (objEnd + 1 < setsEnd) {
+        buf.removeRange(objEnd + 1, setsEnd - objEnd - 1);
+        LOG_DBG("DEBUG=keep_first_set: dropped sets after first (saved %d bytes)\r\n",
+                setsEnd - objEnd - 1);
+    }
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * v0.27.x — TOTAL-OPERATION BUDGET CAP  (feature toggle, starts ENABLED)
+ *
+ * do_frame's trigger-eval cost scales with the TOTAL number of conditions
+ * ("operations") across every kept achievement, NOT with the achievement
+ * count. SMG's core set is ~32768 ops and measured ~25ms (25274us) on the
+ * ESP32 — that alone blows past half of a 16.7ms frame and starves the EXI
+ * / comm work that must also finish each frame.
+ *
+ * Run AFTER every other strip, this pass removes achievements from the
+ * HEAVIEST (most operations) to the lightest until the running total drops
+ * to <= MAX_TOTAL_OPERATIONS (~13000, about half of SMG), buying frame
+ * headroom at the cost of a handful of the most expensive achievements.
+ * It prints how many were dropped.
+ *
+ * Operation count = conditions in MemAddr: +1 per '_' (AND within a group),
+ * +1 per 'S' group separator (NOT the '0xS' bit6 size prefix — that S is
+ * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
+ * ─────────────────────────────────────────────────────────────────────── */
+#ifndef CAP_TOTAL_OPERATIONS
+#define CAP_TOTAL_OPERATIONS 1            // 1 = on, 0 = keep every achievement
+#endif
+#ifndef MAX_TOTAL_OPERATIONS
+#define MAX_TOTAL_OPERATIONS 16000        // target ceiling (~half of SMG's 32768)
+#endif
+
+/* Count rcheevos "operations" (conditions) in one achievement object's
+ * MemAddr value, scanning only the [objStart, objEnd] span. */
+static int count_mem_ops(const char* data, int objStart, int objEnd) {
+    static const char* KEY  = "\"MemAddr\":\"";
+    static const int   KLEN = 11;
+    int p = -1;
+    for (int i = objStart; i <= objEnd - KLEN; i++) {
+        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
+    }
+    if (p == -1) return 0;
+    if (data[p] == '"') return 0;          // empty MemAddr
+    int ops = 1;                           // first condition
+    for (int i = p; i < objEnd; i++) {
+        char c = data[i];
+        if (c == '\\') { i++; continue; }  // skip escaped char
+        if (c == '"') break;               // closing quote → end of value
+        if (c == '_') ops++;
+        else if (c == 'S' && data[i-1] != 'x') ops++;   // group sep, not 0xS
+    }
+    return ops;
+}
+
+static void json_cap_total_operations(PsramStream &buf, int target_ops) {
+    json_remove_whitespace(buf);
+    char* data = buf.data();
+    int achvStart = buf.indexOf("\"Achievements\":[");
+    if (achvStart == -1) return;
+    int arrayStart = buf.indexOf("[", achvStart);
+    int arrayEnd   = buf.indexOf("]", arrayStart);
+    if (arrayStart == -1 || arrayEnd == -1) return;
+
+    /* Pass 1 — enumerate achievement objects: span + operation count. */
+    struct AchSpan { int start, end, ops; bool removed; };
+    const int MAX_ACH = 512;               // SMG core = 161; generous headroom
+    AchSpan* spans = (AchSpan*) ps_malloc(sizeof(AchSpan) * MAX_ACH);
+    if (!spans) { Serial.println("ERROR=cap_ops: ps_malloc failed, skipping"); return; }
+
+    int count = 0, total_ops = 0, pos = arrayStart + 1;
+    while (pos < arrayEnd && count < MAX_ACH) {
+        int objStart = buf.indexOf("{", pos);
+        if (objStart == -1 || objStart > arrayEnd) break;
+        int objEnd = objStart, braces = 1;
+        while (braces > 0 && objEnd < arrayEnd) {
+            objEnd++;
+            if (data[objEnd] == '{') braces++;
+            else if (data[objEnd] == '}') braces--;
+        }
+        if (objEnd >= arrayEnd) break;
+        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false };
+        total_ops += spans[count].ops;
+        count++;
+        pos = objEnd + 1;
+    }
+
+    Serial.printf("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d)\r\n",
+                  count, total_ops, target_ops);
+    if (total_ops <= target_ops) {
+        Serial.printf("DEBUG=cap_ops: already under target, removed 0 achievements\r\n");
+        free(spans);
+        return;
+    }
+
+    /* Pass 2 — greedily mark the heaviest achievement until the running
+     * total drops to <= target. count is small, so a simple O(n^2) max-find. */
+    int removed = 0, removed_ops = 0;
+    while (total_ops > target_ops) {
+        int maxIdx = -1, maxOps = -1;
+        for (int i = 0; i < count; i++)
+            if (!spans[i].removed && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
+        if (maxIdx == -1) break;           // nothing left to remove
+        spans[maxIdx].removed = true;
+        total_ops   -= spans[maxIdx].ops;
+        removed_ops += spans[maxIdx].ops;
+        removed++;
+    }
+
+    /* Pass 3 — physically delete the marked objects, HIGHEST offset first so
+     * lower spans' offsets stay valid. Eat the comma joining the object to the
+     * array (leading comma normally; trailing comma if it's the first one). */
+    for (int i = count - 1; i >= 0; i--) {
+        if (!spans[i].removed) continue;
+        data = buf.data();                 // re-fetch; buffer shrinks each pass
+        int rs = spans[i].start, re = spans[i].end;
+        if (rs > 0 && data[rs-1] == ',')                          rs--;
+        else if (re + 1 < (int)buf.length() && data[re+1] == ',') re++;
+        buf.removeRange(rs, re - rs + 1);
+    }
+
+    free(spans);
+    Serial.printf("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops)\r\n",
+                  removed, removed_ops, count - removed, total_ops);
+}
+
+// Apply all strips to a patch.php response held in PSRAM
+static void json_strip_patch(PsramStream &buf) {
+    vTaskDelay(1); json_remove_whitespace(buf);
+    vTaskDelay(1); json_remove_field(buf,      "Warning");
+    vTaskDelay(1); json_remove_field(buf,      "BadgeLockedURL");
+    vTaskDelay(1); json_remove_field(buf,      "BadgeURL");
+    vTaskDelay(1); json_remove_field(buf,      "ImageIconURL");
+    vTaskDelay(1); json_remove_field(buf,      "Rarity");
+    vTaskDelay(1); json_remove_field(buf,      "RarityHardcore");
+    vTaskDelay(1); json_remove_field(buf,      "Author");
+    vTaskDelay(1); json_remove_field(buf,      "RichPresencePatch");
+    vTaskDelay(1); json_clean_field_array(buf, "Leaderboards");
+    vTaskDelay(1); json_remove_flags5_achievements(buf);
+#if CAP_TOTAL_OPERATIONS
+    vTaskDelay(1); json_cap_total_operations(buf, MAX_TOTAL_OPERATIONS);
+#endif
+}
+
+// ============================================================================
+// HTTP — async worker on Core 0 (v0.24.0)
+//
+// rc_client lives on ONE task (loop, Core 1 — same core as the EXI task).
+// HTTP used to run synchronously inside server_call, which meant the
+// mbedTLS handshake (~2-3s of crypto), the achievementsets download AND
+// the PSRAM JSON strip all executed on Core 1 — starving the EXI task
+// (field: SNAP fires dropped to 97/300 during award submits; historically
+// TWDT reboots when loop lived on Core 0 next to the WiFi task).
+//
+// New shape:
+//   server_call (Core 1)  → deep-copies the request into an http_job_t and
+//                           enqueues it. Returns immediately — do_frame
+//                           never blocks on the network again.
+//   httpTask   (Core 0)   → dequeues, runs the blocking HTTPClient/TLS/
+//                           strip work next to the WiFi/lwIP tasks it
+//                           talks to, enqueues an http_done_t.
+//   loop       (Core 1)   → drains done-queue and invokes the rc_client
+//                           callback there, keeping rc_client single-task.
+//
+// Generation guard: loadGame destroys/recreates g_client; any in-flight
+// response from the previous client generation is discarded on drain
+// instead of calling a callback into freed memory.
+// ============================================================================
+/* http_job_t / http_done_t live in ra_http.h — the Arduino preprocessor
+ * hoists its auto-generated function prototypes above any typedef written
+ * in the .ino body, so types used in function signatures must come from
+ * an #include or the build fails with "does not name a type". */
+static QueueHandle_t http_req_q  = NULL;
+static QueueHandle_t http_done_q = NULL;
+static volatile uint32_t http_gen = 0;
+
+/* Hand a finished response body to the done-queue (called by httpTask). */
+static void http_finish(const http_job_t *job, const char *body, size_t body_len, int status) {
+    http_done_t done;
+    done.body = (char *)ps_malloc(body_len + 1);
+    if (!done.body) {
+        Serial.printf("ERROR=http_finish: ps_malloc(%u) failed\r\n", (unsigned)body_len + 1);
+        return;
+    }
+    memcpy(done.body, body, body_len);
+    done.body[body_len] = '\0';
+    done.body_len      = body_len;
+    done.status        = status;
+    done.callback      = job->callback;
+    done.callback_data = job->callback_data;
+    done.gen           = job->gen;
+    if (xQueueSend(http_done_q, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        Serial.println("ERROR=http_finish: done queue full, response dropped");
+        free(done.body);
+    }
+}
+
+// HTTP blocking worker body (runs ONLY on httpTask, Core 0).
+static void server_call_blocking(const http_job_t *job) {
     // Large responses: rcheevos 11.x uses r=patch, 12.x uses r=achievementsets.
     // Both can be ~500-700KB for games like SSBM.
     // rcheevos puts these in the URL as query params (not in post_data).
-    bool is_patch = (strstr(request->url, "r=patch")           != nullptr) ||
-                    (strstr(request->url, "r=achievementsets")  != nullptr) ||
-                    (request->post_data && strstr(request->post_data, "r=patch")           != nullptr) ||
-                    (request->post_data && strstr(request->post_data, "r=achievementsets") != nullptr);
-    if (DEBUG) Serial.printf("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch, request->url, request->post_data);
+    bool is_patch = (strstr(job->url, "r=patch")           != nullptr) ||
+                    (strstr(job->url, "r=achievementsets")  != nullptr) ||
+                    (job->post_data && strstr(job->post_data, "r=patch")           != nullptr) ||
+                    (job->post_data && strstr(job->post_data, "r=achievementsets") != nullptr);
+    LOG_DBG("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch, job->url, job->post_data);
 
     client.setInsecure();
-    https.begin(client, String(request->url));
+    https.begin(client, String(job->url));
+    /* RA's dorequest can be slow; the default 5s read timeout produced
+     * spurious -11 (HTTPC_ERROR_READ_TIMEOUT). 15s: TLS handshake
+     * (~2-3s on ESP32) + request + response. Off the hot path since the
+     * v0.24 core split — blocking longer here costs nothing on Core 1. */
+    https.setTimeout(15000);
     //https.setReuse(false);    // desabilita keep-alive: força conexão nova em vez de reusar stale
     //https.setTimeout(15000);  // 15s: TLS handshake (~2-3s no ESP32) + request + response
     https.setUserAgent("WII_RA_ADAPTER/0.1 rcheevos/12.3");
+    uint32_t req_start_ms = millis();
     int httpCode = 0;
-    if (request->post_data) {
+    if (job->post_data) {
         https.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        httpCode = https.POST(request->post_data);
+        httpCode = https.POST(job->post_data);
     } else {
         httpCode = https.GET();
     }
 
     if (httpCode != HTTP_CODE_OK) {
-        if (DEBUG) Serial.printf("DEBUG=HTTP error: %d url=%s\r\n", httpCode, request->url);
+        /* Same semantics as the old synchronous path: no callback on HTTP
+         * failure — rcheevos' own retry/ping cadence re-issues the call.
+         * Forensics (error path only): elapsed discriminates fast-fail
+         * (connect/TLS/power-save wakeup) from a genuine read timeout;
+         * heap catches mbedTLS allocation failure (~45KB/session needed);
+         * RSSI/status catch RF or association drops. */
+        LOG_ERR("DEBUG=HTTP error: %d url=%s elapsed=%lums heap=%u maxblk=%u rssi=%d wifi=%d\r\n",
+                httpCode, job->url, (unsigned long)(millis() - req_start_ms),
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (int)WiFi.RSSI(), (int)WiFi.status());
         https.end();
         return;
     }
 
     int contentLen = https.getSize();  // -1 if chunked/unknown
-    Serial.printf("DEBUG=HTTP ok is_patch=%d content-length=%d psram-free=%u heap-free=%u\r\n",
-                  (int)is_patch, contentLen, (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+    LOG_DBG("DEBUG=HTTP ok is_patch=%d content-length=%d psram-free=%u heap-free=%u\r\n",
+            (int)is_patch, contentLen, (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
 
     if (is_patch) {
         // ----------------------------------------------------------------
@@ -943,22 +1836,55 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
             return;
         }
 
-        // writeToStream handles chunked transfer decoding internally.
-        // Direct getStreamPtr() reads bypass chunked decoding and leave
-        // hex chunk-size headers (e.g. "ff58\r\n") in the buffer.
-        int written = https.writeToStream(&ps);
-        Serial.printf("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
-                      written, (unsigned)ESP.getFreePsram());
-        Serial.printf("DEBUG=Patch first64 before: %.64s\r\n", ps.c_str());
+        // Large response: read in a loop with vTaskDelay(1) between chunks
+        // so IDLE0 gets CPU time and can reset its TWDT subscription.
+        // Implements the same chunked-transfer and identity encoding logic
+        // as HTTPClient::writeToStream but yields every iteration.
+        int written = 0;
+        {
+            WiFiClient *dl_stream = https.getStreamPtr();
+            const uint32_t dl_deadline = millis() + 120000UL;  // 120s hard limit
+            if (contentLen > 0) {
+                // Identity encoding: known length, read in blocks
+                uint8_t dl_buf[4096];
+                while (written < contentLen && millis() < dl_deadline) {
+                    vTaskDelay(1);  // yield to IDLE0 every iteration
+                    int avail = dl_stream->available();
+                    if (avail > 0) {
+                        int n = dl_stream->readBytes(dl_buf,
+                                    (size_t)min(avail, (int)sizeof(dl_buf)));
+                        if (n > 0) { ps.write(dl_buf, n); written += n; }
+                    } else if (!https.connected()) break;
+                }
+            } else {
+                // Chunked transfer encoding: parse chunk-size headers manually
+                uint8_t dl_buf[4096];
+                while (millis() < dl_deadline) {
+                    vTaskDelay(1);  // yield to IDLE0 every chunk
+                    if (!https.connected() && !dl_stream->available()) break;
+                    String chunk_hdr = dl_stream->readStringUntil('\n');
+                    chunk_hdr.trim();
+                    if (chunk_hdr.length() == 0) continue;
+                    int chunk_sz = (int)strtol(chunk_hdr.c_str(), NULL, 16);
+                    if (chunk_sz == 0) break;  // final chunk
+                    int remaining = chunk_sz;
+                    while (remaining > 0 && millis() < dl_deadline) {
+                        vTaskDelay(1);
+                        int n = dl_stream->readBytes(dl_buf,
+                                    (size_t)min(remaining, (int)sizeof(dl_buf)));
+                        if (n > 0) { ps.write(dl_buf, n); written += n; remaining -= n; }
+                        else if (!https.connected()) break;
+                    }
+                    dl_stream->readStringUntil('\n');  // consume trailing CRLF
+                }
+            }
+        }
+        LOG_DBG("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
+                written, (unsigned)ESP.getFreePsram());
+        LOG_DBG("DEBUG=Patch first64 before: %.64s\r\n", ps.c_str());
         size_t before = ps.length();
-#if STRIP_JSON_RESPONSE
-        json_strip_patch(ps);
-        Serial.printf("DEBUG=Patch stripped: %u → %u bytes (saved %u)\r\n",
-                      (unsigned)before, (unsigned)ps.length(), (unsigned)(before - ps.length()));
-#else
-        Serial.printf("DEBUG=Patch strip DISABLED, raw size=%u bytes\r\n",
-                      (unsigned)ps.length());
-#endif
+
+
 #if DEBUG_KEEP_ONLY_ACHIEVEMENT_ID
         /* DEBUG: filter to a single achievement AND drop RichPresence +
          * Leaderboards so rcheevos doesn't pull in their address sets.
@@ -968,14 +1894,69 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
          * pull in dozens of memrefs per set on Kirby. */
         //static const uint32_t keep_ids[] = { 557557, 577564, 557558 };
         //json_keep_only_achievement_id(ps, keep_ids, 3);
-        json_clean_field_str(ps,   "RichPresencePatch");
-        json_clean_field_array(ps, "Leaderboards");
+        ra_json_scan(ps.c_str(), ps.length(), "raw");
+        vTaskDelay(1); json_remove_whitespace(ps);
+        ra_json_scan(ps.c_str(), ps.length(), "ws");
+        /* v0.27.6 — drop bonus/specialty sets, keep only "core". Cuts the
+         * SMG do_frame ~40% (270→161 achievements) → df/s toward 60, the
+         * timer fix. Set KEEP_ONLY_FIRST_SET to 0 to monitor every set. */
+        #ifndef KEEP_ONLY_FIRST_SET
+        #define KEEP_ONLY_FIRST_SET 1
+        #endif
+        #if KEEP_ONLY_FIRST_SET
+        vTaskDelay(1); json_keep_first_set(ps);
+        ra_json_scan(ps.c_str(), ps.length(), "firstset");
+        #endif
+        vTaskDelay(1); json_clean_field_str(ps,   "RichPresencePatch");
+        ra_json_scan(ps.c_str(), ps.length(), "RP");
+        vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
+        ra_json_scan(ps.c_str(), ps.length(), "LB");
+        vTaskDelay(1); json_remove_field(ps,      "Warning");
+        ra_json_scan(ps.c_str(), ps.length(), "Warning");
+        vTaskDelay(1); json_remove_field(ps,      "BadgeLockedURL");
+        ra_json_scan(ps.c_str(), ps.length(), "BadgeLockedURL");
+        vTaskDelay(1); json_remove_field(ps,      "BadgeURL");
+        ra_json_scan(ps.c_str(), ps.length(), "BadgeURL");
+        vTaskDelay(1); json_remove_field(ps,      "ImageIconURL");
+        ra_json_scan(ps.c_str(), ps.length(), "ImageIconURL");
+        vTaskDelay(1); json_remove_field(ps,      "Rarity");
+        ra_json_scan(ps.c_str(), ps.length(), "Rarity");
+        vTaskDelay(1); json_remove_field(ps,      "RarityHardcore");
+        ra_json_scan(ps.c_str(), ps.length(), "RarityHardcore");
+        vTaskDelay(1); json_remove_field(ps,      "Author");
+        ra_json_scan(ps.c_str(), ps.length(), "Author");
+        vTaskDelay(1); json_remove_flags5_achievements(ps);
+        ra_json_scan(ps.c_str(), ps.length(), "flags5");
+
+        /* v0.27.x — cap the total operation budget by dropping the heaviest
+         * achievements until total ops <= MAX_TOTAL_OPERATIONS. Runs LAST so
+         * it sees the final kept set. Toggle via CAP_TOTAL_OPERATIONS. */
+#if CAP_TOTAL_OPERATIONS
+        vTaskDelay(1); json_cap_total_operations(ps, MAX_TOTAL_OPERATIONS);
+        ra_json_scan(ps.c_str(), ps.length(), "capops");
 #endif
-        Serial.printf("DEBUG=Patch first64 after: %.64s\r\n", ps.c_str());
+
+        // print ths shrinked ps
+        LOG_DBG("DEBUG=Patch after stripping fields: size=%u bytes\r\n", (unsigned)ps.length());
+        LOG_DBG("DEBUG=Patch first128: %.128s...\r\n", ps.c_str());
+
+        /* v0.27.6 EXPERIMENT — cap the achievement count to measure the
+         * do_frame cost curve. Set EXPERIMENT_KEEP_FIRST_N>0 to limit;
+         * 0 = keep all. Watch df_us in the CATCHUP log: it should scale
+         * ~linearly with the kept count. DIAGNOSTIC ONLY — capped builds
+         * don't monitor the dropped achievements. */
+        #ifndef EXPERIMENT_KEEP_FIRST_N
+        #define EXPERIMENT_KEEP_FIRST_N 0
+        #endif
+        #if EXPERIMENT_KEEP_FIRST_N > 0
+        json_keep_first_n_achievements(ps, EXPERIMENT_KEEP_FIRST_N);
+        #endif
+#endif
+        LOG_DBG("DEBUG=Patch first64 after: %.64s\r\n", ps.c_str());
 
         /* Diagnostic: dump area surrounding ConsoleId so we can see if the
          * strip corrupted brace nesting and made the field appear nested. */
-        {
+        if (RA_LOG_LEVEL >= 2) {
             const char *body = ps.c_str();
             const char *p = strstr(body, "ConsoleID");
             if (!p) p = strstr(body, "ConsoleId");
@@ -1009,13 +1990,9 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
             }
         }
 
-        rc_api_server_response_t server_response;
-        memset(&server_response, 0, sizeof(server_response));
-        server_response.body             = ps.c_str();
-        server_response.body_length      = ps.length();
-        server_response.http_status_code = httpCode;
-        callback(&server_response, callback_data);
-        // ps destructor frees PSRAM automatically
+        /* Hand off to the done-queue — the rc_client callback runs on the
+         * loop task (Core 1), not here. ps destructor frees its PSRAM. */
+        http_finish(job, ps.c_str(), ps.length(), httpCode);
     } else {
         // ----------------------------------------------------------------
         // Small response (login, resolve_hash, etc.) — use heap String
@@ -1027,6 +2004,7 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
         int total_read = 0;
         uint32_t deadline = millis() + 15000;
         while ((https.connected() || stream->available()) && millis() < deadline) {
+            vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
             int avail = stream->available();
             if (avail > 0) {
                 int n = stream->readBytes(chunk, min(avail, (int)sizeof(chunk)));
@@ -1037,17 +2015,85 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
             }
             if (contentLen > 0 && total_read >= contentLen) break;
         }
-        Serial.printf("DEBUG=HTTP body: declared=%d received=%d\r\n", contentLen, total_read);
+        LOG_DBG("DEBUG=HTTP body: declared=%d received=%d\r\n", contentLen, total_read);
 
-        rc_api_server_response_t server_response;
-        memset(&server_response, 0, sizeof(server_response));
-        server_response.body             = responseStr.c_str();
-        server_response.body_length      = responseStr.length();
-        server_response.http_status_code = httpCode;
-        callback(&server_response, callback_data);
+        http_finish(job, responseStr.c_str(), responseStr.length(), httpCode);
     }
 
     https.end();
+}
+
+/* rc_client server-call hook — Core 1. Deep-copies the request (rcheevos
+ * frees it as soon as we return) and enqueues; never blocks on the net. */
+static void server_call(const rc_api_request_t *request, rc_client_server_callback_t callback,
+                        void *callback_data, rc_client_t *rc_client) {
+    http_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.url           = strdup(request->url);
+    job.post_data     = request->post_data ? strdup(request->post_data) : NULL;
+    job.callback      = callback;
+    job.callback_data = callback_data;
+    job.gen           = http_gen;
+    if (!job.url || (request->post_data && !job.post_data) ||
+        xQueueSend(http_req_q, &job, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        Serial.println("ERROR=server_call: enqueue failed, request dropped");
+        free(job.url);
+        free(job.post_data);
+    }
+}
+
+/* HTTP worker task — pinned to Core 0, beside the WiFi/lwIP tasks. All
+ * blocking network work (TLS handshake, download, JSON strip) lives here;
+ * Core 1 (EXI + rc_client) never waits on it. */
+static void httpTask(void *pvParameters) {
+    http_job_t job;
+    for (;;) {
+        if (xQueueReceive(http_req_q, &job, portMAX_DELAY) == pdTRUE) {
+            server_call_blocking(&job);
+            free(job.url);
+            free(job.post_data);
+        }
+    }
+}
+
+/* Drain finished HTTP responses — called from loop() so every rc_client
+ * callback executes on the same task as do_frame. Discards responses from
+ * a previous client generation (g_client was destroyed/recreated). */
+static void http_drain_done(void) {
+    http_done_t done;
+    while (http_done_q && xQueueReceive(http_done_q, &done, 0) == pdTRUE) {
+        if (done.gen == http_gen && done.callback) {
+            rc_api_server_response_t server_response;
+            memset(&server_response, 0, sizeof(server_response));
+            server_response.body             = done.body;
+            server_response.body_length      = done.body_len;
+            server_response.http_status_code = done.status;
+
+            /* v0.27.8 — measure what the rcheevos internal structure costs.
+             * For the big achievementsets response (>100KB), the callback
+             * parses it and allocates all the trigger/memref structs; the
+             * before/after delta is the resident cost of the game's set. */
+            bool big = done.body_len > 100000;
+            uint32_t sram_b = 0, psram_b = 0;
+            if (big) {
+                sram_b  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                psram_b = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            }
+            done.callback(&server_response, done.callback_data);
+            if (big) {
+                int32_t sram_used  = (int32_t)sram_b  - (int32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                int32_t psram_used = (int32_t)psram_b - (int32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                LOG_ERR("DEBUG=rcheevos struct cost: body=%uKB sram=%+dKB psram=%+dKB (after: sram-free=%uKB psram-free=%uKB)\r\n",
+                         (unsigned)(done.body_len / 1024),
+                         (int)(sram_used / 1024), (int)(psram_used / 1024),
+                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+            }
+        } else if (done.gen != http_gen) {
+            LOG_DBG("DEBUG=http_drain: stale-generation response discarded\r\n");
+        }
+        free(done.body);
+    }
 }
 
 // ============================================================================
@@ -1093,22 +2139,58 @@ static uint16_t pending_query_start = 0;
  * pointer chains are ~6 levels; 12 leaves plenty of margin while
  * keeping a runaway loop from stalling the ESP32 forever. */
 #define ADDR_QUERY_MAX_ITERATIONS  12
+
+/* v0.27.8 — per-vblank mutation budget. Each ADDR_QUERY round that
+ * discovers new addresses mints one APPEND mutation; the d2x MUT_RING
+ * holds 8, so we keep resolving (more rounds, deeper chains) within ONE
+ * vblank until either convergence (new_missing==0) OR this many mutations
+ * have been minted this frame — whichever comes first. Replaces the
+ * iteration cap as the practical stop condition. Mutations minted this
+ * frame = wl_seq - wl_seq_at_snap_start. */
+#define MAX_MUTATIONS_PER_VBLANK   8
 static uint8_t addr_query_iter_count = 0;
 
-/* Run rc_memrefs_get_addresses with the current peek (which sees both
- * the static watchlist and the dynamic query cache), and APPEND any
- * NEW addresses (not already in query_addrs and not in watchlist) to
- * query_addrs[query_count..]. Returns the number of new addresses
- * appended. The caller decides whether to send an ADDR_QUERY (return
- * > 0) or to set new_snapshot=true (return == 0). */
+/* Finalise per-vblank telemetry and arm processSnapshot.
+ * Every code path that triggers a frame evaluation calls this instead of
+ * writing new_snapshot = true directly, so stats are always consistent. */
+static inline void set_new_snapshot(void) {
+    g_vblank_stats.addr_proc_us           = (uint32_t)(esp_timer_get_time()
+                                              - g_vblank_stats.snap_start_us);
+    g_vblank_stats.iter_depth             = addr_query_iter_count;
+    g_vblank_stats.pre_doframe_miss_count = peek_miss_count;
+    g_vblank_stats.had_mutation           = (wl_seq != g_vblank_stats.wl_seq_at_snap_start)
+                                            ? 1u : 0u;
+    /* Freeze a consistent copy for processSnapshot's LOG_FRAME — reached ONLY on
+     * a converged frame, so g_frame_log always reflects a real do_frame and is
+     * immune to later ok=0 snapshots resetting g_vblank_stats. */
+    memcpy(&g_frame_log, (const void*)&g_vblank_stats, sizeof(g_frame_log));
+    g_frame_log_fc = frame_counter;
+    new_snapshot = true;
+}
+
+/* Run rc_memrefs_get_pending_addresses with the current cache (hash) and
+ * APPEND any NEW addresses (not already in query_addrs and not in watchlist)
+ * to query_addrs[query_count..]. Returns the number of new addresses
+ * appended. The caller decides whether to send an ADDR_QUERY (return > 0)
+ * or to set new_snapshot=true (return == 0).
+ *
+ * v0.28 — switched from rc_memrefs_get_addresses (which resolves chains
+ * against parent->address, frozen since the last do_frame, so it only ever
+ * exposes ONE level per frame → it=2) to rc_memrefs_get_pending_addresses,
+ * which walks each chain from its static root through the live hash and
+ * reports the FIRST uncached level. Each ADDR_RESPONSE commits that level to
+ * the hash, so the NEXT collect round exposes the level below it. Looping
+ * until it returns 0 resolves an entire multi-level chain within a single
+ * vblank. is_cached_cb decides how far each chain can already be walked. */
 static uint16_t collect_missing_addresses(void) {
     const rc_memrefs_t *memrefs = (state == STATE_ACTIVE && g_client)
                                   ? rc_client_get_memrefs(g_client) : NULL;
     if (!memrefs || g_watchlist_pending) return 0;
 
-    uint32_t n = rc_memrefs_get_addresses(
+    uint32_t cm_t0 = (uint32_t)esp_timer_get_time();
+    uint32_t n = rc_memrefs_get_pending_addresses(
         memrefs, prefetch_addrs, prefetch_sizes, PREFETCH_MAX,
-        peek_from_snapshot, NULL);
+        peek_from_snapshot, is_cached_cb, NULL);
 
     uint16_t start_count = query_count;
 
@@ -1116,11 +2198,13 @@ static uint16_t collect_missing_addresses(void) {
         for (uint8_t b = 0; b < prefetch_sizes[pi] && query_count < ADDR_QUERY_MAX; b++) {
             uint32_t byte_addr = prefetch_addrs[pi] + b;
 
-            /* Sanity: reject addresses outside MEM1/MEM2. rc_memrefs_get_
-             * addresses can emit garbage when chain walks see unresolved
-             * pointers (peek=0 → addr = 0 + offset, which can fall
-             * anywhere). Asking ra-module to Swi_MLoad invalid addrs can
-             * crash the Starlet thread. */
+            /* Sanity: reject addresses outside MEM1/MEM2. Should be rare now
+             * — rc_memrefs_get_pending_addresses resolves each level from a
+             * cached (real) parent value, so a reported address is a real
+             * pointer + offset, not garbage off an unresolved 0 pointer. Kept
+             * as a guard: a genuinely NULL/wild pointer in game RAM could
+             * still land here, and asking ra-module to Swi_MLoad an invalid
+             * address can hang the Starlet thread. */
             if (!((byte_addr <= 0x017FFFFF)
                   || (byte_addr >= 0x10000000 && byte_addr <= 0x13FFFFFF))) continue;
 
@@ -1138,12 +2222,26 @@ static uint16_t collect_missing_addresses(void) {
         }
     }
 
+    /* cm= : cache misses encountered WHILE RESOLVING addAddress chains — the
+     * bytes the new resolver could not find in the hash this round and is
+     * about to fetch. Counted here (before the peek_miss safety net) so it
+     * reflects only the addAddress resolution, not do_frame leftovers. The
+     * invariant to watch: next snapshot's sa == this snapshot's sa + Σcm.
+     * If sa_delta > Σcm, the peek_miss net below caught something the
+     * resolver missed (a chain shape not covered) — a useful red flag. */
+    uint16_t part1 = (uint16_t)(query_count - start_count);
+    g_vblank_stats.collect_cm += part1;
+    /* Per-round breakdown: which addAddress level this collect resolved. */
+    if (g_vblank_stats.collect_round < 8)
+        g_vblank_stats.cm_by_round[g_vblank_stats.collect_round] = part1;
+    if (g_vblank_stats.collect_round < 255)
+        g_vblank_stats.collect_round++;
+
     /* Process peek misses accumulated since the last collect (covers BOTH
-     * the rc_memrefs_get_addresses peek calls just now AND the previous
-     * frame's do_frame trigger evaluations). These are the addresses
-     * actually asked for at evaluation time — different from
-     * rc_memrefs_get_addresses' unmasked outputs when AddAddress chains
-     * include mask modifiers (Kirby pattern). */
+     * the resolver's peek calls just now AND the previous frame's do_frame
+     * trigger evaluations). Safety net for any address the resolver did not
+     * surface (e.g. an exotic modifier shape). */
+    uint16_t before_pm = query_count;
     for (uint16_t i = 0; i < peek_miss_count && query_count < ADDR_QUERY_MAX; i++) {
         uint32_t addr = peek_miss_addrs[i];
         if (hash_lookup(addr) >= 0) continue;
@@ -1155,7 +2253,33 @@ static uint16_t collect_missing_addresses(void) {
     }
     peek_miss_count = 0;
 
-    return (uint16_t)(query_count - start_count);
+    /* Diagnostic: the resolver found NOTHING (part1==0) yet do_frame's
+     * peek_miss surfaced addresses the evaluator actually read. Log a few so
+     * we can see WHAT shape the chain walker doesn't cover. Throttled 2s. */
+    uint16_t pm_added = (uint16_t)(query_count - before_pm);
+    if (part1 == 0 && pm_added > 0) {
+        static uint32_t last_pm_log = 0;
+        uint32_t now_pm = millis();
+        if (now_pm - last_pm_log >= 2000) {
+            last_pm_log = now_pm;
+            uint16_t nlog = pm_added < 8 ? pm_added : 8;
+            char buf[160]; int off = 0;
+            for (uint16_t k = 0; k < nlog && off < (int)sizeof(buf) - 12; k++)
+                off += snprintf(buf + off, sizeof(buf) - off, " %08lX",
+                                (unsigned long)query_addrs[before_pm + k]);
+            LOG_FRAME("DEBUG=resolver-miss pm=%u (resolver found 0):%s\r\n",
+                      (unsigned)pm_added, buf);
+        }
+    }
+
+    uint16_t new_count = (uint16_t)(query_count - start_count);
+    /* ms= : all new addresses queued this vblank (resolver + peek_miss net).
+     * cm= (the addAddress-resolution subset) was already accumulated above. */
+    g_vblank_stats.collect_miss_total += new_count;
+    /* CPU spent in the resolver walk this call — accumulated across all the
+     * vblank's rounds. ap_us - cm_cpu_us ≈ EXI round-trip wait. */
+    g_vblank_stats.cm_cpu_us += (uint32_t)esp_timer_get_time() - cm_t0;
+    return new_count;
 }
 
 /* Build & ship an ADDR_QUERY response with the addresses appended in
@@ -1175,10 +2299,10 @@ static void send_addr_query_response(void) {
         uint32_t now_aq = millis();
         if (now_aq - last_aq_log >= 1000) {
             last_aq_log = now_aq;
-            Serial.printf("DEBUG=>> send_addr_query iter=%u round=%u total_qc=%u first_qa=0x%08lX\r\n",
-                          (unsigned)addr_query_iter_count, (unsigned)round_count,
-                          (unsigned)query_count,
-                          (unsigned long)query_addrs[pending_query_start]);
+            LOG_DBG("DEBUG=>> send_addr_query iter=%u round=%u total_qc=%u first_qa=0x%08lX\r\n",
+                    (unsigned)addr_query_iter_count, (unsigned)round_count,
+                    (unsigned)query_count,
+                    (unsigned long)query_addrs[pending_query_start]);
         }
     }
 
@@ -1194,10 +2318,10 @@ static void send_addr_query_response(void) {
 
     uint8_t *buf = (uint8_t*)malloc(sizeof(ra_esp_header_t) + payload_len);
     if (!buf) {
-        Serial.printf("DEBUG=send_addr_query_response: malloc(%u) FAILED\n",
-                      (unsigned)(sizeof(ra_esp_header_t) + payload_len));
+        LOG_ERR("ERROR=send_addr_query_response: malloc(%u) FAILED\n",
+                (unsigned)(sizeof(ra_esp_header_t) + payload_len));
         addr_query_pending = false;
-        new_snapshot = true;  /* fail-open: process frame with what we have */
+        set_new_snapshot();  /* fail-open: process frame with what we have */
         return;
     }
     memcpy(buf, &resp, sizeof(resp));
@@ -1219,14 +2343,14 @@ static void send_addr_query_response(void) {
  * own padding for the single-CS-low write+read pattern. */
 static void send_response(const uint8_t *data, size_t len) {
     if (len > EXI_MAX_TRANSACTION_SIZE) {
-        Serial.printf("DEBUG=send_response: too big len=%u\n", (unsigned)len);
+        LOG_ERR("DEBUG=send_response: too big len=%u\n", (unsigned)len);
         return;
     }
     /* DIAG: log wire-format ONLY for non-ACK events (event_type at offset 2). */
     if (len >= 6 && state == STATE_ACTIVE && data[2] != 0x00) {
-        Serial.printf("DEBUG=>>WIRE len=%u hdr=[%02X %02X %02X %02X %02X %02X]\r\n",
-                      (unsigned)len,
-                      data[0], data[1], data[2], data[3], data[4], data[5]);
+        LOG_DBG("DEBUG=>>WIRE len=%u hdr=[%02X %02X %02X %02X %02X %02X]\r\n",
+                (unsigned)len,
+                data[0], data[1], data[2], data[3], data[4], data[5]);
     }
     exi_spi_prepare_response(data, len);
 }
@@ -1235,7 +2359,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
     if (rx_len < sizeof(ra_gc_header_t)) {
         static uint32_t last_short = 0; uint32_t now = millis();
         if (now - last_short >= 1000) { last_short = now;
-            Serial.printf("DEBUG=EXI: short pkt rx_len=%u\r\n", (unsigned)rx_len); }
+            LOG_DBG("DEBUG=EXI: short pkt rx_len=%u\r\n", (unsigned)rx_len); }
         return;
     }
 
@@ -1243,7 +2367,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
     if (hdr->magic != RA_MAGIC_GC_TO_ESP) {
         static uint32_t last_magic = 0; uint32_t now = millis();
         if (now - last_magic >= 1000) { last_magic = now;
-            Serial.printf("DEBUG=EXI: bad magic 0x%02X rx_len=%u bytes=%02X %02X %02X %02X\r\n",
+            LOG_ERR("DEBUG=EXI: bad magic 0x%02X rx_len=%u bytes=%02X %02X %02X %02X\r\n",
                 hdr->magic, (unsigned)rx_len,
                 rx_data[0], rx_data[1],
                 rx_len>2 ? rx_data[2] : 0, rx_len>3 ? rx_data[3] : 0); }
@@ -1257,8 +2381,8 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
     {
         static uint32_t last_cmd = 0; uint32_t now = millis();
         if (now - last_cmd >= 5000) { last_cmd = now;
-            Serial.printf("DEBUG=EXI: cmd=0x%02X rx_len=%u state=%d\r\n",
-                          hdr->command, (unsigned)rx_len, (int)state); }
+            LOG_DBG("DEBUG=EXI: cmd=0x%02X rx_len=%u state=%d\r\n",
+                      hdr->command, (unsigned)rx_len, (int)state); }
     }
 
     switch (hdr->command) {
@@ -1281,30 +2405,58 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             memcpy(buf + 4, &resp, sizeof(resp));
             memcpy(buf + 4 + sizeof(resp), &device_id, 4);
             exi_spi_prepare_response(buf, sizeof(buf));
-            if (DEBUG) Serial.println("DEBUG=EXI: IDENTIFY");
+            LOG_DBG("DEBUG=EXI: IDENTIFY\r\n");
             break;
         }
         
         case RA_CMD_LOAD_GAME: {
-            // Only game_id (6 bytes) is mandatory; md5_hash is optional.
-            // ra_load_game_t is 40 bytes total — Wii/WiiFlow only sends 8 bytes.
+            // game_id (6 bytes) is mandatory; disc_number/has_hash/md5_hash
+            // follow per ra_load_game_t. Since v0.27.0 WiiFlow computes the
+            // RA hash ON CONSOLE (rc_hash_wii_disc port over the WBFS/ISO
+            // image) and ships it here — identification works for ANY game
+            // RA knows, exactly like Dolphin. The game-ID table remains the
+            // fallback for physical discs / unsupported image formats.
             if (rx_len < sizeof(ra_gc_header_t) + RA_GAME_ID_LEN) break;
             const uint8_t *p = rx_data + sizeof(ra_gc_header_t);
             char gid[RA_GAME_ID_LEN + 1];
             memcpy(gid, p, RA_GAME_ID_LEN);
             gid[RA_GAME_ID_LEN] = '\0';
-            Serial.printf("DEBUG=EXI: LOAD_GAME id=%s rx_len=%u\r\n", gid, (unsigned)rx_len);
+            LOG_INFO("DEBUG=EXI: LOAD_GAME id=%s rx_len=%u\r\n", gid, (unsigned)rx_len);
 
-            // Lookup hash from Wii game table
-            const char *hash = wii_lookup_game_hash(gid);
-            if (hash) {
-                Serial.printf("DEBUG=Hash found: %s (%s)\r\n", hash, wii_lookup_game_name(gid));
-                gameId = String(hash);  // store MD5 hash for loadGame()
+            uint8_t has_hash = 0;
+            char console_hash[RA_HASH_LEN + 1];
+            if (rx_len >= sizeof(ra_gc_header_t) + RA_GAME_ID_LEN + 2 + RA_HASH_LEN) {
+                has_hash = p[RA_GAME_ID_LEN + 1];
+                if (has_hash == 1) {
+                    memcpy(console_hash, p + RA_GAME_ID_LEN + 2, RA_HASH_LEN);
+                    console_hash[RA_HASH_LEN] = '\0';
+                    /* sanity: 32 lowercase hex chars */
+                    for (int hx = 0; hx < RA_HASH_LEN; hx++) {
+                        char c = console_hash[hx];
+                        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                            has_hash = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (has_hash == 1) {
+                LOG_INFO("DEBUG=Console-computed hash: %s\r\n", console_hash);
+                gameId = String(console_hash);
                 state = STATE_LOADING_GAME;
             } else {
-                Serial.printf("ERROR=No hash found for Wii game ID: %s\r\n", gid);
-                gameId = String(gid);
-                state = STATE_ERROR;
+                // Fallback: lookup hash from the Wii game-ID table
+                const char *hash = wii_lookup_game_hash(gid);
+                if (hash) {
+                    LOG_INFO("DEBUG=Hash found in table: %s (%s)\r\n", hash, wii_lookup_game_name(gid));
+                    gameId = String(hash);  // store MD5 hash for loadGame()
+                    state = STATE_LOADING_GAME;
+                } else {
+                    Serial.printf("ERROR=No hash for Wii game ID %s (no console hash either)\r\n", gid);
+                    gameId = String(gid);
+                    state = STATE_ERROR;
+                }
             }
             
             // ACK
@@ -1326,7 +2478,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             if (state == STATE_INIT || state == STATE_ERROR) break;
             if (state == STATE_GAME_LOADED) {
                 state = STATE_ACTIVE;
-                Serial.println("DEBUG=*** STATE 6 -> 7: first SNAPSHOT received from ra-module ***");
+                LOG_INFO("DEBUG=*** STATE 6 -> 7: first SNAPSHOT received from ra-module ***\r\n");
             }
             if (rx_len < sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t)) break;
 
@@ -1334,8 +2486,29 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             uint16_t count = ra_be16_to_host(snap->addr_count);
             frame_counter = ra_be32_to_host(snap->frame_counter);
 
-            /* lru_clock ticks each SNAPSHOT for LRU eviction freshness. */
-            lru_clock++;
+            /* v0.28.8 — LRU clock = PPC VBI game-frame counter (was ++ per
+             * SNAPSHOT ≈7.4Hz, which made the eviction age tiers worth ~8x
+             * their intended seconds). Now age = real game-frames since last
+             * touch — fixed relation to wall-clock and robust to dropped/
+             * skipped snapshots. frame_counter set just above from the header.
+             * (A game restart can reset frame_counter; the age clamps at the
+             * eviction/histogram sites guard the resulting underflow.) */
+            lru_clock = frame_counter;
+
+            /* Reset per-vblank telemetry for this frame. */
+            g_vblank_stats.data_ok               = 0;
+            g_vblank_stats.snap_addr_count        = count;
+            g_vblank_stats.collect_cm             = 0;
+            g_vblank_stats.pre_doframe_miss_count = 0;
+            g_vblank_stats.collect_miss_total     = 0;
+            g_vblank_stats.cm_cpu_us              = 0;
+            g_vblank_stats.iter_depth             = 0;
+            g_vblank_stats.collect_round          = 0;
+            for (uint8_t r = 0; r < 8; r++) g_vblank_stats.cm_by_round[r] = 0;
+            g_vblank_stats.had_mutation           = 0;
+            g_vblank_stats.had_cleanup            = 0;
+            g_vblank_stats.snap_start_us          = (uint32_t)esp_timer_get_time();
+            g_vblank_stats.wl_seq_at_snap_start   = wl_seq;
 
             // Throttled log: confirm ra_do_frame VBlank hook is firing on GC side.
             // frame_counter should increment ~60x/sec. If stuck at 0, hook is not installed.
@@ -1343,83 +2516,70 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             uint32_t snap_now = (uint32_t)(esp_timer_get_time() / 1000);
             if (snap_now - last_snap_log_ms >= 5000) {
                 last_snap_log_ms = snap_now;
-                Serial.printf("DEBUG=SNAP frame=%lu snap_count=%u esp_watch=%u state=%d\r\n",
-                              (unsigned long)frame_counter, (unsigned)count,
-                              (unsigned)watch_count, (int)state);
+                LOG_INFO("DEBUG=SNAP frame=%lu snap_count=%u esp_watch=%u state=%d\r\n",
+                         (unsigned long)frame_counter, (unsigned)count,
+                         (unsigned)watch_count, (int)state);
             }
             const uint8_t *values = rx_data + sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t);
 
-            // Update memory_data and run multi-pass cache fill when fully active
+            /* ---- Phase D2 (v0.26.0): VERIFIED sync ----
+             * The snapshot echoes the seq of the last mutation the Wii
+             * applied. Equality with our wl_seq (plus matching count) is
+             * PROOF of positional alignment — only then do we accept the
+             * values and run the frame. Behind → deliver exactly the next
+             * mutation from the ring (idempotent: the Wii drops anything
+             * != ra_seq+1). Anything else → RESYNC. This replaces the
+             * v0.24.6/v0.25.1 count-mismatch streak heuristics entirely. */
+            uint16_t wl_seq_ra = ra_be16_to_host(snap->wl_seq);
+
             if (state == STATE_ACTIVE) {
-                if (count <= watch_count && memory_data)
-                    memcpy(memory_data, values, count);
-            }
+                ra_seq_view = wl_seq_ra;          /* authoritative echo */
 
-            /* Re-sync: if SNAPSHOT carries FEWER values than our watchlist
-             * size, ra-module missed a WATCHLIST_APPEND event (or just
-             * processed a REMOVE we emitted last round and hasn't grown
-             * back to our count yet — transient state during eviction
-             * roundtrips). Re-send the missing tail BEFORE doing anything
-             * else for this frame. We must skip do_frame this iteration
-             * because peek_from_snapshot would read STALE memory_data for
-             * the missing tail slots and could mis-evaluate triggers.
-             *
-             * mismatch_last_sent_count guards against double-emit: if the
-             * NEXT SNAPSHOT still shows the same count, ra-module hasn't
-             * processed our APPEND yet — don't re-send, just send a plain
-             * ACK. Under Phase B's deterministic delivery this dedup is
-             * rarely needed but kept as a cheap belt-and-suspenders. */
-            static uint16_t mismatch_last_sent_count = 0xFFFF;
-
-            if (state == STATE_ACTIVE && count < watch_count
-                && count == mismatch_last_sent_count) {
-                /* Same mismatch as last tx — skip re-send, send plain ACK. */
-                ra_esp_header_t ack;
-                ack.magic       = RA_MAGIC_ESP_TO_GC;
-                ack.status      = (uint8_t)state;
-                ack.event_type  = RA_EVT_NONE;
-                ack.event_count = 0;
-                ack.data_len    = 0;
-                send_response((uint8_t*)&ack, sizeof(ack));
-                break;
-            }
-
-            if (state == STATE_ACTIVE && count < watch_count) {
-                uint16_t missing = (uint16_t)(watch_count - count);
-                if (missing > ADDR_QUERY_MAX) missing = ADDR_QUERY_MAX;
-                mismatch_last_sent_count = count;  /* arm dup-suppression */
-                Serial.printf("DEBUG=SNAPSHOT mismatch: ra-module count=%u < esp watch=%u — re-sending APPEND for %u tail addrs\r\n",
-                              (unsigned)count, (unsigned)watch_count, (unsigned)missing);
-
-                static uint8_t buf[sizeof(ra_esp_header_t)
-                                   + sizeof(ra_watchlist_append_t)
-                                   + ADDR_QUERY_MAX * 4];
-                ra_esp_header_t evt;
-                evt.magic       = RA_MAGIC_ESP_TO_GC;
-                evt.status      = (uint8_t)state;
-                evt.event_type  = RA_EVT_WATCHLIST_APPEND;
-                evt.event_count = 0;
-                uint16_t data_len = sizeof(ra_watchlist_append_t) + missing * 4;
-                evt.data_len    = ra_host_to_be16(data_len);
-                memcpy(buf, &evt, sizeof(evt));
-                ra_watchlist_append_t wa;
-                wa.addr_count = ra_host_to_be16(missing);
-                memcpy(buf + sizeof(evt), &wa, sizeof(wa));
-                uint8_t *addr_dst = buf + sizeof(evt) + sizeof(wa);
-                for (uint16_t i = 0; i < missing; i++) {
-                    uint32_t a = ra_host_to_be32(watch_addresses[count + i]);
-                    memcpy(addr_dst + i * 4, &a, 4);
+                if (wl_seq_ra != wl_seq) {
+                    static uint32_t last_behind_log = 0;
+                    uint32_t now_bh = millis();
+                    if (now_bh - last_behind_log >= 2000) {
+                        last_behind_log = now_bh;
+                        LOG_DBG("DEBUG=SNAP seq: ra=%u esp=%u — delivering next mutation\r\n",
+                                (unsigned)wl_seq_ra, (unsigned)wl_seq);
+                    }
+                    if (!mut_deliver_next()) {
+                        /* Wii ahead of us, or the ring no longer holds the
+                         * mutation it needs — unrecoverable by walking. */
+                        trigger_watchlist_resync("seq-gap");
+                        ra_esp_header_t ack;
+                        ack.magic       = RA_MAGIC_ESP_TO_GC;
+                        ack.status      = (uint8_t)state;
+                        ack.event_type  = RA_EVT_NONE;
+                        ack.event_count = 0;
+                        ack.data_len    = 0;
+                        send_response((uint8_t*)&ack, sizeof(ack));
+                    }
+                    g_ok0_skips++;
+                    break;   /* out of sync — no memcpy, no do_frame */
                 }
-                send_response(buf, sizeof(evt) + data_len);
-                /* Skip do_frame this iteration — wait for ra-module's
-                 * next SNAPSHOT to confirm catch-up. */
-                break;
-            }
 
-            /* No mismatch this SNAPSHOT — ra-module caught up. Reset
-             * the dup-suppression marker so a FUTURE mismatch (e.g. after
-             * another eviction) goes through. */
-            mismatch_last_sent_count = 0xFFFF;
+                if (count != watch_count) {
+                    /* Same mutation point but different length = replica
+                     * corruption the seq stream cannot explain. */
+                    trigger_watchlist_resync("count@seq");
+                    ra_esp_header_t ack;
+                    ack.magic       = RA_MAGIC_ESP_TO_GC;
+                    ack.status      = (uint8_t)state;
+                    ack.event_type  = RA_EVT_NONE;
+                    ack.event_count = 0;
+                    ack.data_len    = 0;
+                    send_response((uint8_t*)&ack, sizeof(ack));
+                    g_ok0_skips++;
+                    break;
+                }
+
+                /* Verified in sync — accept the values. */
+                if (memory_data) {
+                    memcpy(memory_data, values, count);
+                    g_vblank_stats.data_ok = 1;  /* Phase D2 integrity check passed */
+                }
+            }
 
             /* CRITICAL: only reset multi-pass state when no ADDR_QUERY is in
              * flight. ra-module's arm-after-prepare protocol means a
@@ -1444,11 +2604,52 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
              * round's bookkeeping is still needed. See
              * [[project-snapshot-wipes-inflight-query]]. */
             if (!addr_query_pending) {
+                /* EVICTION (v0.31): trigger at the CONVERGED state — both
+                 * replicas are identical here (count just matched in Phase D2)
+                 * — and BEFORE this frame's resolution. evict_lru defrags the
+                 * ESP list + queues REMOVE_IDX(s); the collect_missing below
+                 * then re-resolves any evicted-but-still-reachable byte (re-walk
+                 * → re-query → re-append age 0), so nothing the do_frame needs is
+                 * stranded (this is WHY it goes before resolution, not after).
+                 * The REMOVE ships via the existing convergence mut_deliver; the
+                 * seq machinery drains multi-batch in order. Only fires under
+                 * watchlist pressure — light games (Kirby ~978 << 4608) never
+                 * hit it. d2x unchanged (REMOVE_IDX handler already in v0.30). */
+                if (state == STATE_ACTIVE && watch_count > WATCHLIST_HIGH_WATER) {
+                    evict_lru();
+                }
                 query_count = 0;
                 pending_query_start = 0;
                 addr_query_iter_count = 0;
-                n_missing = (state == STATE_ACTIVE)
-                            ? collect_missing_addresses() : 0;
+                /* v0.27.3 — SKIP the expensive memref walk in steady state.
+                 * collect_missing_addresses() iterates all ~3500 SMG memrefs
+                 * (rc_memrefs_get_addresses peeks every chain) EVERY snapshot,
+                 * which starves the do_frame catch-up of CPU (measured df/s=16
+                 * vs 60 needed → bunny timer ran 27% speed). But once chains
+                 * have converged it finds nothing new. peek_miss_count carries
+                 * the PREVIOUS do_frame's unresolved peeks: if it's 0, every
+                 * address the evaluator touched was already cached, so the
+                 * walk is pure waste — skip it and converge immediately,
+                 * freeing the frame for catch-up do_frames. A pointer that
+                 * moves (galaxy change) makes the next do_frame miss → walk
+                 * runs the frame after (1-frame latency, same as always). A
+                 * periodic force every FORCE_COLLECT_EVERY frames catches any
+                 * address only reachable via the memref walk, not do_frame. */
+                #define FORCE_COLLECT_EVERY 60u
+                static uint16_t collect_skip_run = 0;
+                if (state == STATE_ACTIVE) {
+                    if (peek_miss_count > 0
+                        || ++collect_skip_run >= FORCE_COLLECT_EVERY) {
+                        collect_skip_run = 0;
+                        uint32_t t0 = (uint32_t)esp_timer_get_time();
+                        n_missing = collect_missing_addresses();
+                        g_cm_us += (uint32_t)esp_timer_get_time() - t0;
+                        g_cm_n++;
+                    } else {
+                        n_missing = 0;     /* steady state — converge now */
+                        g_cm_skipped++;
+                    }
+                }
             }
 
             /* Throttled snapshot diagnostic — 2s cadence keeps Serial
@@ -1459,7 +2660,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 uint32_t now_sd = millis();
                 if (now_sd - last_snap_diag >= 2000) {
                     last_snap_diag = now_sd;
-                    Serial.printf("DEBUG=SNAP_HDR n_missing=%u qc=%u peek_miss=%u first_qa=%08lX\r\n",
+                    LOG_DBG("DEBUG=SNAP_HDR n_missing=%u qc=%u peek_miss=%u first_qa=%08lX\r\n",
                                   (unsigned)n_missing, (unsigned)query_count,
                                   (unsigned)peek_miss_count,
                                   query_count > 0 ? (unsigned long)query_addrs[0] : 0UL);
@@ -1472,33 +2673,20 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             resp.status      = (uint8_t)state;
             resp.event_count = has_pending_event() ? 1 : 0;
 
-            /* Phase A.5 — REMOVE has top priority. evict_lru() queued
-             * specific addresses to drop; emit them so ra-module can
-             * defrag in lockstep. */
-            if (pending_remove_count > 0) {
-                uint16_t n = pending_remove_count;
-                uint16_t data_len = sizeof(ra_watchlist_remove_t) + n * 4;
-                static uint8_t buf[sizeof(ra_esp_header_t)
-                                   + sizeof(ra_watchlist_remove_t)
-                                   + EVICT_BATCH_SIZE * 4];
-                ra_esp_header_t evt;
-                evt.magic       = RA_MAGIC_ESP_TO_GC;
-                evt.status      = (uint8_t)state;
-                evt.event_type  = RA_EVT_WATCHLIST_REMOVE;
-                evt.event_count = 0;
-                evt.data_len    = ra_host_to_be16(data_len);
-                memcpy(buf, &evt, sizeof(evt));
-                ra_watchlist_remove_t wr;
-                wr.addr_count = ra_host_to_be16(n);
-                memcpy(buf + sizeof(evt), &wr, sizeof(wr));
-                memcpy(buf + sizeof(evt) + sizeof(wr),
-                       pending_remove_addrs, n * 4);
-                send_response(buf, sizeof(evt) + data_len);
-                Serial.printf("DEBUG=Sent WATCHLIST_REMOVE n=%u (esp_watch=%u)\r\n",
-                              (unsigned)n, (unsigned)watch_count);
-                pending_remove_count = 0;
-                new_snapshot = true;
-                break;
+            /* Mutation delivery has top priority. collect_missing →
+             * watchlist_append may have just minted an eviction
+             * (REMOVE_IDX) and/or an append on THIS frame — the ring
+             * holds them in seq order; ship the next one the Wii lacks.
+             * memory_data stays locally coherent (evict_lru defrags it
+             * with the addresses), so do_frame on this frame's values
+             * is safe. */
+            if (state == STATE_ACTIVE && ra_seq_view != wl_seq) {
+                if (mut_deliver_next()) {
+                    set_new_snapshot();
+                    break;
+                }
+                trigger_watchlist_resync("ring-miss");
+                /* fall through to plain ACK below via the event-less path */
             }
 
             if (n_missing > 0) {
@@ -1511,21 +2699,24 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 addr_query_iter_count = 1;
                 send_addr_query_response();
             } else if (g_watchlist_pending) {
-                // Notify GC: new watchlist ready
+                // Notify GC: new watchlist ready (initial load OR Phase D2
+                // resync). seq = the mutation base both sides hold after
+                // the chunk fetch completes.
                 uint16_t num_chunks = RA_WATCHLIST_NUM_CHUNKS(g_watchlist_count);
                 ra_watchlist_notify_t notify;
                 notify.total_addr_count = ra_host_to_be16(g_watchlist_count);
                 notify.num_chunks       = ra_host_to_be16(num_chunks);
+                notify.seq              = ra_host_to_be16(wl_seq);
                 resp.event_type = RA_EVT_WATCHLIST_UPDATE;
                 resp.data_len   = ra_host_to_be16(sizeof(notify));
                 uint8_t buf[sizeof(ra_esp_header_t) + sizeof(notify)];
                 memcpy(buf, &resp, sizeof(resp));
                 memcpy(buf + sizeof(resp), &notify, sizeof(notify));
                 send_response(buf, sizeof(buf));
-                new_snapshot = true;  // no missing addrs, process immediately
+                set_new_snapshot();  // no missing addrs, process immediately
             } else {
                 // No missing addresses, no watchlist update. Process immediately.
-                new_snapshot = true;
+                set_new_snapshot();
                 PendingEvent *evt = peek_event();
                 if (evt) {
                     resp.event_type = evt->type;
@@ -1564,142 +2755,107 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 uint32_t now_resp = millis();
                 if (now_resp - last_resp_log >= 1000) {
                     last_resp_log = now_resp;
-                    Serial.printf("DEBUG=<<ADDR_RESP qc=%u resp_count=%u iter=%u first_qa=0x%08lX\r\n",
-                                  (unsigned)query_count, (unsigned)resp_count,
-                                  (unsigned)addr_query_iter_count,
-                                  query_count > 0 ? (unsigned long)query_addrs[0] : 0UL);
+                    LOG_DBG("DEBUG=<<ADDR_RESP qc=%u resp_count=%u iter=%u first_qa=0x%08lX\r\n",
+                            (unsigned)query_count, (unsigned)resp_count,
+                            (unsigned)addr_query_iter_count,
+                            query_count > 0 ? (unsigned long)query_addrs[0] : 0UL);
                 }
             }
 
-            /* Values land at the offset where the most recent round of
-             * collect_missing_addresses appended new addresses. */
-            for (uint16_t i = 0; i < resp_count
-                              && (pending_query_start + i) < query_count; i++) {
-                query_values[pending_query_start + i] = resp_values[i];
+            /* Commit this batch immediately to the permanent watchlist + hash.
+             * This is the key to multi-level chain resolution in a single vblank:
+             * instead of accumulating all rounds into query_addrs and committing
+             * only at convergence, we commit each round right here so the next
+             * collect_missing_addresses() call finds these addresses via hash_lookup()
+             * (O(1) hit → skip), exposing only the NEXT level of the pointer chain
+             * as new misses. Without this, query_count hits ADDR_QUERY_MAX=128 on
+             * round 1 and the second collect() call immediately returns 0 (cap full),
+             * capping discovery at 128 addrs/vblank regardless of chain depth. */
+            uint16_t round_start  = pending_query_start;
+            uint16_t round_end    = (pending_query_start + resp_count < query_count)
+                                    ? pending_query_start + resp_count
+                                    : query_count;
+            uint16_t round_actual = round_end - round_start;
+            uint16_t round_new_addrs = 0;
+            if (state == STATE_ACTIVE && round_actual > 0) {
+                uint16_t before_round = watch_count;
+                watchlist_append(query_addrs + round_start, resp_values, round_actual);
+                if (watch_count > before_round)
+                    round_new_addrs = watch_count - before_round;
             }
 
-            addr_query_pending = false;
-            (void)resp_count;  /* parsed above but unused after Phase B */
+            /* Reset query buffer — all addresses from this round are now in
+             * the hash, so we don't need to keep them in query_addrs for
+             * fallback lookups in read_memory_ingame / peek_from_snapshot. */
+            query_count        = 0;
+            pending_query_start = 0;
 
-            /* Run next convergence pass — peek_from_snapshot now sees
-             * the values we just received, so deeper pointer chains
-             * may resolve to brand new addresses. */
-            pending_query_start = query_count;
+            addr_query_pending = false;
+
+            /* Run next convergence pass — peek_from_snapshot now sees the
+             * newly committed addresses via hash_lookup (not query_addrs),
+             * so deeper pointer chain levels resolve correctly. */
             uint16_t new_missing = (state == STATE_ACTIVE)
                                    ? collect_missing_addresses() : 0;
             addr_query_iter_count++;
 
-            if (new_missing > 0 && addr_query_iter_count < ADDR_QUERY_MAX_ITERATIONS) {
+            /* v0.27.8 — keep resolving within this vblank until convergence
+             * OR the per-vblank mutation budget (8 = d2x MUT_RING) is spent.
+             * Mutations minted this frame = wl_seq - wl_seq_at_snap_start. */
+            uint16_t muts_this_vblank =
+                (uint16_t)(wl_seq - g_vblank_stats.wl_seq_at_snap_start);
+            if (new_missing > 0
+                && muts_this_vblank < MAX_MUTATIONS_PER_VBLANK
+                && addr_query_iter_count < ADDR_QUERY_MAX_ITERATIONS) {
                 /* Another round needed — send ADDR_QUERY for just the
                  * new addresses. ra-module sees event_type=ADDR_QUERY
                  * and loops back with another ADDR_RESPONSE. */
                 send_addr_query_response();
             } else {
-                /* Converged (or iteration cap hit). Commit query_addrs/
-                 * query_values to the permanent watchlist FIRST, THEN set
-                 * new_snapshot=true. If we set new_snapshot=true before the
-                 * append, Core 0's processSnapshot can race in, run do_frame,
-                 * and (used to) reset query_count=0 at its tail — wiping the
-                 * value we needed for watchlist_append a few microseconds
-                 * later. Order is now: read query_count → append → publish. */
-                uint16_t new_addr_count = 0;
-                uint16_t qc_snapshot = query_count;
-                if (state == STATE_ACTIVE && qc_snapshot > 0) {
-                    uint16_t before = watch_count;
-                    watchlist_append(query_addrs, query_values, qc_snapshot);
-                    /* watchlist_append may have triggered evict_lru() if
-                     * the batch crossed WATCHLIST_HIGH_WATER. In that case
-                     * watch_count dropped BELOW `before` then re-grew to
-                     * static_count + actual_appended — `before - watch_count`
-                     * would wrap. Guard the subtraction. */
-                    if (watch_count > before) {
-                        new_addr_count = watch_count - before;
-                    } else {
-                        new_addr_count = 0;
-                    }
-                }
-                new_snapshot = true;
+                /* Converged (or iteration cap hit). All batches were already
+                 * committed to the watchlist + hash per-round above, so no
+                 * additional watchlist_append() is needed here.
+                 * query_count == 0 at this point (reset after last round). */
+                uint16_t new_addr_count = round_new_addrs;  /* from last round */
+                set_new_snapshot();
 
                 static uint32_t last_conv_log = 0;
                 uint32_t now_ms = millis();
                 if (now_ms - last_conv_log >= 2000) {
                     last_conv_log = now_ms;
-                    Serial.printf("DEBUG=CONVERGE qc=%u new_addrs=%u watch=%u\r\n",
-                                  (unsigned)qc_snapshot, (unsigned)new_addr_count,
-                                  (unsigned)watch_count);
+                    LOG_DBG("DEBUG=CONVERGE iter=%u new_addrs(last)=%u watch=%u\r\n",
+                            (unsigned)addr_query_iter_count,
+                            (unsigned)new_addr_count,
+                            (unsigned)watch_count);
                 }
 
-                /* Phase A.5 — REMOVE takes priority over WATCHLIST_APPEND.
-                 * If watchlist_append() crossed HIGH_WATER it called
-                 * evict_lru() which queued specific addresses in
-                 * pending_remove_addrs[]. */
-                if (pending_remove_count > 0) {
-                    uint16_t n = pending_remove_count;
-                    uint16_t data_len = sizeof(ra_watchlist_remove_t) + n * 4;
-                    static uint8_t buf[sizeof(ra_esp_header_t)
-                                       + sizeof(ra_watchlist_remove_t)
-                                       + EVICT_BATCH_SIZE * 4];
-                    ra_esp_header_t evt;
-                    evt.magic       = RA_MAGIC_ESP_TO_GC;
-                    evt.status      = (uint8_t)state;
-                    evt.event_type  = RA_EVT_WATCHLIST_REMOVE;
-                    evt.event_count = 0;
-                    evt.data_len    = ra_host_to_be16(data_len);
-                    memcpy(buf, &evt, sizeof(evt));
-                    ra_watchlist_remove_t wr;
-                    wr.addr_count = ra_host_to_be16(n);
-                    memcpy(buf + sizeof(evt), &wr, sizeof(wr));
-                    memcpy(buf + sizeof(evt) + sizeof(wr),
-                           pending_remove_addrs, n * 4);
-                    send_response(buf, sizeof(evt) + data_len);
-                    Serial.printf("DEBUG=CONVERGE WATCHLIST_REMOVE n=%u (esp_watch=%u)\r\n",
-                                  (unsigned)n, (unsigned)watch_count);
-                    pending_remove_count = 0;
-                } else if (new_addr_count > 0) {
-                    static uint32_t last_app_log = 0;
-                    uint32_t now_a = millis();
-                    if (now_a - last_app_log >= 2000) {
-                        last_app_log = now_a;
-                        Serial.printf("DEBUG=CONVERGE sending WATCHLIST_APPEND for %u addrs (watch=%u)\r\n",
-                                      (unsigned)new_addr_count, (unsigned)watch_count);
+                /* Phase D2: any mutations minted by watchlist_append above
+                 * (an eviction REMOVE_IDX and/or the APPEND itself) are in
+                 * the ring in seq order — deliver the next one the Wii
+                 * lacks. The Wii applies it and its next snapshot echoes
+                 * the new seq; remaining mutations ship one per response. */
+                if (state == STATE_ACTIVE && ra_seq_view != wl_seq) {
+                    if (!mut_deliver_next()) {
+                        trigger_watchlist_resync("ring-miss-conv");
+                        ra_esp_header_t ack;
+                        ack.magic       = RA_MAGIC_ESP_TO_GC;
+                        ack.status      = (uint8_t)state;
+                        ack.event_type  = RA_EVT_NONE;
+                        ack.event_count = 0;
+                        ack.data_len    = 0;
+                        send_response((uint8_t*)&ack, sizeof(ack));
+                    } else if (new_addr_count > 0) {
+                        static uint32_t last_app_log = 0;
+                        uint32_t now_a = millis();
+                        if (now_a - last_app_log >= 2000) {
+                            last_app_log = now_a;
+                            LOG_DBG("DEBUG=CONVERGE delivering mutation seq=%u (appended %u, watch=%u)\r\n",
+                                    (unsigned)ra_seq_view, (unsigned)new_addr_count,
+                                    (unsigned)watch_count);
+                        }
                     }
-                    /* Build response: esp_header + ra_watchlist_append_t + N*4 addrs.
-                     * Tell ra-module the EXACT addrs to append, in
-                     * insertion order (ra-module just appends to its tail
-                     * so its order matches ours). Static buf to avoid
-                     * stack pressure on the EXI core's loopTask. */
-                    static uint8_t buf[sizeof(ra_esp_header_t)
-                                       + sizeof(ra_watchlist_append_t)
-                                       + ADDR_QUERY_MAX * 4];
-                    ra_esp_header_t evt;
-                    evt.magic       = RA_MAGIC_ESP_TO_GC;
-                    evt.status      = (uint8_t)state;
-                    evt.event_type  = RA_EVT_WATCHLIST_APPEND;
-                    evt.event_count = 0;
-                    uint16_t data_len = sizeof(ra_watchlist_append_t) + new_addr_count * 4;
-                    evt.data_len    = ra_host_to_be16(data_len);
-                    memcpy(buf, &evt, sizeof(evt));
-                    ra_watchlist_append_t wa;
-                    wa.addr_count = ra_host_to_be16(new_addr_count);
-                    memcpy(buf + sizeof(evt), &wa, sizeof(wa));
-                    /* Read from the TAIL of watch_addresses, NOT query_addrs.
-                     * watchlist_append may have filtered out duplicates
-                     * (defensive dedup against hash false-misses post-
-                     * eviction), so the addresses actually appended are
-                     * watch_addresses[watch_count - new_addr_count ..
-                     * watch_count - 1] — not the first new_addr_count of
-                     * query_addrs. Mismatching these would emit a phantom
-                     * APPEND to ra-module for an address ESP32 didn't
-                     * actually add, breaking the SNAPSHOT positional invariant. */
-                    uint8_t *addr_dst = buf + sizeof(evt) + sizeof(wa);
-                    uint16_t base_idx = (uint16_t)(watch_count - new_addr_count);
-                    for (uint16_t i = 0; i < new_addr_count; i++) {
-                        uint32_t a = ra_host_to_be32(watch_addresses[base_idx + i]);
-                        memcpy(addr_dst + i * 4, &a, 4);
-                    }
-                    send_response(buf, sizeof(evt) + data_len);
                 } else {
-                    /* No new addrs to announce — plain ack. */
+                    /* Nothing to deliver — plain ack. */
                     ra_esp_header_t ack;
                     ack.magic       = RA_MAGIC_ESP_TO_GC;
                     ack.status      = (uint8_t)state;
@@ -1712,8 +2868,8 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 if (addr_query_iter_count >= ADDR_QUERY_MAX_ITERATIONS && new_missing > 0) {
                     static uint32_t last_iter_warn = 0; uint32_t now = millis();
                     if (now - last_iter_warn >= 5000) { last_iter_warn = now;
-                        Serial.printf("DEBUG=ADDR_QUERY iteration cap (%u) hit with %u still missing\r\n",
-                                      ADDR_QUERY_MAX_ITERATIONS, new_missing);
+                        LOG_DBG("DEBUG=ADDR_QUERY iteration cap (%u) hit with %u still missing\r\n",
+                                ADDR_QUERY_MAX_ITERATIONS, new_missing);
                     }
                 }
             }
@@ -1723,22 +2879,30 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
         case RA_CMD_DEBUG_LOG: {
             /* Format: u8 msg_len, then msg_len bytes of ASCII text. */
             if (rx_len < sizeof(ra_gc_header_t) + 1) {
-                Serial.printf("DEBUG=GC: (DEBUG_LOG rx too short: %u bytes)\n",
-                              (unsigned)rx_len);
+                LOG_DBG("DEBUG=GC: (DEBUG_LOG rx too short: %u bytes)\n",
+                        (unsigned)rx_len);
                 break;
             }
             const uint8_t *p = rx_data + sizeof(ra_gc_header_t);
             uint8_t msg_len = *p;
             if (rx_len < sizeof(ra_gc_header_t) + 1 + msg_len) {
-                Serial.printf("DEBUG=GC: (DEBUG_LOG truncated: have %u bytes, need %u)\n",
-                              (unsigned)rx_len,
-                              (unsigned)(sizeof(ra_gc_header_t) + 1 + msg_len));
+                LOG_DBG("DEBUG=GC: (DEBUG_LOG truncated: have %u bytes, need %u)\n",
+                        (unsigned)rx_len,
+                        (unsigned)(sizeof(ra_gc_header_t) + 1 + msg_len));
                 break;
             }
 
-            Serial.print("DEBUG=GC: ");
-            Serial.write(p + 1, msg_len);
-            Serial.println();
+            /* v0.28.9 — also surface ra-module diag (VBI/PHB timing) when
+             * FRAME stats are on, so it shows up next to the FRAME lines
+             * WITHOUT raising RA_LOG_LEVEL (which would add the noisier ESP
+             * LOG_DBG traffic and perturb the cyc_us we're measuring). These
+             * GC messages are throttled (~2 per 5s), so the Serial cost is
+             * negligible. Revert this `|| RA_LOG_FRAME_STATS` after the test. */
+            if (RA_LOG_LEVEL >= 2 || RA_LOG_FRAME_STATS) {
+                Serial.print("DEBUG=GC: ");
+                Serial.write(p + 1, msg_len);
+                Serial.println();
+            }
 
             /* Minimal ACK — we don't care about the response on the GC side. */
             ra_esp_header_t ack;
@@ -1753,8 +2917,8 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 
         case RA_CMD_GET_WATCHLIST_CHUNK: {
             if (rx_len < sizeof(ra_gc_header_t) + sizeof(ra_watchlist_chunk_req_t)) {
-                Serial.printf("DEBUG=GET_CHUNK: rx_len too short (%u bytes)\n",
-                              (unsigned)rx_len);
+                LOG_DBG("DEBUG=GET_CHUNK: rx_len too short (%u bytes)\n",
+                        (unsigned)rx_len);
                 break;
             }
             const ra_watchlist_chunk_req_t *req =
@@ -1788,15 +2952,14 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 
             /* Unconditional diagnostic — chunk traffic is infrequent so we
              * never need to throttle it. */
-            Serial.printf("DEBUG=GET_CHUNK req: idx=%u (total_addrs=%u, n_chunks=%u, this_chunk=%u, is_last=%u, resp_len=%u, padded_len=%u)\n",
-                          chunk_idx, total, n_chunks, n_in_chunk, is_last,
-                          (unsigned)(sizeof(ra_esp_header_t) + resp_data_len),
-                          (unsigned)total_len);
+            LOG_DBG("DEBUG=GET_CHUNK req: idx=%u (total_addrs=%u, n_chunks=%u, this_chunk=%u, is_last=%u, resp_len=%u, padded_len=%u)\n",
+                    chunk_idx, total, n_chunks, n_in_chunk, is_last,
+                    (unsigned)(sizeof(ra_esp_header_t) + resp_data_len),
+                    (unsigned)total_len);
 
             uint8_t *buf = (uint8_t*)malloc(total_len);
             if (!buf) {
-                Serial.printf("DEBUG=GET_CHUNK: malloc(%u) FAILED\n",
-                              (unsigned)total_len);
+                LOG_ERR("DEBUG=GET_CHUNK: malloc(%u) FAILED\n", (unsigned)total_len);
                 break;
             }
 
@@ -1826,7 +2989,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 addr_out[i] = ra_host_to_be32(g_watchlist_addrs[start + i]);
 
             /* Log first 4 addresses so we can confirm the data on the GC side. */
-            if (n_in_chunk > 0) {
+            if (n_in_chunk > 0 && RA_LOG_LEVEL >= 2) {
                 Serial.printf("DEBUG=GET_CHUNK first addrs:");
                 for (uint16_t i = 0; i < n_in_chunk && i < 4; i++) {
                     Serial.printf(" 0x%08lX",
@@ -1838,11 +3001,13 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 
             /* Log first 22 bytes of the prepared response: 6 padding + the
              * first 16 bytes of actual content. */
-            Serial.printf("DEBUG=GET_CHUNK resp head:");
-            for (uint32_t i = 0; i < total_len && i < 22; i++) {
-                Serial.printf(" %02X", buf[i]);
+            if (RA_LOG_LEVEL >= 2) {
+                Serial.printf("DEBUG=GET_CHUNK resp head:");
+                for (uint32_t i = 0; i < total_len && i < 22; i++) {
+                    Serial.printf(" %02X", buf[i]);
+                }
+                Serial.println();
             }
-            Serial.println();
 
             exi_spi_prepare_response(buf, total_len);
             free(buf);
@@ -1878,7 +3043,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
         }
 
         case RA_CMD_GAME_RESET: {
-            Serial.println("DEBUG=EXI: GAME_RESET");
+            LOG_INFO("DEBUG=EXI: GAME_RESET\r\n");
             // TODO: reset rcheevos state
             state = STATE_WAIT_GAME_ID;
             ra_esp_header_t resp;
@@ -1916,45 +3081,21 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 static uint16_t watchlist_append(const uint32_t *addrs, const uint8_t *values, uint16_t count) {
     if (count == 0) return watch_count;
     uint16_t old_count = watch_count;
-    /* Defense-in-depth dedup via hash: skip any addr that is ALREADY in
-     * watch_addresses. collect_missing_addresses already dedups via
-     * hash_lookup, but if the hash got into a transient inconsistent state
-     * (e.g. mid-eviction tombstones in earlier versions), duplicates could
-     * slip in. Cheap (O(count) hash hits) and bullet-proof. */
-    static uint32_t  filtered_addrs[ADDR_QUERY_MAX];
-    static uint8_t   filtered_values[ADDR_QUERY_MAX];
-    uint16_t filtered_count = 0;
-    for (uint16_t i = 0; i < count && filtered_count < ADDR_QUERY_MAX; i++) {
-        if (hash_lookup(addrs[i]) >= 0) continue;  /* already in watchlist */
-        /* Also dedup within this batch (could be same addr twice). */
-        bool dup_in_batch = false;
-        for (uint16_t j = 0; j < filtered_count; j++) {
-            if (filtered_addrs[j] == addrs[i]) { dup_in_batch = true; break; }
-        }
-        if (dup_in_batch) continue;
-        filtered_addrs[filtered_count]  = addrs[i];
-        filtered_values[filtered_count] = values[i];
-        filtered_count++;
-    }
-    if (filtered_count == 0) return watch_count;
-    count = filtered_count;
-    addrs = filtered_addrs;
-    values = filtered_values;
 
+    /* UNIFY (v0.30): NO filter, NO eviction here. The ra-module appends these
+     * SAME addresses in-band when it receives the ADDR_QUERY, so both replicas
+     * grow identically and Phase D2's count check verifies the append — the
+     * wl_seq channel is now REMOVE-only.
+     *  - No filter: collect_missing_addresses already deduped query_addrs vs
+     *    the hash; filtering here (but NOT on the ra-module) would desync the
+     *    replicas. A stray dup would land on BOTH sides -> still in sync.
+     *  - No evict_lru: the REMOVE_IDX-vs-in-band-append ordering is the
+     *    eviction milestone's job. Until then only the hard cap bounds growth
+     *    (SMG peaks ~5300 < 6144, so it won't bite in normal sessions). */
     uint32_t new_count = (uint32_t)old_count + count;
-    /* Phase A.5 — HIGH WATER eviction: drop LRU dynamic entries that
-     * AREN'T protected (statics + their byte-fanouts always stay). Queues
-     * a REMOVE event for ra-module to defrag in lockstep. */
-    if (new_count > WATCHLIST_HIGH_WATER) {
-        Serial.printf("DEBUG=watchlist_append: HIGH WATER hit (%u + %u > %u) — running evict_lru\r\n",
-                      (unsigned)old_count, (unsigned)count, (unsigned)WATCHLIST_HIGH_WATER);
-        evict_lru();
-        old_count = watch_count;
-        new_count = (uint32_t)old_count + count;
-    }
     if (new_count > RA_MAX_WATCH_ADDRS) {
-        Serial.printf("DEBUG=watchlist_append: would overflow (%u + %u > %u)\r\n",
-                      old_count, count, RA_MAX_WATCH_ADDRS);
+        LOG_ERR("DEBUG=watchlist_append: at hard cap (%u + %u > %u) — skipped (eviction pending)\r\n",
+                (unsigned)old_count, (unsigned)count, (unsigned)RA_MAX_WATCH_ADDRS);
         return old_count;
     }
     if (!watch_addresses || !memory_data) return old_count;
@@ -1976,6 +3117,10 @@ static uint16_t watchlist_append(const uint32_t *addrs, const uint8_t *values, u
     /* Release-ordered publication: writer-visible memory barrier so
      * Core 0 sees the new entries before the new count. */
     __atomic_store_n(&watch_count, (uint16_t)new_count, __ATOMIC_RELEASE);
+
+    /* UNIFY (v0.30): NO mutation minted. The ra-module already appended these
+     * addresses in-band on ADDR_QUERY receipt; the snapshot count check is the
+     * sync proof. (Was: build a WATCHLIST_APPEND event into mut_ring + wl_seq++.) */
     return (uint16_t)new_count;
 }
 
@@ -1985,8 +3130,15 @@ static uint16_t watchlist_append(const uint32_t *addrs, const uint8_t *values, u
 static void ensure_watchlist_capacity() {
     if (!watch_addresses)
         watch_addresses = (uint32_t*)malloc(RA_MAX_WATCH_ADDRS * sizeof(uint32_t));
-    if (!memory_data)
-        memory_data = (uint8_t*)calloc(RA_MAX_WATCH_ADDRS, 1);
+    /* memory_data is the hottest do_frame buffer (1 access per peek) —
+     * force INTERNAL SRAM (v0.27.4). watch_addresses/last_used_frame are
+     * cold during do_frame (collect/evict only), so they stay in PSRAM. */
+    if (!memory_data) {
+        memory_data = (uint8_t*)ra_hot_alloc(RA_MAX_WATCH_ADDRS, &g_memdata_internal);
+        LOG_INFO("DEBUG=hotbuf: memdata=%s internal-free=%uKB\r\n",
+                 g_memdata_internal ? "SRAM" : "PSRAM",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    }
     if (!last_used_frame)
         last_used_frame = (uint32_t*)calloc(RA_MAX_WATCH_ADDRS, sizeof(uint32_t));
 }
@@ -2041,157 +3193,180 @@ static void watchlist_update_if_changed(uint32_t new_count) {
     static_watch_count = expanded;
     pending_remove_count = 0;
     lru_clock = 1;
+    tomb_clear();  /* stale values from a previous game are poison */
+    /* Phase D2: fresh mutation stream for the new list. The Wii's
+     * ra_wl_seq resets to the notify's seq (0) when it fetches chunks. */
+    wl_seq = 0;
+    ra_seq_view = 0;
+    mut_ring_clear();
 
     // Publish into dedicated watchlist buffer for chunked delivery
     memcpy(g_watchlist_addrs, watch_addresses, expanded * sizeof(uint32_t));
     g_watchlist_count   = expanded;
     g_watchlist_pending = true;
 
-    Serial.printf("DEBUG=Watchlist updated: %u addresses (%u chunks) [static_byte_count=%u, base_addrs=%u]\r\n",
-                  (unsigned)expanded, RA_WATCHLIST_NUM_CHUNKS(expanded),
-                  (unsigned)static_watch_count, (unsigned)new_count);
+    LOG_INFO("DEBUG=Watchlist updated: %u addresses (%u chunks) [static_byte_count=%u, base_addrs=%u]\r\n",
+             (unsigned)expanded, RA_WATCHLIST_NUM_CHUNKS(expanded),
+             (unsigned)static_watch_count, (unsigned)new_count);
 }
 
-/* Phase A.5 — LRU eviction of dynamic entries.
+/* LRU eviction of dynamic entries (v0.25.0 — index-based, age-gated).
  *
  * Selects up to EVICT_BATCH_SIZE entries from the dynamic region
- * [static_watch_count..watch_count-1] with the SMALLEST last_used_frame
- * values (= least recently touched). Removes them from the hash, defrags
- * watch_addresses/memory_data/last_used_frame (shifts survivors down),
- * and queues their addresses (BE-encoded) in pending_remove_addrs[] for
- * emission via RA_EVT_WATCHLIST_REMOVE.
+ * [static_watch_count..watch_count-1] that are age-cold (untouched for
+ * >= LRU_MIN_AGE snapshots). Tombstones their last values (peek-miss
+ * continuity), defrags watch_addresses/memory_data/last_used_frame
+ * (shifts survivors down), and queues their array INDICES in
+ * pending_remove_idx[] for emission via RA_EVT_WATCHLIST_REMOVE_IDX.
  *
  * Static entries (last_used_frame == LRU_PROTECTED) are NEVER picked,
  * preserving chain[0]/chain[1] byte-fanouts that the trigger evaluator
  * depends on. Insertion order of survivors is preserved → ra-module's
- * defrag (linear scan + shift on REMOVE parse) arrives at the same array. */
+ * single-pass index compaction arrives at the same array. */
 static void evict_lru(void) {
     if (watch_count <= static_watch_count) return;
 
     uint16_t dyn_start = static_watch_count;
     uint16_t dyn_count = watch_count - dyn_start;
-    uint16_t target = (dyn_count > EVICT_BATCH_SIZE) ? EVICT_BATCH_SIZE : dyn_count;
-    if (target == 0) return;
+    if (dyn_count == 0) return;
 
-    /* Partial selection: walk dynamic region; mark the `target` slots with
-     * the smallest last_used_frame values. We use a high-water-mark scan —
-     * O(N×K) where K=target=256, but N≤1024, fine on ESP32-S3. */
-    static bool evict_mark[RA_MAX_WATCH_ADDRS];
-    memset(evict_mark + dyn_start, 0, dyn_count * sizeof(bool));
+    g_vblank_stats.had_cleanup = 1;  /* signal per-vblank stats */
 
-    for (uint16_t k = 0; k < target; k++) {
-        uint32_t min_frame = LRU_PROTECTED;
-        int32_t  min_idx   = -1;
-        for (uint16_t i = dyn_start; i < watch_count; i++) {
-            if (evict_mark[i]) continue;
-            if (last_used_frame[i] < min_frame) {
-                min_frame = last_used_frame[i];
-                min_idx   = i;
+    /* v0.26.3 — RECLAIM HALF, ADAPTIVELY. The v0.25 single-256-batch +
+     * fixed 10s age floor lost the race on SMG: galaxy transitions append
+     * thousands of YOUNG entries, the floor found nothing cold exactly
+     * when pressure peaked ("only 0/256 cold"), the list hit MAX and
+     * appends got REJECTED (326x in one session) — rejected bytes read 0
+     * forever, which both broke timers (bunny cheevo lost its ResetIf
+     * clock) and poisoned "value changed" conditions.
+     *
+     * New shape (user-specified): target HALF the dynamic region, minted
+     * as up to EVICT_MUT_MAX sequential REMOVE_IDX mutations (the Phase
+     * D2 ring delivers them in order, one per response slot — multi-frame
+     * cleanup is fine, the seq machinery guarantees lockstep). Age tiers
+     * relax under pressure: prefer 10s-cold; if scarce take 2s-cold, then
+     * 0.5s-cold. Entries the evaluator touched this/last frame (age<30)
+     * are never evicted — dropping genuinely-hot bytes never helps.
+     * (v0.28.8: these seconds are now ACCURATE — lru_clock counts game-frames
+     * at ~59Hz, so 600/120/30 = 10s/2s/0.5s. Pre-0.28.8 it ticked per-snapshot
+     * ≈7.4Hz, so the same tiers were really ~81s/16s/4s — far too conservative.)
+     * Values are tombstoned so a later re-touch peeks the last real
+     * value instead of 0. */
+    #define EVICT_MUT_MAX 4   /* ≤4 mutations per call; MUT_RING=8 keeps room for appends */
+    uint16_t target = dyn_count / 2;
+    if (target < EVICT_BATCH_SIZE) target = EVICT_BATCH_SIZE;
+    if (target > EVICT_BATCH_SIZE * EVICT_MUT_MAX)
+        target = EVICT_BATCH_SIZE * EVICT_MUT_MAX;
+
+    /* v0.31: top tier 1800 (30s-cold, user-specified conservative floor — an
+     * addr unread for 30s is almost certainly dead; avoids churning level-cycle
+     * addrs that return within ~10-30s). Relaxes to 2s/0.5s only under burst
+     * pressure (cap safety, per the v0.26.3 "galaxy appends thousands young" lesson). */
+    uint32_t age_tiers[3] = { 1800u, 120u, 30u };
+    uint16_t evicted_total = 0;
+    uint16_t mutations = 0;
+    uint16_t before_all = watch_count;
+
+    for (int tier = 0; tier < 3 && evicted_total < target
+                       && mutations < EVICT_MUT_MAX; tier++) {
+        uint32_t min_age = age_tiers[tier];
+
+        for (;;) {
+            if (evicted_total >= target || mutations >= EVICT_MUT_MAX) break;
+
+            /* Select up to one batch of cold entries (ascending indices). */
+            uint16_t want = (uint16_t)(target - evicted_total);
+            if (want > EVICT_BATCH_SIZE) want = EVICT_BATCH_SIZE;
+            pending_remove_count = 0;
+            for (uint16_t i = dyn_start;
+                 i < watch_count && pending_remove_count < want; i++) {
+                if (last_used_frame[i] == LRU_PROTECTED) continue;
+                /* clamp against frame_counter reset (game restart) so an
+                 * underflowed age can't mass-evict freshly-touched entries */
+                uint32_t age = (lru_clock >= last_used_frame[i])
+                               ? (lru_clock - last_used_frame[i]) : 0;
+                if (age < min_age) continue;
+                pending_remove_idx[pending_remove_count++] = i;
+                tomb_put(watch_addresses[i], memory_data[i]);
             }
-        }
-        if (min_idx < 0) break;  // somehow all marked
-        evict_mark[min_idx] = true;
-    }
+            if (pending_remove_count == 0) break;  /* tier exhausted */
 
-    /* Queue evicted addresses in BE wire order BEFORE defrag (otherwise
-     * indices shift). Dedup as we go AND log any duplicates found —
-     * the off-by-N forensic loop (v0.21.0-cleanup showed exact off-by-2
-     * even at 10Hz so it can't be a timing race; if duplicates exist in
-     * watch_addresses they'd show up here). */
-    pending_remove_count = 0;
-    uint16_t dup_skipped = 0;
-    for (uint16_t i = dyn_start; i < watch_count && pending_remove_count < EVICT_BATCH_SIZE; i++) {
-        if (!evict_mark[i]) continue;
-        uint32_t addr_host = watch_addresses[i];
-        uint32_t addr_be   = ra_host_to_be32(addr_host);
-        bool dup = false;
-        for (uint16_t k = 0; k < pending_remove_count; k++) {
-            if (pending_remove_addrs[k] == addr_be) { dup = true; break; }
-        }
-        if (dup) {
-            dup_skipped++;
-            Serial.printf("DEBUG=evict_lru DUP: addr=0x%08lX at idx=%u (already queued)\r\n",
-                          (unsigned long)addr_host, (unsigned)i);
-            continue;
-        }
-        pending_remove_addrs[pending_remove_count++] = addr_be;
-    }
-    if (dup_skipped > 0) {
-        Serial.printf("DEBUG=evict_lru: %u duplicates skipped (watch_addresses had dups!)\r\n",
-                      (unsigned)dup_skipped);
-    }
-
-    /* Sanity: every entry in pending_remove_addrs MUST be present in the hash
-     * (since we read them from watch_addresses, which the hash tracks). If
-     * the hash returns -1 for any of them, the hash is out of sync with
-     * watch_addresses — that's a bug we want to know about immediately. */
-    {
-        uint16_t hash_missing = 0;
-        for (uint16_t k = 0; k < pending_remove_count; k++) {
-            uint32_t addr_host = ra_be32_to_host(pending_remove_addrs[k]);
-            if (hash_lookup(addr_host) < 0) {
-                hash_missing++;
-                if (hash_missing <= 4) {
-                    Serial.printf("DEBUG=evict_lru HASH_MISS: addr=0x%08lX not in hash\r\n",
-                                  (unsigned long)addr_host);
+            /* Mint mutation #(wl_seq+1): complete REMOVE_IDX response into
+             * the ring; mut_deliver_next() ships it on the next free slot.
+             * Indices are pre-defrag, matching the Wii's skip-cursor. */
+            {
+                uint16_t seq = (uint16_t)(wl_seq + 1);
+                wl_seq = seq;
+                static uint8_t mbuf[sizeof(ra_esp_header_t)
+                                    + sizeof(ra_watchlist_remove_idx_t)
+                                    + EVICT_BATCH_SIZE * 2];
+                ra_esp_header_t evt;
+                evt.magic       = RA_MAGIC_ESP_TO_GC;
+                evt.status      = (uint8_t)state;
+                evt.event_type  = RA_EVT_WATCHLIST_REMOVE_IDX;
+                evt.event_count = 0;
+                uint16_t data_len = sizeof(ra_watchlist_remove_idx_t)
+                                  + pending_remove_count * 2;
+                evt.data_len    = ra_host_to_be16(data_len);
+                memcpy(mbuf, &evt, sizeof(evt));
+                ra_watchlist_remove_idx_t wri;
+                wri.seq       = ra_host_to_be16(seq);
+                wri.idx_count = ra_host_to_be16(pending_remove_count);
+                memcpy(mbuf + sizeof(evt), &wri, sizeof(wri));
+                uint8_t *idx_dst = mbuf + sizeof(evt) + sizeof(wri);
+                for (uint16_t k = 0; k < pending_remove_count; k++) {
+                    uint16_t be = ra_host_to_be16(pending_remove_idx[k]);
+                    memcpy(idx_dst + k * 2, &be, 2);
                 }
+                mut_record(seq, mbuf, sizeof(evt) + data_len);
             }
-        }
-        if (hash_missing > 0) {
-            Serial.printf("DEBUG=evict_lru: %u/%u REMOVE addrs missing from hash\r\n",
-                          (unsigned)hash_missing, (unsigned)pending_remove_count);
+
+            /* Defrag: shift survivors down, skipping the (ascending)
+             * selected indices with a single cursor. No inline hash
+             * deletes (tombstones broke probe chains — v0.18.3 saga);
+             * rebuild afterwards. */
+            uint16_t skip = 0;
+            uint16_t write_idx = dyn_start;
+            for (uint16_t read_idx = dyn_start; read_idx < watch_count; read_idx++) {
+                if (skip < pending_remove_count
+                    && pending_remove_idx[skip] == read_idx) {
+                    skip++;
+                    continue;
+                }
+                if (read_idx != write_idx) {
+                    watch_addresses[write_idx] = watch_addresses[read_idx];
+                    memory_data[write_idx]     = memory_data[read_idx];
+                    last_used_frame[write_idx] = last_used_frame[read_idx];
+                }
+                write_idx++;
+            }
+            __atomic_store_n(&watch_count, write_idx, __ATOMIC_RELEASE);
+
+            /* v0.31.1: hash rebuild deferred to ONCE after all batches (below) —
+             * the batch loop selects by index from last_used_frame, never via
+             * hash_lookup, so a stale hash mid-eviction is harmless. */
+            evicted_total += pending_remove_count;
+            mutations++;
+            pending_remove_count = 0;
         }
     }
 
-    /* Log first 4 + last 4 addresses going into REMOVE so we can correlate
-     * with any external trace of what ra-module actually receives. */
-    if (pending_remove_count >= 8) {
-        Serial.printf("DEBUG=evict_lru REMOVE-first4: 0x%08lX 0x%08lX 0x%08lX 0x%08lX\r\n",
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[0]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[1]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[2]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[3]));
-        Serial.printf("DEBUG=evict_lru REMOVE-last4: 0x%08lX 0x%08lX 0x%08lX 0x%08lX\r\n",
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[pending_remove_count-4]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[pending_remove_count-3]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[pending_remove_count-2]),
-                      (unsigned long)ra_be32_to_host(pending_remove_addrs[pending_remove_count-1]));
+    if (evicted_total == 0) {
+        LOG_DBG("DEBUG=evict_lru: nothing evictable (dyn=%u, all age<%u)\r\n",
+                (unsigned)dyn_count, (unsigned)age_tiers[2]);
+        return;
     }
-
-    /* Defrag: shift survivors down to fill the holes. We DO NOT touch the
-     * hash inline — open-addressing with linear probing tolerates inserts
-     * but NOT deletes: a HASH_EMPTY tombstone breaks any probe chain that
-     * passed through the now-empty slot, so subsequent hash_lookup misses
-     * entries that are still in watch_addresses. Those false misses caused
-     * watchlist_append to add duplicates of already-present addresses,
-     * which then propagated into pending_remove_addrs as duplicates, then
-     * into REMOVE events that ra-module could only partially honor →
-     * silent off-by-N desync after eviction (observed v0.21.0-cleanup 2026-06-01,
-     * off-by-2 froze multi-pass). Instead, REBUILD the hash from scratch
-     * after the defrag completes. O(N) but N≤1024 → ~50µs. */
-    uint16_t write_idx = dyn_start;
-    for (uint16_t read_idx = dyn_start; read_idx < watch_count; read_idx++) {
-        if (evict_mark[read_idx]) continue;
-        if (read_idx != write_idx) {
-            watch_addresses[write_idx] = watch_addresses[read_idx];
-            memory_data[write_idx]     = memory_data[read_idx];
-            last_used_frame[write_idx] = last_used_frame[read_idx];
-        }
-        write_idx++;
-    }
-
-    uint16_t before = watch_count;
-    __atomic_store_n(&watch_count, write_idx, __ATOMIC_RELEASE);
-
-    /* Rebuild hash from scratch — eliminates tombstone-induced false misses. */
+    /* v0.31.1: rebuild the hash ONCE after all batches, not per-batch. Only the
+     * final array needs a correct hash (before the next collect_missing /
+     * read_memory); the batches in between never hash_lookup. Cuts the ~40ms
+     * ap_us seen on cln=1 frames to ~12ms. */
     hash_clear();
-    for (uint16_t i = 0; i < write_idx; i++) {
+    for (uint16_t i = 0; i < watch_count; i++)
         hash_insert(watch_addresses[i], i);
-    }
-
-    Serial.printf("DEBUG=evict_lru: %u → %u (dropped %u dynamic)\r\n",
-                  (unsigned)before, (unsigned)write_idx,
-                  (unsigned)pending_remove_count);
+    LOG_DBG("DEBUG=evict_lru: %u → %u (dropped %u in %u mutations, target=%u, seq=%u)\r\n",
+            (unsigned)before_all, (unsigned)watch_count,
+            (unsigned)evicted_total, (unsigned)mutations,
+            (unsigned)target, (unsigned)wl_seq);
 }
 
 // ============================================================================
@@ -2204,7 +3379,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         state = STATE_ERROR;
         return;
     }
-    Serial.println("DEBUG=Game loaded, building initial watchlist...");
+    LOG_INFO("DEBUG=Game loaded, building initial watchlist...\r\n");
 
     const rc_memrefs_t *memrefs = rc_client_get_memrefs(client);
     uint32_t n = 0;
@@ -2218,23 +3393,88 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
 
     rc_client_set_read_memory_function(client, read_memory_ingame);
 
+    /* v0.32 cache-primed do_frame gate: size a PSRAM rollback buffer to the
+     * memref count and arm the gate. rc_client_do_frame will run the UPDATE,
+     * call doframe_primed_cb, and defer (roll back, no eval) if any read would
+     * have returned 0 — killing the resolver/evaluator divergence false
+     * unlocks. ISR never touches this buffer (loop-task only) → PSRAM is safe. */
+    {
+        uint32_t mrc = rc_client_memref_count(client);
+        free(g_memref_save); g_memref_save = NULL;
+        g_rc_doframe_primed_cb = NULL;          /* disarm until the buffer is ready */
+        g_rc_doframe_save_buf  = NULL;
+        g_rc_doframe_save_cap  = 0;
+        if (mrc > 0) {
+            g_memref_save = (rc_memref_value_t*)ps_malloc((size_t)mrc * sizeof(rc_memref_value_t));
+        }
+        if (g_memref_save) {
+            g_rc_doframe_save_buf     = g_memref_save;
+            g_rc_doframe_save_cap     = mrc;
+            g_rc_doframe_gate_enabled = 1;
+            g_rc_doframe_primed_cb    = doframe_primed_cb;   /* arm last (all fields set) */
+            LOG_INFO("DEBUG=doframe gate armed: %u memrefs, %u KB PSRAM rollback buf\r\n",
+                     (unsigned)mrc, (unsigned)((size_t)mrc * sizeof(rc_memref_value_t) / 1024));
+        } else {
+            LOG_ERR("ERROR=doframe gate: ps_malloc(%u memrefs) failed — gate DISABLED\r\n",
+                    (unsigned)mrc);
+        }
+    }
+
     const rc_client_game_t *game = rc_client_get_game_info(client);
     if (game) {
         gameName = String(game->title);
-        Serial.printf("DEBUG=Game: %s\r\n", game->title);
+        LOG_INFO("DEBUG=Game: %s\r\n", game->title);
     }
+
+    /* v0.27.8 — memory free right before the vblank stream starts (game
+     * fully loaded: rcheevos structs allocated, watchlist built). This is
+     * the steady-state baseline the do_frame/collect loop runs against. */
+    LOG_ERR("DEBUG=mem at game-loaded: sram-free=%uKB (maxblk=%uKB) psram-free=%uKB watch=%u\r\n",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)watch_count);
+
+    /* v0.27.1 warm-up: NOW the session exists (startsession fired during
+     * begin_load_game), so spectator mode is togglable — not LOCKED. It
+     * stays on through the boot discovery storm; processSnapshot lifts
+     * it (plus rc_client_reset) after WARMUP_GAME_FRAMES. */
+    rc_client_set_spectator_mode_enabled(client, 1);
+    g_warmup_active = true;
+    g_warmup_end_frame = 0;
 
     setSemaphoreLED(LED_ON, LED_GREEN);
     /* Transition to GAME_LOADED so WiiFlow sees status 0x06 (RA_STATUS_GAME_LOADED)
      * and knows it can proceed with the IOS reload + game boot.
      * STATE_ACTIVE (0x07) is set on the first SNAPSHOT received from ra-module. */
     state = STATE_GAME_LOADED;
-    Serial.printf("DEBUG=Game loaded, watching %u addresses — waiting for first SNAPSHOT\r\n", watch_count);
+    LOG_INFO("DEBUG=Game loaded, watching %u addresses — waiting for first SNAPSHOT\r\n", watch_count);
+}
+
+/* Login→load chaining (v0.24.0). server_call is async now, so the old
+ * "login then immediately begin_load_game" sequence — which relied on the
+ * login HTTP round-trip completing synchronously — must be event-driven:
+ * begin_load_game only fires from the login completion callback. */
+static char g_pending_hash[64];
+
+static void login_then_load_cb(int result, const char *error_message, rc_client_t *client, void *userdata) {
+    if (result != RC_OK) {
+        Serial.printf("ERROR=RA login failed (%d): %s\r\n", result,
+                      error_message ? error_message : "?");
+        state = STATE_ERROR;
+        return;
+    }
+    LOG_INFO("DEBUG=Login OK — loading game with hash: %s\r\n", g_pending_hash);
+    // on_game_loaded sets state = STATE_ACTIVE or STATE_ERROR.
+    rc_client_begin_load_game(g_client, g_pending_hash, on_game_loaded, NULL);
 }
 
 void loadGame(const char *hash) {
-    // Destroy previous client if any
+    // Destroy previous client if any. Bump the HTTP generation so any
+    // in-flight response addressed to the old client is discarded by
+    // http_drain_done instead of calling into freed memory.
     if (g_client) {
+        http_gen++;
         rc_client_destroy(g_client);
         g_client = NULL;
     }
@@ -2245,17 +3485,24 @@ void loadGame(const char *hash) {
     rc_client_set_hardcore_enabled(g_client, 0);
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);
 
-    // rc_client needs its own login session with correct URLs via server_call
+    /* v0.27.1: warm-up spectator is enabled in on_game_loaded, NOT here.
+     * Enabling it BEFORE begin_load_game made rc_client skip the server
+     * session entirely and LOCK spectator for the whole game ("Spectator
+     * mode cannot be disabled if it was enabled prior to loading game" —
+     * rc_client.c) → zero unlock submissions all session + the synthetic
+     * "Unknown Emulator" warning 101000001 (field 2026-06-12 21:2x, was
+     * mistaken for an ESP network problem). Enabled AFTER the load, the
+     * session exists and spectator is freely togglable. */
+
+    strncpy(g_pending_hash, hash, sizeof(g_pending_hash) - 1);
+    g_pending_hash[sizeof(g_pending_hash) - 1] = '\0';
+
+    // rc_client needs its own login session with correct URLs via server_call.
+    // The game load is chained from the login callback (async HTTP).
     String ra_user = read_ra_user_from_eeprom();
     String ra_pass = read_ra_pass_from_eeprom();
     rc_client_begin_login_with_password(g_client, ra_user.c_str(), ra_pass.c_str(),
-                                        rc_callback, g_callback_userdata);
-
-    Serial.printf("DEBUG=Loading game with hash: %s\r\n", hash);
-
-    // on_game_loaded sets state = STATE_ACTIVE or STATE_ERROR.
-    // server_call is synchronous so all HTTP calls complete before this returns.
-    rc_client_begin_load_game(g_client, hash, on_game_loaded, NULL);
+                                        login_then_load_cb, g_callback_userdata);
 }
 
 // ============================================================================
@@ -2356,6 +3603,7 @@ static uint16_t cache_read_u16_be(uint32_t addr, bool *ok) {
     return ((uint16_t)memory_data[i0] << 8) | memory_data[i1];
 }
 static void dump_kirby_chain() {
+    if (RA_LOG_LEVEL < 2) return;  /* investigation-only diag — 3 lines/2s */
     static uint32_t last = 0;
     uint32_t now = millis();
     if (now - last < 2000) return;
@@ -2403,11 +3651,117 @@ static void dump_kirby_chain() {
                   valid_chain ? "YES" : "no(player_null)");
 }
 
+/* One-shot micro-benchmark of the read_memory_ingame hot path (hash_lookup +
+ * memory_data read) in the CURRENT memory tier (PSRAM). Combined with the
+ * CATCHUP rm_bytes/df count, est. do_frame memory time ≈ rm_bytes × ns/lookup
+ * — the number that decides whether moving hash/cache to SRAM is worth it. */
+static void bench_hash_once(void) {
+    if (!addr_hash || !memory_data || !watch_addresses || watch_count == 0) return;
+    const uint32_t N = 50000;
+    volatile uint32_t sink = 0;
+    uint32_t t0 = (uint32_t)esp_timer_get_time();
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t idx = (uint16_t)((i * 2654435761u) % watch_count);
+        int32_t widx = hash_lookup(watch_addresses[idx]);
+        if (widx >= 0) sink += memory_data[widx];
+    }
+    uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
+    LOG_FRAME("DEBUG=BENCH hash+read PSRAM: %lu lookups / %lu us = %lu ns each (watch=%u sink=%lu)\r\n",
+              (unsigned long)N, (unsigned long)dt, (unsigned long)(dt * 1000UL / N),
+              (unsigned)watch_count, (unsigned long)sink);
+}
+
+/* v0.28.7 dual-core PSRAM contention probe. The ESP32-S3 has ONE PSRAM
+ * controller; before committing to splitting rcheevos eval across both cores
+ * we must know whether two cores reading PSRAM at once serialize on the
+ * controller (which would cap the speedup well below 2x). A start barrier
+ * (ready/go flags) makes both cores enter the loop together so the windows
+ * fully overlap. hash_lookup is the WORST case (random PSRAM access, defeats
+ * the cache); real condition eval walks structs more sequentially and would
+ * contend LESS, so the measured per-core time here is a conservative upper
+ * bound on what eval would see. Decision rule: if dual-core per-lookup stays
+ * near the single-core ~244ns, the controller pipelines two cores well and
+ * parallelizing eval is worth it; if it climbs toward ~488ns, the controller
+ * serializes and we'd need a different lever (SRAM migration / fewer reads). */
+static volatile uint32_t s_bench_c0_dt = 0;
+static volatile int s_bench_ready = 0;
+static volatile int s_bench_go = 0;
+static SemaphoreHandle_t s_bench_done = NULL;
+
+static void bench_psram_loop(uint32_t N, volatile uint32_t* out_dt) {
+    volatile uint32_t sink = 0;
+    uint32_t t0 = (uint32_t)esp_timer_get_time();
+    for (uint32_t i = 0; i < N; i++) {
+        uint16_t idx = (uint16_t)((i * 2654435761u) % watch_count);
+        int32_t widx = hash_lookup(watch_addresses[idx]);
+        if (widx >= 0) sink += memory_data[widx];
+    }
+    *out_dt = (uint32_t)esp_timer_get_time() - t0;
+    (void)sink;
+}
+
+static void bench_worker_core0(void* arg) {
+    const uint32_t N = (uint32_t)(uintptr_t)arg;
+    s_bench_ready = 1;
+    while (!s_bench_go) { /* spin until core1 releases */ }
+    bench_psram_loop(N, &s_bench_c0_dt);
+    xSemaphoreGive(s_bench_done);
+    vTaskDelete(NULL);
+}
+
+static void bench_dualcore(void) {
+    if (!addr_hash || !memory_data || !watch_addresses || watch_count == 0) return;
+    const uint32_t N = 50000;
+    if (!s_bench_done) s_bench_done = xSemaphoreCreateBinary();
+    s_bench_ready = 0; s_bench_go = 0; s_bench_c0_dt = 0;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(bench_worker_core0, "bench0", 4096,
+                        (void*)(uintptr_t)N, 5, NULL, 0);
+    if (ok != pdPASS) { LOG_FRAME("DEBUG=BENCH2 spawn failed\r\n"); return; }
+
+    uint32_t spin_t0 = (uint32_t)esp_timer_get_time();
+    while (!s_bench_ready) {        /* wait worker ready on core 0 */
+        if ((uint32_t)esp_timer_get_time() - spin_t0 > 100000) {
+            LOG_FRAME("DEBUG=BENCH2 worker never readied, aborting\r\n");
+            s_bench_go = 1;        /* let the worker finish & self-delete */
+            return;
+        }
+    }
+    uint32_t dt_c1 = 0;
+    s_bench_go = 1;                 /* release both cores together */
+    bench_psram_loop(N, &dt_c1);
+
+    xSemaphoreTake(s_bench_done, portMAX_DELAY);
+
+    uint32_t c0 = s_bench_c0_dt * 1000UL / N;
+    uint32_t c1 = dt_c1 * 1000UL / N;
+    LOG_FRAME("DEBUG=BENCH2 dualcore PSRAM: core1=%lu ns core0=%lu ns/lookup "
+              "(N=%lu/core; single~244ns => 2x if near 244, 1x if near 488)\r\n",
+              (unsigned long)c1, (unsigned long)c0, (unsigned long)N);
+}
+
 void processSnapshot() {
     if (!new_snapshot || state != STATE_ACTIVE || !g_client) return;
     new_snapshot = false;
 
-    dump_kirby_chain();
+    /* Snapshot the frozen converged-frame stats up front: do_frame below runs
+     * ~25ms during which later snapshots rewrite g_frame_log, so capture now to
+     * keep the LOG_FRAME consistent with THIS frame (not a later convergence). */
+    vblank_stats_t fl;
+    memcpy(&fl, &g_frame_log, sizeof(fl));
+    uint32_t fl_fc = g_frame_log_fc;
+
+    /* v0.28.7 — measure the real processing cycle: wall-clock since the
+     * previous processSnapshot body started. cycle - ap_us - df_us = the
+     * overhead spent waiting on the ra-module/EXI for the next snapshot. */
+    {
+        static uint32_t last_ps_us = 0;
+        uint32_t now_ps_us = (uint32_t)esp_timer_get_time();
+        g_cycle_us = (last_ps_us > 0) ? (now_ps_us - last_ps_us) : 0;
+        last_ps_us = now_ps_us;
+    }
+
+    // dump_kirby_chain();
 
     /* All required addresses are guaranteed cached by the time we get
      * here — the SNAPSHOT/ADDR_RESPONSE handler chain iterates
@@ -2415,8 +3769,202 @@ void processSnapshot() {
      * missing addresses before setting new_snapshot=true. So the very
      * first do_frame sees all REAL values; rcheevos's per-trigger
      * WAITING state naturally suppresses spurious triggers (see
-     * trigger.c:243 — WAITING + condition TRUE → reset to WAITING). */
-    rc_client_do_frame(g_client);
+     * trigger.c:243 — WAITING + condition TRUE → reset to WAITING).
+     *
+     * FRAME-DEBT CATCH-UP (v0.26.1): rcheevos hit-count timers assume
+     * exactly one do_frame per GAME frame ("3600 hits" = 60s @ 60fps).
+     * Our delivered/evaluated rate is 55-95% of the game's — snapshots
+     * skipped for convergence, mutation delivery or missed fires made
+     * timers run SLOW (the SMG bunny "under 1 minute" cheevo unlocked
+     * after >1 real minute, 2026-06-12: 18224 evaluations over 33236
+     * game frames = the "minute" lasted 109s). The snapshot header now
+     * carries the PPC VBI counter (true game-frame clock); we owe one
+     * do_frame per elapsed game frame and pay the debt here, capped per
+     * snapshot to bound CPU. Calling do_frame repeatedly with the SAME
+     * memory image is semantically correct: Delta==Mem on the repeats
+     * (no false edges) while frame-counted hits accumulate — exactly
+     * what those frames meant on the console. Debt is itself capped:
+     * a stall beyond ~10s means a load screen / pause, where the sets'
+     * own ResetIf guards rule, not the timer. */
+    /* v0.26.3 warm-up window: track the end frame on the first evaluated
+     * snapshot; when the window closes, wipe every trigger state that was
+     * primed against boot-storm garbage and go live. */
+    if (g_warmup_active) {
+        if (g_warmup_end_frame == 0) {
+            g_warmup_end_frame = frame_counter + WARMUP_GAME_FRAMES;
+            LOG_INFO("DEBUG=warmup: spectator until game frame %lu\r\n",
+                     (unsigned long)g_warmup_end_frame);
+        } else if (frame_counter >= g_warmup_end_frame) {
+            rc_client_reset(g_client);
+            rc_client_set_spectator_mode_enabled(g_client, 0);
+            g_warmup_active = false;
+            LOG_INFO("DEBUG=warmup complete: triggers reset, going live (watch=%u)\r\n",
+                     (unsigned)watch_count);
+        }
+    }
+
+    {
+        static uint32_t prev_game_frame = 0;
+        static uint32_t frame_debt = 0;
+        /* RUN_MAX 4→32 (v0.27.2). processSnapshot runs on the LOW-priority
+         * loopTask, which the prio-19 EXI task preempts at will — so a long
+         * catch-up burst here never delays the SPI/snapshot path. The old
+         * cap of 4 throttled catch-up below the game's 60 fps whenever
+         * processSnapshot ran < 15×/s (it collapses multiple arrived
+         * snapshots into one boolean new_snapshot, so it runs far less
+         * often than snapshots arrive). The debt then pinned at the cap
+         * and frames were dropped permanently → timers ran slow → the SMG
+         * bunny <1min cheevo false-unlocked after >1 real minute.
+         * CAP 600→1800 (~30s) gives a deeper recovery reservoir while
+         * still discarding genuinely absurd jumps (ra-module restart). */
+        #define FRAME_DEBT_RUN_MAX   32u
+        #define FRAME_DEBT_CAP       1800u
+        uint32_t elapsed = frame_counter - prev_game_frame;
+        if (prev_game_frame == 0 || elapsed == 0 || elapsed > FRAME_DEBT_CAP)
+            elapsed = 1;   /* first frame / frozen counter / absurd jump */
+        prev_game_frame = frame_counter;
+        frame_debt += elapsed;
+        if (frame_debt > FRAME_DEBT_CAP) frame_debt = FRAME_DEBT_CAP;
+
+        uint32_t run = (frame_debt < FRAME_DEBT_RUN_MAX)
+                       ? frame_debt : FRAME_DEBT_RUN_MAX;
+        frame_debt -= run;
+        uint32_t this_df_us = 0;
+        int df_ran = 0;
+        if (run > 0) {
+            uint32_t t0 = (uint32_t)esp_timer_get_time();
+            /* v0.32 cache-primed gate: reset the per-frame miss counter, then
+             * run the gated do_frame. If it DEFERS (a no-tombstone read missed),
+             * the memref values were rolled back and NOTHING was evaluated —
+             * the misses feed the next convergence round and we retry next
+             * frame. Fail-open after MAX consecutive defers so a permanently
+             * wild pointer can't freeze evaluation forever (tombstone/WAITING
+             * guard the rare residual). */
+            #define MAX_DOFRAME_DEFER 4u
+            static uint8_t consec_defer = 0;
+            g_update_miss_count = 0;
+            g_rc_doframe_gate_enabled = (consec_defer < MAX_DOFRAME_DEFER) ? 1 : 0;
+            // disable the loop to pay for missing do_frame
+            //for (uint32_t f = 0; f < run; f++) {
+                rc_client_do_frame(g_client);
+            //}
+            if (g_rc_doframe_deferred) {
+                /* Deferred: un-spend the frame debt (the frame wasn't evaluated)
+                 * and skip the do_frame accounting; eval lands next frame once
+                 * the cache primes. */
+                consec_defer++;
+                g_doframe_deferred_total++;
+                frame_debt += run;
+                if (frame_debt > FRAME_DEBT_CAP) frame_debt = FRAME_DEBT_CAP;
+            } else {
+                consec_defer = 0;
+                df_ran = 1;
+                this_df_us = (uint32_t)esp_timer_get_time() - t0;
+                g_df_us += this_df_us;
+                g_df_n  += 1;   /* exactly one do_frame ran (catch-up loop disabled) */
+            }
+        }
+
+        /* Per-vblank frame summary (LOG_FRAME channel).
+         * Set RA_LOG_LEVEL 0 + RA_LOG_FRAME_STATS 1 for minimum-noise mode.
+         *
+         * seq    = frame sequence number (PPC VBI counter from d2x)
+         * ok     = Phase D2: seq+count matched, values accepted (1=ok, 0=skipped)
+         * sa     = addr_count in the first SNAPSHOT message (d2x → ESP32)
+         * cm     = cache misses in collect_missing (before do_frame)
+         * it     = addAddress resolution depth (ADDR_QUERY iteration count)
+         * mut    = 1 if watchlist mutation minted this vblank (APPEND/REMOVE_IDX)
+         * cln    = 1 if evict_lru fired this vblank (LRU cleanup)
+         * ap_us  = address processing time µs (SNAPSHOT receipt → new_snapshot)
+         * df     = 1 if rc_client_do_frame executed this frame
+         * df_us  = rc_client_do_frame total duration µs */
+        /* cmr= : per-round resolver yield (≈ per addAddress level). Tells us
+         * whether the cascade is climbing levels (e.g. 128,90,40,...) or
+         * stalling at round 0 while peek_miss carries the rest (0 here with
+         * ms>0 = the resolver isn't surfacing what do_frame reads). */
+        char cmr_buf[56]; cmr_buf[0] = 0;
+        {
+            uint8_t nr = fl.collect_round; if (nr > 8) nr = 8;
+            int off = 0;
+            for (uint8_t r = 0; r < nr && off < (int)sizeof(cmr_buf) - 8; r++)
+                off += snprintf(cmr_buf + off, sizeof(cmr_buf) - off,
+                                r ? ",%u" : "%u", (unsigned)fl.cm_by_round[r]);
+        }
+        /* df_us splits into upd (pointer-chain resolve = rc_update_memref_values,
+         * the 68KB of modified_memrefs) and evl (condition evaluation). Whichever
+         * dominates decides the optimization: upd→move memrefs to SRAM (fits);
+         * evl→fewer active achievements. */
+        LOG_FRAME("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu\r\n",
+                  (unsigned long)fl_fc,
+                  (int)fl.data_ok,
+                  (unsigned)fl.snap_addr_count,
+                  (unsigned)fl.collect_miss_total,
+                  (unsigned)fl.collect_cm,
+                  cmr_buf,
+                  (unsigned)fl.iter_depth,
+                  (int)fl.had_mutation,
+                  (int)fl.had_cleanup,
+                  (unsigned long)fl.addr_proc_us,
+                  (unsigned long)fl.cm_cpu_us,
+                  df_ran,   /* v0.32: 1=evaluated, 0=deferred (cache not primed) */
+                  (unsigned long)this_df_us,
+                  (unsigned long)g_rc_update_us,
+                  (unsigned long)g_rc_eval_us,
+                  (unsigned long)g_cycle_us,
+                  (unsigned long)g_par_a_us,
+                  (unsigned long)g_par_b_us,
+                  (unsigned long)g_par_runs);
+
+        /* Every 1000 frames: dump the full cache + LRU ages. Heavy (stalls
+         * SPI for a few seconds) but by 1000 frames we already have enough
+         * FRAME lines to debug; the user accepts the disruption. */
+        static uint32_t last_cache_dump = 0;
+        if (frame_counter - last_cache_dump >= 1000) {
+            last_cache_dump = frame_counter;
+            dump_cache_lru();
+        }
+
+        /* Catch-up + profiling telemetry (every 5s). df/s should track the
+         * game's ~60 fps. df_us = mean do_frame µs, cm_us = mean
+         * collect_missing µs, cm_skip = walks skipped in steady state. If
+         * df/s << 60 with debt high: CPU-bound — the µs breakdown says
+         * whether do_frame or the memref walk dominates. */
+        g_doframe_count += df_ran;   /* count REAL do_frame EVALUATIONS (0 on a gate-deferred frame) */
+        static uint32_t last_df_log = 0;
+        uint32_t df_now = millis();
+        if (df_now - last_df_log >= 5000) {
+            uint32_t dt = df_now - last_df_log;
+            uint32_t gf = frame_counter - g_df_prev_gameframe;
+            /* rm_b/df = mean bytes (== hash_lookups) read_memory served per
+             * do_frame. If rm_b/df × (BENCH ns/lookup) ≈ df_us, do_frame is
+             * memory-bound (SRAM migration helps); if it's a small fraction,
+             * it's CPU-bound (trigger eval) and SRAM won't move the needle. */
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu rm_b/df=%lu\r\n",
+                     (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
+                     (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
+                     (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
+                     (unsigned long)(g_doframe_deferred_total * 1000UL / (dt ? dt : 1)),
+                     (unsigned long)frame_debt,
+                     (unsigned long)(g_df_n ? g_df_us / g_df_n : 0),
+                     (unsigned long)(g_cm_n ? g_cm_us / g_cm_n : 0),
+                     (unsigned long)g_cm_n,
+                     (unsigned long)g_cm_skipped,
+                     (unsigned long)(g_df_n ? g_rm_bytes / g_df_n : 0));
+            g_doframe_count = 0;
+            g_ok0_skips = 0;
+            g_doframe_deferred_total = 0;
+            g_df_prev_gameframe = frame_counter;
+            g_df_us = g_df_n = g_cm_us = g_cm_n = g_cm_skipped = g_rm_bytes = 0;
+            last_df_log = df_now;
+            /* BENCH disabled 2026-06-14: already measured PSRAM contention
+             * (hash 1.53x single/dual; eval 1.8x → eval is PSRAM-bandwidth-bound).
+             * The one-shot run blocked Core 1 ~76ms at boot and polluted the
+             * boot logs (1522ns/lookup vs 244 steady = boot-time PSRAM saturation).
+             * Re-enable by uncommenting if we need to re-measure. */
+            // static bool benched = false;
+            // if (!benched) { benched = true; bench_hash_once(); bench_dualcore(); }
+        }
+    }
     /* INTENTIONAL: do NOT call watchlist_update_if_changed here.
      *
      * The initial watchlist (computed in on_game_loaded) is FROZEN for
@@ -2506,13 +4054,16 @@ void taskCore1(void *pvParameters) {
          * Only call when state actually changes, to avoid touching shared buffers
          * unnecessarily (no need to write the same byte every millisecond). */
         if ((uint8_t)state != last_published_state) {
-            Serial.printf("DEBUG=state transition %02X -> %02X\r\n",
-                          last_published_state, (uint8_t)state);
+            LOG_INFO("DEBUG=state transition %02X -> %02X\r\n",
+                     last_published_state, (uint8_t)state);
             last_published_state = (uint8_t)state;
             exi_spi_update_status(last_published_state);
         }
 
         processEXI();
+#if !RC_DO_FRAME_IN_LOW_PRIO_TASK
+        processSnapshot();  /* do_frame on the EXI critical path */
+#endif
         vTaskDelay(1);  // Yield to prevent watchdog
         
         // Heartbeat every 5 seconds
@@ -2522,10 +4073,12 @@ void taskCore1(void *pvParameters) {
             int cs = gpio_get_level((gpio_num_t)EXI_PIN_CS);
             /* Echo firmware version + build stamp in every heartbeat so we can
              * confirm a flashed binary is current without needing the boot log. */
-            Serial.printf("DEBUG=fw v0.21.0-cleanup build=%s %s\n", __DATE__, __TIME__);
-            Serial.printf("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d\n",
-                          cs, (unsigned long)exi_spi_get_transaction_count(),
-                          (unsigned long)exi_spi_get_total_bytes_rx(), (int)state);
+            LOG_DBG("DEBUG=fw v0.32.0-gate build=%s %s\n", __DATE__, __TIME__);
+            LOG_DBG("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d | heap=%u maxblk=%u\n",
+                    cs, (unsigned long)exi_spi_get_transaction_count(),
+                    (unsigned long)exi_spi_get_total_bytes_rx(), (int)state,
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             /* Capture the post-setup callback diagnostics. cb_invocations tells
              * us whether the callback ever fires (and how many times) and
              * cb_last_response_len / cb_last_tx6 capture the state seen by the
@@ -2539,21 +4092,21 @@ void taskCore1(void *pvParameters) {
             extern volatile uint32_t exi_prepare_call_count;
             extern volatile uint16_t exi_prepare_last_len;
             extern volatile uint8_t  exi_prepare_post_tx_b6;
-            Serial.printf("DEBUG=cb invocations=%lu last_response_len=%u resp[0]=%02X tx[6]=%02X\n",
-                          (unsigned long)exi_cb_invocations,
-                          (unsigned)exi_cb_last_response_len,
-                          (unsigned)exi_cb_last_response_b0,
-                          (unsigned)exi_cb_last_tx_b6);
-            Serial.printf("DEBUG=prepare calls=%lu last_len=%u post_tx[6]=%02X\n",
-                          (unsigned long)exi_prepare_call_count,
-                          (unsigned)exi_prepare_last_len,
-                          (unsigned)exi_prepare_post_tx_b6);
+            LOG_DBG("DEBUG=cb invocations=%lu last_response_len=%u resp[0]=%02X tx[6]=%02X\n",
+                    (unsigned long)exi_cb_invocations,
+                    (unsigned)exi_cb_last_response_len,
+                    (unsigned)exi_cb_last_response_b0,
+                    (unsigned)exi_cb_last_tx_b6);
+            LOG_DBG("DEBUG=prepare calls=%lu last_len=%u post_tx[6]=%02X\n",
+                    (unsigned long)exi_prepare_call_count,
+                    (unsigned)exi_prepare_last_len,
+                    (unsigned)exi_prepare_post_tx_b6);
 
             /* Dump default_ack to confirm the dynamic-status update is in this
              * firmware build (byte 5 should match the current state value). */
             char ack_str[64] = {0};
             exi_spi_dump_default_ack(ack_str, sizeof(ack_str));
-            Serial.printf("DEBUG=default_ack: %s\n", ack_str);
+            LOG_DBG("DEBUG=default_ack: %s\n", ack_str);
 
             /* Per-command totals + delta since last heartbeat. Only print rows that
              * have nonzero total to keep the line short. Format:
@@ -2570,7 +4123,7 @@ void taskCore1(void *pvParameters) {
                                 cmd_short_name(c), (unsigned long)cmd_count[c],
                                 (unsigned long)delta);
             }
-            Serial.println(line);
+            LOG_DBG("%s\n", line);
         }
     }
 }
@@ -2579,9 +4132,62 @@ void taskCore1(void *pvParameters) {
 // Arduino setup() and loop()
 // ============================================================================
 void setup() {
+    /* v0.24.3 — route big allocations to PSRAM. Field forensics showed
+     * the INTERNAL heap collapsing to 2.6KB after game load (rcheevos
+     * parse objects + our arrays + the v0.24.x additions: httpTask
+     * stack, UART TX ring, doubled watchlist), while mbedTLS needs
+     * ~45KB per TLS session — every gameplay-time HTTP failed with -1
+     * in 30ms (alloc fail) or -11 (limping into the read timeout). The
+     * "network problem" was an OOM problem all along.
+     *
+     * Threshold 256, not 4096 (v0.24.4): two field findings. (a) The
+     * Arduino prebuilt mbedTLS allocates with MALLOC_CAP_INTERNAL
+     * explicitly — its 2x16KB record buffers CANNOT be sent to PSRAM
+     * from here, so internal heap must always hold ~45KB contiguous
+     * for TLS. (b) The post-load internal residency (~40KB) is not big
+     * blocks — it's rcheevos' small-struct storm (119 achievements +
+     * hundreds of memrefs, each allocation < 512B), which a 4096
+     * threshold left internal (field: heap=43K maxblk=32756, and the
+     * second 16KB TLS buffer missed fitting by ~50 bytes → -11). At
+     * 256, those structs go to PSRAM (rcheevos allocates at load time,
+     * not per-frame — PSRAM latency is irrelevant there). Task stacks,
+     * FreeRTOS objects, the UART ring and the WiFi driver allocate
+     * with explicit internal caps and are unaffected; our SPI/ISR
+     * buffers are static .bss (internal) by construction. */
+    heap_caps_malloc_extmem_enable(256);
+
+    /* Big working buffers — allocated AFTER the extmem threshold is set
+     * so they land in PSRAM (all ≥256B, task-context-only, never ISR). */
+    prefetch_addrs   = (uint32_t*)calloc(PREFETCH_MAX, sizeof(uint32_t));
+    prefetch_sizes   = (uint8_t*) calloc(PREFETCH_MAX, sizeof(uint8_t));
+    g_watchlist_addrs= (uint32_t*)calloc(RA_MAX_WATCH_ADDRS, sizeof(uint32_t));
+    addr_hash        = (hash_entry_t*)ra_hot_alloc(HASH_SIZE * sizeof(hash_entry_t), &g_hash_internal);
+    tomb             = (tomb_entry_t*)calloc(TOMB_SIZE, sizeof(tomb_entry_t));
+    /* Phase D2 mutation ring — MUT_RING * MUT_RESP_SZ ≈ 33KB → PSRAM (≥256B,
+     * lands in PSRAM via heap_caps_malloc_extmem_enable(256) set above).
+     * calloc zero-inits resp_len=0 so every slot starts empty. */
+    mut_ring         = (mut_entry_t*)calloc(MUT_RING, sizeof(mut_entry_t));
+    if (!prefetch_addrs || !prefetch_sizes || !g_watchlist_addrs || !addr_hash || !tomb || !mut_ring) {
+        LOG_ERR("ERROR=setup: PSRAM buffer alloc failed\r\n");
+    }
+    /* Report where the hot buffers landed + remaining internal headroom. */
+    LOG_INFO("DEBUG=hotbuf: hash=%s(%uKB) memdata=deferred internal-free=%uKB maxblk=%uKB\r\n",
+             g_hash_internal ? "SRAM" : "PSRAM",
+             (unsigned)(HASH_SIZE * sizeof(hash_entry_t) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024));
+
     pinMode(RESET_PIN, INPUT);
     beginEEPROM(false);
     /* v0.18.10: bumped 115200 → 250000 (max of vscode serial monitor)*/
+    /* v0.24.1: TX ring buffer (default 256B). Serial.printf blocks the
+     * CALLING task when the ring is full — with the EXI task and loop()
+     * sharing the UART with httpTask, a log burst used to stall the
+     * realtime core mid-frame. 8KB absorbs any level-1 burst and drains
+     * at ~25 KB/s in the background; was 16KB in v0.24.1, halved in
+     * v0.24.3 to give internal heap back to mbedTLS. Must be set BEFORE
+     * Serial.begin. */
+    Serial.setTxBufferSize(8192);
     Serial.begin(250000);
     delay(250);
     /* Mark all hash buckets as empty BEFORE any potential lookup.
@@ -2593,7 +4199,7 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    Serial.printf("WII-RA-ADAPTER v0.21.0-cleanup (build %s %s)\n", __DATE__, __TIME__);
+    Serial.printf("WII-RA-ADAPTER v0.32.0-gate (build %s %s)\n", __DATE__, __TIME__);
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {
@@ -2601,7 +4207,7 @@ void setup() {
         setSemaphoreLED(LED_BLINK_FAST, LED_RED);
         while(1) yield();
     }
-    Serial.println("DEBUG=SPI slave initialized");
+    LOG_INFO("DEBUG=SPI slave initialized\r\n");
 
     // WiFi + RA login (same flow as fpga-ra-adapter)
     if (!isConfigured()) {
@@ -2615,7 +4221,7 @@ void setup() {
         
         while (!isConfigured()) {
             setSemaphoreLED(LED_BLINK_MEDIUM, LED_YELLOW);
-            Serial.println("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1");
+            LOG_INFO("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
             if (wm.startConfigPortal("WII_RA_ADAPTER", "12345678")) {
                 String token = try_login_RA(custom_user.getValue(), custom_pass.getValue());
                 if (token != "null") {
@@ -2631,19 +4237,43 @@ void setup() {
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
         setSemaphoreLED(LED_BLINK_SLOW, LED_GREEN);
-        Serial.println("DEBUG=WiFi OK");
+        LOG_INFO("DEBUG=WiFi OK\r\n");
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
             setSemaphoreLED(LED_BLINK_MEDIUM, LED_GREEN);
-            Serial.println("DEBUG=RA login OK");
+            LOG_INFO("DEBUG=RA login OK\r\n");
         }
     }
 
-    state = STATE_WAIT_GAME_ID;
-    Serial.println("DEBUG=Ready, waiting for GameCube...");
+    /* Kill the WiFi modem power-save (default WIFI_PS_MIN_MODEM). With
+     * the radio dozing between DTIM beacons, the first TLS connect after
+     * a network-idle stretch fails FAST (-1/-11) — which is exactly the
+     * gameplay pattern: login + 214KB patch fetch work perfectly at load
+     * (continuous traffic keeps the radio awake), then pings/awards fail
+     * minutes later. Costs ~50mA — irrelevant, we're not on battery. */
+    WiFi.setSleep(false);
 
-    // Start Core 1 task for EXI communication (16KB stack to avoid overflow)
-    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 1, &taskCore1Handle, 1);
+    state = STATE_WAIT_GAME_ID;
+    LOG_INFO("DEBUG=Ready, waiting for GameCube...\r\n");
+
+    /* EXI task priority 19 (v0.24.2; was 1). Arduino-ESP32 leaves the
+     * lwIP tcpip task UNPINNED (NO_AFFINITY, prio ~18) — during HTTP
+     * activity it freely hops onto Core 1 and, at prio 18 vs our old
+     * prio 1, preempted the EXI task mid-frame (the residual fire-rate
+     * dips that survived the v0.24.0 core split). 19 sits above tcpip
+     * and below the WiFi driver (23). Safe: taskCore1 blocks on the SPI
+     * result queue / vTaskDelay every iteration, never busy-spins. */
+    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 19, &taskCore1Handle, 1);
+
+    /* HTTP worker on Core 0, beside the WiFi/lwIP tasks. 12KB stack —
+     * TLS+HTTPClient ran for months on loopTask's default 8KB, so 12KB
+     * has margin while giving 8KB of internal heap back to mbedTLS
+     * (stacks must stay internal RAM). Queue depth 8 is generous:
+     * rcheevos issues at most a couple of concurrent calls (ping +
+     * award); the single worker serializes them. */
+    http_req_q  = xQueueCreate(8, sizeof(http_job_t));
+    http_done_q = xQueueCreate(8, sizeof(http_done_t));
+    xTaskCreatePinnedToCore(httpTask, "HTTP_Task", 12288, nullptr, 1, nullptr, 0);
 }
 
 void loop() {
@@ -2652,13 +4282,26 @@ void loop() {
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
     }
-    
-    // State machine
+
+    /* Deliver finished HTTP responses to rc_client (callbacks run HERE,
+     * on the same task as do_frame — rc_client is not thread-safe). */
+    http_drain_done();
+
+    // State machine. loadGame is async now (login → load → on_game_loaded
+    // all via callbacks), so guard against re-entering it every iteration
+    // while state is still LOADING.
+    static bool load_started = false;
     if (state == STATE_LOADING_GAME) {
-        loadGame(gameId.c_str());
-        // state is now STATE_ACTIVE or STATE_ERROR (set by on_game_loaded callback)
+        if (!load_started) {
+            load_started = true;
+            loadGame(gameId.c_str());
+        }
+    } else {
+        load_started = false;  // re-arm for the next LOAD_GAME / reset
     }
-    
+
+#if RC_DO_FRAME_IN_LOW_PRIO_TASK
     processSnapshot();
+#endif
     vTaskDelay(1);
 }

@@ -45,8 +45,18 @@ extern "C" {
 #define RA_MAGIC_GC_TO_ESP      0x52  /* 'R' - GameCube to ESP32 */
 #define RA_MAGIC_ESP_TO_GC      0xAE  /* ESP32 to GameCube */
 
-/** Maximum number of watched addresses */
-#define RA_MAX_WATCH_ADDRS      1024
+/** Maximum number of watched addresses.
+ *  6144 since v0.24.7 — SMG's LIVE per-frame working set measured
+ *  ~3700 on hw (119 active achievements x ~30 chain bytes each), which
+ *  sat exactly ON the old 4096/3800 ceiling: eviction at capacity has
+ *  no cold entries to pick, so it dropped live bytes, the evaluator
+ *  re-requested them next frame, and the system livelocked
+ *  (3698->3442->3570->3698 cycle, fires at ~10Hz) while masked-chain
+ *  bytes read 0 on miss and mass-fired false unlocks. Capacity must
+ *  sit comfortably above live demand; snapshot (12+6144=6156 B) still
+ *  fits EXI_MAX_TRANSACTION_SIZE=8192.
+ *  KEEP IN SYNC with the copy of this header in d2x-cios/source/ra-module/. */
+#define RA_MAX_WATCH_ADDRS      6144
 
 /** Number of addresses per watchlist chunk (fits in one EXI transaction) */
 /* Each chunk: 6B resp header + 4B chunk_hdr + N*4B addrs <= EXI_MAX_TRANSACTION_SIZE */
@@ -189,6 +199,23 @@ typedef enum {
      * survivors preserved on both sides → SNAPSHOT positions stay aligned.
      */
     RA_EVT_WATCHLIST_REMOVE  = 0x0D,
+
+    /* Watchlist removal by INDEX (v0.25.0 — replaces address-based
+     * REMOVE on the hot path). Both replicas are identical before the
+     * removal, so the ESP sends the u16 array indices of the entries to
+     * drop (ascending order) instead of their u32 addresses. ra-module
+     * marks by index directly — O(R) instead of the O(R*N) linear
+     * address search that cost ~25-30ms (≈2 frames!) at N=6144 — then
+     * compacts in one pass. Index identity also eliminates the entire
+     * address-ambiguity bug class (duplicate addresses, hash-tombstone
+     * off-by-N).
+     *
+     * Payload: ra_watchlist_remove_idx_t (u16 idx_count, BE) followed
+     * by idx_count x u16 indices (BE, ascending, all < current count).
+     *
+     * Parse MUST be in both ra_send_snapshot AND ra_send_addr_response
+     * (twin function divergence hazard). */
+    RA_EVT_WATCHLIST_REMOVE_IDX = 0x0E,
 } ra_esp_event_t;
 
 /**
@@ -264,6 +291,11 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t frame_counter;  /* Incrementing frame counter */
     uint16_t addr_count;     /* Number of values in this snapshot */
+    uint16_t wl_seq;         /* v0.26.0 Phase D2: seq of the LAST watchlist
+                              * mutation the Wii applied. Sync is VERIFIED
+                              * against the ESP's emitted seq every frame —
+                              * behind → resend exactly the next mutation
+                              * (idempotent); impossible → full RESYNC. */
     /* Followed by addr_count bytes: values[0..addr_count-1] */
     /* Each byte corresponds to the address at the same index in the watch list */
 } ra_snapshot_header_t;
@@ -294,6 +326,9 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint16_t total_addr_count;  /* big-endian total number of addresses */
     uint16_t num_chunks;        /* big-endian number of chunks to fetch */
+    uint16_t seq;               /* v0.26.0: mutation-seq base of this (re)load —
+                                 * after the chunk fetch completes, BOTH sides
+                                 * hold this seq and the list it names. */
 } ra_watchlist_notify_t;
 
 /**
@@ -338,6 +373,7 @@ typedef struct __attribute__((packed)) {
  * intent is clear at call sites.
  */
 typedef struct __attribute__((packed)) {
+    uint16_t seq;            /* v0.26.0: mutation seq — Wii applies iff seq == ra_seq+1 */
     uint16_t addr_count;     /* Number of addresses to append (big-endian) */
 } ra_watchlist_append_t;
 
@@ -357,6 +393,16 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint16_t addr_count;     /* Number of addresses to remove (big-endian) */
 } ra_watchlist_remove_t;
+
+/**
+ * RA_EVT_WATCHLIST_REMOVE_IDX data — idx_count followed by idx_count u16
+ * array indices (BE, ascending, all < current watchlist count). ra-module
+ * marks the slots directly and compacts in a single pass.
+ */
+typedef struct __attribute__((packed)) {
+    uint16_t seq;            /* v0.26.0: mutation seq — Wii applies iff seq == ra_seq+1 */
+    uint16_t idx_count;
+} ra_watchlist_remove_idx_t;
 
 /**
  * RA_CMD_ADDR_RESPONSE data

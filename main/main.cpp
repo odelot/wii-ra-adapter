@@ -109,17 +109,19 @@ extern "C" {
  * the UART drains at 250000 baud ≈ 25 KB/s; when the TX ring buffer
  * fills, Serial.printf BLOCKS the calling task — including the EXI task
  * and loop() on Core 1. The award/load windows used to burst hundreds of
- * chars (URLs, HTTP bodies, rcheevos verbose, KIRBY diag) and that burst
+ * chars (URLs, HTTP bodies, rcheevos verbose) and that burst
  * showed up as dropped SNAP fires ("Serial pressure breaks SPI timing").
  *
- *   0 = errors only
- *   1 = info: heartbeat, state transitions, milestones (default)
- *   2 = debug: HTTP traces, rcheevos verbose, KIRBY chain diag, SNAP_HDR
+ *   0 = errors only (+ banner + ACHIEVEMENT, always-on)
+ *   1 = info: FRAME/CATCHUP telemetry + lifecycle milestones (game loaded,
+ *       login, state transitions, ready) — the default working view
+ *   2 = debug: HTTP traces, rcheevos verbose, cap_ops, full FRAME line,
+ *       hotbuf, FORCE-collect, WiFi steps, EXI init dumps, SNAP_HDR
  *
  * Raise to 2 only while investigating. Combined with the enlarged UART
  * TX buffer in setup(), level 1 keeps hot windows burst-free. */
 #ifndef RA_LOG_LEVEL
-#define RA_LOG_LEVEL 0
+#define RA_LOG_LEVEL 1
 #endif
 #include <stdarg.h>
 /* ============================================================================
@@ -164,7 +166,8 @@ static void ralog_vprintf(const char *fmt, va_list ap) {
     else Serial.write((const uint8_t *)buf, len);    /* boot: no EXI yet, blocking ok */
 }
 
-static void ralog_printf(const char *fmt, ...) {
+/* non-static: also called from exi_spi_slave.cpp via ra_log.h */
+void ralog_printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     ralog_vprintf(fmt, ap);
     va_end(ap);
@@ -206,9 +209,10 @@ static void ralog_drain_task(void *pv) {
 #define LOG_INFO(...) do { if (RA_LOG_LEVEL >= 1) ralog_printf(__VA_ARGS__); } while (0)
 #define LOG_DBG(...)  do { if (RA_LOG_LEVEL >= 2) ralog_printf(__VA_ARGS__); } while (0)
 
-/* LOG_FRAME: per-vblank summary line (one per processed frame).
- * Emitted independently of RA_LOG_LEVEL.
- * "Minimum-noise" mode: RA_LOG_LEVEL 0  +  RA_LOG_FRAME_STATS 1.
+/* LOG_FRAME: per-vblank summary line (one per processed frame). This is the
+ * INFO channel — FRAME (and the periodic CATCHUP line) are emitted at
+ * RA_LOG_LEVEL >= 1. RA_LOG_FRAME_STATS remains a compile-time master switch
+ * to remove the telemetry entirely. "Minimum-noise" mode: RA_LOG_LEVEL 0.
  *
  * Fields printed:
  *   seq    - frame sequence number (PPC VBI counter, sent by d2x)
@@ -231,7 +235,7 @@ static void ralog_drain_task(void *pv) {
 #ifndef RA_LOG_FRAME_STATS
 #define RA_LOG_FRAME_STATS 1
 #endif
-#define LOG_FRAME(...) do { if (RA_LOG_FRAME_STATS) ralog_printf(__VA_ARGS__); } while (0)
+#define LOG_FRAME(...) do { if (RA_LOG_FRAME_STATS && RA_LOG_LEVEL >= 1) ralog_printf(__VA_ARGS__); } while (0)
 
 /* ============================================================================
  * Flight recorder (2026-06-19). The per-frame FRAME line is the bulk of the
@@ -267,7 +271,7 @@ static uint8_t        fr_after  = 0;   /* remaining after-context frames to prin
 static unsigned long  fr_spikes = 0;   /* diag: total spikes dumped */
 
 static void fr_record(const char *fmt, ...) {
-    if (!RA_LOG_FRAME_STATS) return;
+    if (!RA_LOG_FRAME_STATS || RA_LOG_LEVEL < 1) return;   /* FRAME = INFO channel */
     va_list ap; va_start(ap, fmt);
     if (g_log_all_frames) {                /* log-all mode: emit every frame (async, free) */
         ralog_vprintf(fmt, ap);
@@ -389,10 +393,6 @@ static int32_t hash_lookup(uint32_t addr);
 static int is_cached_cb(uint32_t addr, uint32_t num_bytes, void* ud);
 #line 819 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static const char * cmd_short_name(uint8_t cmd);
-#line 851 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void enqueue_marker(uint32_t m);
-#line 860 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void drain_marker_queue(void);
 #line 915 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void queue_event(uint8_t type, const uint8_t *data, uint16_t len);
 #line 929 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
@@ -421,8 +421,6 @@ static bool json_quote_is_real(const char* data, size_t idx);
 static void json_remove_whitespace(PsramStream &buf);
 #line 1202 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_remove_field(PsramStream &buf, const char* field);
-#line 1241 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void ra_json_scan(const char *b, size_t len, const char *tag);
 #line 1266 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_clean_field_str(PsramStream &buf, const char* field);
 #line 1302 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
@@ -485,20 +483,6 @@ String read_ra_user_from_eeprom();
 String read_ra_pass_from_eeprom();
 #line 3603 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 String try_login_RA(String user, String pass);
-#line 3633 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static uint32_t cache_read_u32_be(uint32_t addr, bool *ok);
-#line 3645 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static uint16_t cache_read_u16_be(uint32_t addr, bool *ok);
-#line 3652 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void dump_kirby_chain();
-#line 3705 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void bench_hash_once(void);
-#line 3738 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void bench_psram_loop(uint32_t N, volatile uint32_t* out_dt);
-#line 3750 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void bench_worker_core0(void* arg);
-#line 3759 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void bench_dualcore(void);
 #line 3790 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void processSnapshot();
 #line 4047 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
@@ -540,10 +524,6 @@ extern "C" {
     void rc_modified_memref_mark_dirty(void* chain);
     void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs);
 }
-/* EXI re-arm gap instrumentation (defined in exi_spi_slave.cpp). Max un-armed
- * window per FRAME — spikes during the galaxy storm == the request-race cause. */
-extern volatile uint32_t g_exi_rearm_gap_max_us;
-
 /* Deadlock locator (project_exi_robust_handshake): a Core-0 watchdog dumps these
  * each second. Whichever STOPS advancing during the galaxy convergence is the
  * task that hung; g_servicer_stage says where in the servicer it stalled. */
@@ -561,11 +541,6 @@ static uint32_t g_df_prev_gameframe = 0;   // frame_counter at last CATCHUP log
 static uint32_t g_df_us = 0, g_df_n = 0;       // do_frame
 static uint32_t g_cm_us = 0, g_cm_n = 0;       // collect_missing_addresses
 static uint32_t g_cm_skipped = 0;              // collect calls skipped (steady state)
-/* v0.28.5 — memory-access volume during do_frame. g_rm_bytes counts every
- * byte read_memory_ingame serves (== one hash_lookup each); comparing it to
- * df_us tells whether do_frame is memory-bound (worth moving hash/cache to
- * SRAM) or CPU-bound (trigger eval — SRAM won't help). Reset each CATCHUP. */
-static uint32_t g_rm_bytes = 0;
 /* v0.28.7 — wall-clock between consecutive processSnapshot bodies (the real
  * processing cycle). cycle = gap + ap_us + df_us, where gap is the overhead
  * NOT spent in our code: ra-module producing/transferring the next SNAPSHOT
@@ -667,16 +642,16 @@ static void dump_cache_lru(void) {
         else if (age < 1000) c[(age - 100) / 100]++;
         else { uint32_t b = (age - 1000) / 250; if (b > 8) b = 8; k[b]++; }
     }
-    LOG_FRAME("=== CACHE DUMP watch=%u static=%u dyn=%u lru_clock=%lu ===\r\n",
+    LOG_DBG("=== CACHE DUMP watch=%u static=%u dyn=%u lru_clock=%lu ===\r\n",
               (unsigned)watch_count, (unsigned)static_watch_count,
               (unsigned)(watch_count - static_watch_count), (unsigned long)lru_clock);
-    LOG_FRAME("  hot: age0=%lu 1-9=%lu 10-99=%lu\r\n",
+    LOG_DBG("  hot: age0=%lu 1-9=%lu 10-99=%lu\r\n",
               (unsigned long)lo[0], (unsigned long)lo[1], (unsigned long)lo[2]);
-    LOG_FRAME("  100s: 1xx=%lu 2xx=%lu 3xx=%lu 4xx=%lu 5xx=%lu 6xx=%lu 7xx=%lu 8xx=%lu 9xx=%lu\r\n",
+    LOG_DBG("  100s: 1xx=%lu 2xx=%lu 3xx=%lu 4xx=%lu 5xx=%lu 6xx=%lu 7xx=%lu 8xx=%lu 9xx=%lu\r\n",
               (unsigned long)c[0], (unsigned long)c[1], (unsigned long)c[2],
               (unsigned long)c[3], (unsigned long)c[4], (unsigned long)c[5],
               (unsigned long)c[6], (unsigned long)c[7], (unsigned long)c[8]);
-    LOG_FRAME("  1k+: 1.00k=%lu 1.25k=%lu 1.50k=%lu 1.75k=%lu 2.00k=%lu 2.25k=%lu 2.50k=%lu 2.75k=%lu 3k+=%lu\r\n",
+    LOG_DBG("  1k+: 1.00k=%lu 1.25k=%lu 1.50k=%lu 1.75k=%lu 2.00k=%lu 2.25k=%lu 2.50k=%lu 2.75k=%lu 3k+=%lu\r\n",
               (unsigned long)k[0], (unsigned long)k[1], (unsigned long)k[2],
               (unsigned long)k[3], (unsigned long)k[4], (unsigned long)k[5],
               (unsigned long)k[6], (unsigned long)k[7], (unsigned long)k[8]);
@@ -1074,7 +1049,6 @@ static inline uint32_t hash_addr(uint32_t addr) {
 static uint32_t g_l1_addr[L1_SLOTS];   /* internal .bss; slot = set*2 + way */
 static uint16_t g_l1_widx[L1_SLOTS];
 static uint8_t  g_l1_mru[L1_SETS];     /* which way was last used (evict the other) */
-static unsigned long g_l1_hits = 0, g_l1_miss = 0;   /* diag */
 static inline void l1_clear() {
     for (uint32_t i = 0; i < L1_SLOTS; i++) g_l1_addr[i] = L1_EMPTY;
 }
@@ -1120,13 +1094,12 @@ static void hash_insert(uint32_t addr, uint16_t watch_index) {
 static inline int32_t hash_lookup(uint32_t addr) {
     uint32_t set  = (addr * 0x9E3779B9u) & L1_SET_MASK;
     uint32_t base = set << 1;
-    if (g_l1_addr[base]   == addr) { ++g_l1_hits; g_l1_mru[set] = 0; return (int32_t)g_l1_widx[base]; }
-    if (g_l1_addr[base+1] == addr) { ++g_l1_hits; g_l1_mru[set] = 1; return (int32_t)g_l1_widx[base+1]; }
+    if (g_l1_addr[base]   == addr) { g_l1_mru[set] = 0; return (int32_t)g_l1_widx[base]; }
+    if (g_l1_addr[base+1] == addr) { g_l1_mru[set] = 1; return (int32_t)g_l1_widx[base+1]; }
 
     uint32_t h = hash_addr(addr);
     while (addr_hash[h].watch_index != HASH_EMPTY) {
         if (addr_hash[h].addr == addr) {
-            ++g_l1_miss;
             uint32_t way = (uint32_t)g_l1_mru[set] ^ 1u;   /* populate the non-MRU way */
             g_l1_addr[base + way] = addr;
             g_l1_widx[base + way] = addr_hash[h].watch_index;
@@ -1204,74 +1177,6 @@ String base_url = "https://retroachievements.org/dorequest.php?";
 NetworkClientSecure client;
 HTTPClient https;
 
-// ============================================================================
-// Async marker queue — decouples SPI receive from Serial.printf
-//
-// handle_exi_command() enqueues 0xD0xxxxxx markers without printing.
-// drain_marker_queue() is called from the processEXI loop AFTER the SPI
-// slave has been re-armed, so Serial.printf never blocks the receive path.
-// This prevents consecutive back-to-back markers from being lost.
-// ============================================================================
-#define MARKER_QUEUE_SIZE 32
-
-static volatile uint32_t marker_queue[MARKER_QUEUE_SIZE];
-static volatile int      marker_head = 0;
-static volatile int      marker_tail = 0;
-
-static void enqueue_marker(uint32_t m) {
-    int next = (marker_head + 1) % MARKER_QUEUE_SIZE;
-    if (next != marker_tail) {
-        marker_queue[marker_head] = m;
-        marker_head = next;
-    }
-    // If queue is full the marker is silently dropped — better than blocking.
-}
-
-static void drain_marker_queue(void) {
-    while (marker_tail != marker_head) {
-        uint32_t m   = marker_queue[marker_tail];
-        marker_tail  = (marker_tail + 1) % MARKER_QUEUE_SIZE;
-        if (RA_LOG_LEVEL < 2) continue;  /* drain queue silently */
-
-        uint8_t top  = (m >> 24) & 0xFF;
-        uint8_t sub  = (m >> 16) & 0xFF;
-        uint8_t ch   = ((m >>  8) >> 4) & 0xF;
-        uint8_t dev  =  (m >>  8)       & 0xF;
-        uint16_t crumb = (uint16_t)(m & 0xFFFF);
-
-        if (top == 0x9A) {
-            /* Swiss ra_install.c step markers */
-            switch (sub) {
-                case 0x01: Serial.println("DEBUG=STEP: [1] workspace allocated");           break;
-                case 0x02: Serial.printf( "DEBUG=STEP: [2] blob copy done, addr_lo=0x%04X\n", crumb); break;
-                case 0x03: Serial.println("DEBUG=STEP: [3] before VAR_AREA init writes");   break;
-                case 0x04: Serial.println("DEBUG=STEP: [4] after VAR_AREA init writes");    break;
-                case 0x05: Serial.printf( "DEBUG=STEP: [5] VIRetraceHook addr_lo=0x%04X%s\n", crumb, crumb ? "" : " (NULL!)"); break;
-                case 0x06: Serial.printf( "DEBUG=STEP: [6] install_site addr_lo=0x%04X%s\n",  crumb, crumb ? "" : " (NULL!)"); break;
-                case 0x07: Serial.println("DEBUG=STEP: [7] hook[24]=bl written OK");         break;
-                case 0x08: Serial.println("DEBUG=STEP: [8] *install_site=b written OK");    break;
-                case 0x0F: Serial.println("DEBUG=STEP: [F] ra_agent_install() COMPLETE");   break;
-                default:   Serial.printf( "DEBUG=STEP: 0x%08X\n", (unsigned)m);             break;
-            }
-            return;
-        }
-
-        switch (m) {
-            case 0xD000C0DE: Serial.println("DEBUG=MARKER: ra_agent_install() entered"); break;
-            case 0xD000FA11: Serial.println("DEBUG=MARKER: all probes FAILED");           break;
-            default:
-                if      (sub == 0xBB) Serial.printf("DEBUG=MARKER: breadcrumb %04X\n",        crumb);
-                else if (sub == 0xB1) Serial.printf("DEBUG=MARKER: loop iter %u entered\n",   (unsigned)(m & 0xF));
-                else if (sub == 0xB2) Serial.printf("DEBUG=MARKER: loop iter %u chdv OK\n",   (unsigned)(m & 0xF));
-                else if (sub == 0xE0) Serial.printf("DEBUG=MARKER: probing ch=%d dev=%d\n",   ch, dev);
-                else if (sub == 0xE1) Serial.printf("DEBUG=MARKER: probe PASS ch=%d dev=%d\n",ch, dev);
-                else if (sub == 0x50) Serial.printf("DEBUG=MARKER: ra_init ch=%d dev=%d\n",   ch, dev);
-                else if (sub == 0xAA) Serial.printf("DEBUG=MARKER: beacon ch=%d dev=%d\n",    ch, dev);
-                else                  Serial.printf("DEBUG=MARKER: 0x%08X\n", (unsigned)m);
-                break;
-        }
-    }
-}
 
 // ============================================================================
 // Pending events queue (ESP32 -> GameCube)
@@ -1346,7 +1251,7 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
             memcpy(buf + sizeof(ra_achievement_t), ach->title, title_len);
 
             queue_event(RA_EVT_ACHIEVEMENT, buf, sizeof(ra_achievement_t) + title_len);
-            Serial.printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
+            ralog_printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
             break;
         }
         default:
@@ -1373,7 +1278,6 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
 static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
                                    uint32_t num_bytes, rc_client_t *client) {
     (void)client;
-    g_rm_bytes += num_bytes;   /* memory-access volume profiling (one hash_lookup/byte) */
     /* Return RAW bytes in address order. rcheevos handles PPC BE-ness
      * INTERNALLY via the RC_MEMSIZE_*_BITS_BE size enums (see memref.c
      * rc_transform_memref_value cases 526-542) — cheevo devs pick the
@@ -1600,36 +1504,6 @@ static void json_remove_field(PsramStream &buf, const char* field) {
         r++;
     }
     buf.setLength(w);
-}
-
-/* Diagnostic: scan a JSON buffer for the first structural break — the symptom
- * of a field-clean that miscounts an escaped quote (\") and cuts the wrong
- * span. Tracks brace/bracket depth honoring strings + escapes. Prints final
- * depth (0 = balanced), in_str, and the first negative-depth offset + context.
- * Uses Serial.printf directly so it prints regardless of RA_LOG_LEVEL. */
-static void ra_json_scan(const char *b, size_t len, const char *tag) {
-    int depth = 0; bool in_str = false; bool esc = false;
-    long brk = -1;
-    for (size_t i = 0; i < len; i++) {
-        char c = b[i];
-        if (esc) { esc = false; continue; }
-        if (in_str) {
-            if (c == '\\') esc = true;
-            else if (c == '"') in_str = false;
-            continue;
-        }
-        if (c == '"') in_str = true;
-        else if (c == '{' || c == '[') depth++;
-        else if (c == '}' || c == ']') { if (--depth < 0) { brk = (long)i; break; } }
-    }
-    Serial.printf("DEBUG=JSONSCAN[%s] len=%u final_depth=%d in_str=%d brk=%ld\r\n",
-                  tag, (unsigned)len, depth, (int)in_str, brk);
-    if (brk >= 0) {
-        size_t s = (brk > 200) ? (size_t)brk - 200 : 0;
-        Serial.printf("DEBUG=JSONSCAN[%s] ctx@%ld: %.260s\r\n", tag, brk, b + s);
-    } else if (depth != 0 && len >= 260) {
-        Serial.printf("DEBUG=JSONSCAN[%s] tail: %.260s\r\n", tag, b + (len - 260));
-    }
 }
 
 static void json_clean_field_str(PsramStream &buf, const char* field) {
@@ -1976,19 +1850,19 @@ static void json_keep_first_set(PsramStream &buf) {
  *
  * Run AFTER every other strip, this pass removes achievements from the
  * HEAVIEST (most operations) to the lightest until the running total drops
- * to <= MAX_TOTAL_OPERATIONS (~13000, about half of SMG), buying frame
+ * to <= MAX_TOTAL_OPERATIONS (~20000, ~60% of SMG), buying frame
  * headroom at the cost of a handful of the most expensive achievements.
- * It prints how many were dropped.
+ * It logs (INFO) how many were dropped and names each one.
  *
  * Operation count = conditions in MemAddr: +1 per '_' (AND within a group),
  * +1 per 'S' group separator (NOT the '0xS' bit6 size prefix — that S is
  * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
  * ─────────────────────────────────────────────────────────────────────── */
 #ifndef CAP_TOTAL_OPERATIONS
-#define CAP_TOTAL_OPERATIONS 0            // 1 = on, 0 = keep every achievement
+#define CAP_TOTAL_OPERATIONS 1            // 1 = on, 0 = keep every achievement
 #endif
 #ifndef MAX_TOTAL_OPERATIONS
-#define MAX_TOTAL_OPERATIONS 13000        // target ceiling (~half of SMG's 32768)
+#define MAX_TOTAL_OPERATIONS 20000        // target ceiling (~60% of SMG's 32768)
 #endif
 
 /* Count rcheevos "operations" (conditions) in one achievement object's
@@ -2013,6 +1887,49 @@ static int count_mem_ops(const char* data, int objStart, int objEnd) {
     return ops;
 }
 
+/* Copy the "Title" value of one achievement object's [objStart,objEnd] span into
+ * out (NUL-terminated, truncated to outsize). Used to name the achievements the
+ * op-cap drops so the INFO log lists exactly what was removed. */
+static void cap_extract_title(const char* data, int objStart, int objEnd,
+                              char* out, int outsize) {
+    static const char* KEY  = "\"Title\":\"";
+    static const int   KLEN = 9;
+    int p = -1, w = 0;
+    for (int i = objStart; i <= objEnd - KLEN; i++) {
+        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
+    }
+    if (p != -1) {
+        for (int i = p; i < objEnd && w < outsize - 1; i++) {
+            char c = data[i];
+            if (c == '\\') { if (i + 1 < objEnd && w < outsize - 1) out[w++] = data[++i]; continue; }
+            if (c == '"') break;            // closing quote → end of value
+            out[w++] = c;
+        }
+    }
+    out[w] = '\0';
+    if (w == 0) snprintf(out, outsize, "(no title)");
+}
+
+/* Achievements whose Type is "progression" (RA needs ALL) or "win_condition"
+ * (RA needs ANY) gate beaten-game / mastery detection — the op-cap must NEVER
+ * drop these, even when heavy, or the player can't get credit for finishing.
+ * The patch is whitespace-stripped before the cap runs ("Type":"progression"),
+ * but tolerate an optional space for safety. Type core/bonus/null = droppable. */
+static bool cap_is_protected(const char* data, int objStart, int objEnd) {
+    static const char* KEY  = "\"Type\":";
+    static const int   KLEN = 7;
+    int p = -1;
+    for (int i = objStart; i <= objEnd - KLEN; i++) {
+        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
+    }
+    if (p == -1) return false;
+    while (p < objEnd && (data[p] == ' ' || data[p] == '\t')) p++;
+    if (p >= objEnd || data[p] != '"') return false;   // null / non-string => droppable
+    p++;
+    return strncmp(data + p, "progression\"",  12) == 0
+        || strncmp(data + p, "win_condition\"", 14) == 0;
+}
+
 static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     json_remove_whitespace(buf);
     char* data = buf.data();
@@ -2022,13 +1939,15 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     int arrayEnd   = buf.indexOf("]", arrayStart);
     if (arrayStart == -1 || arrayEnd == -1) return;
 
-    /* Pass 1 — enumerate achievement objects: span + operation count. */
-    struct AchSpan { int start, end, ops; bool removed; };
+    /* Pass 1 — enumerate achievement objects: span + operation count + whether
+     * it's a protected (progression/win_condition) achievement the cap can't drop. */
+    struct AchSpan { int start, end, ops; bool removed; bool prot; };
     const int MAX_ACH = 512;               // SMG core = 161; generous headroom
     AchSpan* spans = (AchSpan*) ps_malloc(sizeof(AchSpan) * MAX_ACH);
-    if (!spans) { Serial.println("ERROR=cap_ops: ps_malloc failed, skipping"); return; }
+    if (!spans) { LOG_ERR("ERROR=cap_ops: ps_malloc failed, skipping\r\n"); return; }
 
     int count = 0, total_ops = 0, pos = arrayStart + 1;
+    int prot_count = 0, prot_ops = 0;
     while (pos < arrayEnd && count < MAX_ACH) {
         int objStart = buf.indexOf("{", pos);
         if (objStart == -1 || objStart > arrayEnd) break;
@@ -2039,32 +1958,57 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
             else if (data[objEnd] == '}') braces--;
         }
         if (objEnd >= arrayEnd) break;
-        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false };
+        bool prot = cap_is_protected(data, objStart, objEnd);
+        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false, prot };
         total_ops += spans[count].ops;
+        if (prot) { prot_count++; prot_ops += spans[count].ops; }
         count++;
         pos = objEnd + 1;
     }
 
-    Serial.printf("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d)\r\n",
-                  count, total_ops, target_ops);
+    LOG_DBG("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d), %d protected (%d ops)\r\n",
+             count, total_ops, target_ops, prot_count, prot_ops);
     if (total_ops <= target_ops) {
-        Serial.printf("DEBUG=cap_ops: already under target, removed 0 achievements\r\n");
+        LOG_DBG("DEBUG=cap_ops: already under target, removed 0 achievements\r\n");
         free(spans);
         return;
     }
 
-    /* Pass 2 — greedily mark the heaviest achievement until the running
-     * total drops to <= target. count is small, so a simple O(n^2) max-find. */
-    int removed = 0, removed_ops = 0;
+    /* Pass 2 — greedily mark the heaviest DROPPABLE achievement until the running
+     * total drops to <= target. Protected (progression/win_condition) achievements
+     * are NEVER candidates — if only protected remain, we stop above target (better
+     * to overshoot the op budget than break beaten-game detection). O(n^2) max-find. */
+    int removed = 0, removed_ops = 0, min_removed_ops = -1;
     while (total_ops > target_ops) {
         int maxIdx = -1, maxOps = -1;
         for (int i = 0; i < count; i++)
-            if (!spans[i].removed && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
-        if (maxIdx == -1) break;           // nothing left to remove
+            if (!spans[i].removed && !spans[i].prot && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
+        if (maxIdx == -1) break;           // nothing droppable left (rest are protected)
         spans[maxIdx].removed = true;
         total_ops   -= spans[maxIdx].ops;
         removed_ops += spans[maxIdx].ops;
         removed++;
+        if (min_removed_ops < 0 || spans[maxIdx].ops < min_removed_ops) min_removed_ops = spans[maxIdx].ops;
+        /* Name each dropped achievement (INFO). data offsets are still valid here —
+         * the physical removeRange happens in Pass 3 below. Heaviest dropped first. */
+        {
+            char title[80];
+            cap_extract_title(data, spans[maxIdx].start, spans[maxIdx].end, title, sizeof(title));
+            LOG_INFO("DEBUG=cap_ops removed: \"%s\" (%d ops)\r\n", title, spans[maxIdx].ops);
+        }
+    }
+
+    /* Surface the protected achievements that protection actually saved — i.e.
+     * ones at least as heavy as the lightest we dropped, which the greedy pass
+     * WOULD have cut if they weren't progression/win_condition. */
+    if (removed > 0) {
+        for (int i = 0; i < count; i++) {
+            if (spans[i].prot && spans[i].ops >= min_removed_ops) {
+                char title[80];
+                cap_extract_title(data, spans[i].start, spans[i].end, title, sizeof(title));
+                LOG_INFO("DEBUG=cap_ops KEPT (progression/win): \"%s\" (%d ops)\r\n", title, spans[i].ops);
+            }
+        }
     }
 
     /* Pass 3 — physically delete the marked objects, HIGHEST offset first so
@@ -2080,8 +2024,9 @@ static void json_cap_total_operations(PsramStream &buf, int target_ops) {
     }
 
     free(spans);
-    Serial.printf("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops)\r\n",
-                  removed, removed_ops, count - removed, total_ops);
+    LOG_INFO("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops), %d protected kept%s\r\n",
+             removed, removed_ops, count - removed, total_ops, prot_count,
+             (total_ops > target_ops) ? " [target unreachable — protected floor]" : "");
 }
 
 // Apply all strips to a patch.php response held in PSRAM
@@ -2139,7 +2084,7 @@ static void http_finish(const http_job_t *job, const char *body, size_t body_len
     http_done_t done;
     done.body = (char *)ps_malloc(body_len + 1);
     if (!done.body) {
-        Serial.printf("ERROR=http_finish: ps_malloc(%u) failed\r\n", (unsigned)body_len + 1);
+        LOG_ERR("ERROR=http_finish: ps_malloc(%u) failed\r\n", (unsigned)body_len + 1);
         return;
     }
     memcpy(done.body, body, body_len);
@@ -2150,7 +2095,7 @@ static void http_finish(const http_job_t *job, const char *body, size_t body_len
     done.callback_data = job->callback_data;
     done.gen           = job->gen;
     if (xQueueSend(http_done_q, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        Serial.println("ERROR=http_finish: done queue full, response dropped");
+        LOG_ERR("ERROR=http_finish: done queue full, response dropped\r\n");
         free(done.body);
     }
 }
@@ -2217,8 +2162,8 @@ static void server_call_blocking(const http_job_t *job) {
 
         PsramStream ps;
         if (!ps.reserve(buf_size)) {
-            Serial.printf("ERROR=PSRAM alloc failed (%u bytes), psram-free=%u\r\n",
-                          (unsigned)buf_size, (unsigned)ESP.getFreePsram());
+            LOG_ERR("ERROR=PSRAM alloc failed (%u bytes), psram-free=%u\r\n",
+                    (unsigned)buf_size, (unsigned)ESP.getFreePsram());
             https.end();
             return;
         }
@@ -2268,7 +2213,6 @@ static void server_call_blocking(const http_job_t *job) {
         }
         LOG_DBG("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
                 written, (unsigned)ESP.getFreePsram());
-        LOG_DBG("DEBUG=Patch first64 before: %.64s\r\n", ps.c_str());
         size_t before = ps.length();
 
 
@@ -2281,9 +2225,7 @@ static void server_call_blocking(const http_job_t *job) {
          * pull in dozens of memrefs per set on Kirby. */
         //static const uint32_t keep_ids[] = { 557557, 577564, 557558 };
         //json_keep_only_achievement_id(ps, keep_ids, 3);
-        ra_json_scan(ps.c_str(), ps.length(), "raw");
         vTaskDelay(1); json_remove_whitespace(ps);
-        ra_json_scan(ps.c_str(), ps.length(), "ws");
         /* v0.27.6 — drop bonus/specialty sets, keep only "core". Cuts the
          * SMG do_frame ~40% (270→161 achievements) → df/s toward 60, the
          * timer fix. Set KEEP_ONLY_FIRST_SET to 0 to monitor every set. */
@@ -2292,40 +2234,27 @@ static void server_call_blocking(const http_job_t *job) {
         #endif
         #if KEEP_ONLY_FIRST_SET
         vTaskDelay(1); json_keep_first_set(ps);
-        ra_json_scan(ps.c_str(), ps.length(), "firstset");
         #endif
         vTaskDelay(1); json_clean_field_str(ps,   "RichPresencePatch");
-        ra_json_scan(ps.c_str(), ps.length(), "RP");
         vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
-        ra_json_scan(ps.c_str(), ps.length(), "LB");
         vTaskDelay(1); json_remove_field(ps,      "Warning");
-        ra_json_scan(ps.c_str(), ps.length(), "Warning");
         vTaskDelay(1); json_remove_field(ps,      "BadgeLockedURL");
-        ra_json_scan(ps.c_str(), ps.length(), "BadgeLockedURL");
         vTaskDelay(1); json_remove_field(ps,      "BadgeURL");
-        ra_json_scan(ps.c_str(), ps.length(), "BadgeURL");
         vTaskDelay(1); json_remove_field(ps,      "ImageIconURL");
-        ra_json_scan(ps.c_str(), ps.length(), "ImageIconURL");
         vTaskDelay(1); json_remove_field(ps,      "Rarity");
-        ra_json_scan(ps.c_str(), ps.length(), "Rarity");
         vTaskDelay(1); json_remove_field(ps,      "RarityHardcore");
-        ra_json_scan(ps.c_str(), ps.length(), "RarityHardcore");
         vTaskDelay(1); json_remove_field(ps,      "Author");
-        ra_json_scan(ps.c_str(), ps.length(), "Author");
         vTaskDelay(1); json_remove_flags5_achievements(ps);
-        ra_json_scan(ps.c_str(), ps.length(), "flags5");
 
         /* v0.27.x — cap the total operation budget by dropping the heaviest
          * achievements until total ops <= MAX_TOTAL_OPERATIONS. Runs LAST so
          * it sees the final kept set. Toggle via CAP_TOTAL_OPERATIONS. */
 #if CAP_TOTAL_OPERATIONS
         vTaskDelay(1); json_cap_total_operations(ps, MAX_TOTAL_OPERATIONS);
-        ra_json_scan(ps.c_str(), ps.length(), "capops");
 #endif
 
         // print ths shrinked ps
         LOG_DBG("DEBUG=Patch after stripping fields: size=%u bytes\r\n", (unsigned)ps.length());
-        LOG_DBG("DEBUG=Patch first128: %.128s...\r\n", ps.c_str());
 
         /* v0.27.6 EXPERIMENT — cap the achievement count to measure the
          * do_frame cost curve. Set EXPERIMENT_KEEP_FIRST_N>0 to limit;
@@ -2339,44 +2268,6 @@ static void server_call_blocking(const http_job_t *job) {
         json_keep_first_n_achievements(ps, EXPERIMENT_KEEP_FIRST_N);
         #endif
 #endif
-        LOG_DBG("DEBUG=Patch first64 after: %.64s\r\n", ps.c_str());
-
-        /* Diagnostic: dump area surrounding ConsoleId so we can see if the
-         * strip corrupted brace nesting and made the field appear nested. */
-        if (RA_LOG_LEVEL >= 2) {
-            const char *body = ps.c_str();
-            const char *p = strstr(body, "ConsoleID");
-            if (!p) p = strstr(body, "ConsoleId");
-            if (p) {
-                size_t off = (size_t)(p - body);
-                Serial.printf("DEBUG=Patch ConsoleID found at offset %u: %.80s\r\n",
-                              (unsigned)off, p);
-                /* Print the 160 bytes leading up to ConsoleId — looking for unbalanced
-                 * braces from a bad RichPresencePatch / Description strip. */
-                size_t pre_start = (off > 160) ? off - 160 : 0;
-                size_t pre_len   = off - pre_start;
-                Serial.printf("DEBUG=Patch pre-ConsoleId[%u..%u]: %.*s\r\n",
-                              (unsigned)pre_start, (unsigned)off,
-                              (int)pre_len, body + pre_start);
-
-                /* Count unbalanced braces from start to ConsoleId.
-                 * In valid JSON, just before a top-level field we expect depth=1. */
-                int depth = 0; bool in_str = false; bool esc = false;
-                for (size_t i = 0; i < off; i++) {
-                    char c = body[i];
-                    if (esc) { esc = false; continue; }
-                    if (c == '\\' && in_str) { esc = true; continue; }
-                    if (c == '"') in_str = !in_str;
-                    if (in_str) continue;
-                    if (c == '{') depth++;
-                    else if (c == '}') depth--;
-                }
-                Serial.printf("DEBUG=Patch brace depth at ConsoleId offset: %d (expect 1)\r\n", depth);
-            } else {
-                Serial.println("DEBUG=Patch: ConsoleID/ConsoleId NOT in body");
-            }
-        }
-
         /* Hand off to the done-queue — the rc_client callback runs on the
          * loop task (Core 1), not here. ps destructor frees its PSRAM. */
         http_finish(job, ps.c_str(), ps.length(), httpCode);
@@ -2423,7 +2314,7 @@ static void server_call(const rc_api_request_t *request, rc_client_server_callba
     job.gen           = http_gen;
     if (!job.url || (request->post_data && !job.post_data) ||
         xQueueSend(http_req_q, &job, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        Serial.println("ERROR=server_call: enqueue failed, request dropped");
+        LOG_ERR("ERROR=server_call: enqueue failed, request dropped\r\n");
         free(job.url);
         free(job.post_data);
     }
@@ -2470,7 +2361,7 @@ static void http_drain_done(void) {
             if (big) {
                 int32_t sram_used  = (int32_t)sram_b  - (int32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 int32_t psram_used = (int32_t)psram_b - (int32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-                LOG_ERR("DEBUG=rcheevos struct cost: body=%uKB sram=%+dKB psram=%+dKB (after: sram-free=%uKB psram-free=%uKB)\r\n",
+                LOG_INFO("DEBUG=rcheevos struct cost: body=%uKB sram=%+dKB psram=%+dKB (after: sram-free=%uKB psram-free=%uKB)\r\n",
                          (unsigned)(done.body_len / 1024),
                          (int)(sram_used / 1024), (int)(psram_used / 1024),
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -2666,7 +2557,7 @@ static void build_chain_roots(void) {
         g_root_baddr_count = w;
     }
     g_roots_built = true;
-    LOG_INFO("DEBUG=chain-root gate: %u pointer-base byte-addrs extracted\r\n",
+    LOG_DBG("DEBUG=chain-root gate: %u pointer-base byte-addrs extracted\r\n",
              (unsigned)g_root_baddr_count);
 }
 
@@ -2888,7 +2779,7 @@ static uint16_t collect_missing_addresses(void) {
             for (uint16_t k = 0; k < nlog && off < (int)sizeof(buf) - 12; k++)
                 off += snprintf(buf + off, sizeof(buf) - off, " %08lX",
                                 (unsigned long)query_addrs[before_pm + k]);
-            LOG_FRAME("DEBUG=resolver-miss pm=%u stuck=%ux@%08lX watch=%u (resolver found 0):%s\r\n",
+            LOG_DBG("DEBUG=resolver-miss pm=%u stuck=%ux@%08lX watch=%u (resolver found 0):%s\r\n",
                       (unsigned)pm_added, (unsigned)g_stuck_count,
                       (unsigned long)g_stuck_addr, (unsigned)watch_count, buf);
 
@@ -2910,7 +2801,7 @@ static uint16_t collect_missing_addresses(void) {
                 for (uint16_t k = 0; k < dn && doff < (int)sizeof(dbuf) - 12; k++)
                     doff += snprintf(dbuf + doff, sizeof(dbuf) - doff, " %08lX",
                                      (unsigned long)peek_miss_addrs[k]);
-                LOG_FRAME("DEBUG=DRY-DIAG dry_miss=%u verdict=%s:%s\r\n",
+                LOG_DBG("DEBUG=DRY-DIAG dry_miss=%u verdict=%s:%s\r\n",
                           (unsigned)dry,
                           dry > 0 ? "LOGIC-DIVERGENCE" : "frame-latency(resolver-ok)",
                           dbuf);
@@ -2966,10 +2857,10 @@ static void send_addr_query_response(void) {
             uint32_t a = query_addrs[pending_query_start + i];
             if (a < min_qa) min_qa = a;
             if (a > max_qa) max_qa = a;
-            if (a < 0x00100000u) { if (n_low  < 6) LOG_ERR("DEBUG=LOWQA=0x%08lX\r\n",  (unsigned long)a); n_low++;  }
-            if (a > 0x13000000u) { if (n_high < 6) LOG_ERR("DEBUG=HIGHQA=0x%08lX\r\n", (unsigned long)a); n_high++; }
+            if (a < 0x00100000u) { if (n_low  < 6) LOG_DBG("DEBUG=LOWQA=0x%08lX\r\n",  (unsigned long)a); n_low++;  }
+            if (a > 0x13000000u) { if (n_high < 6) LOG_DBG("DEBUG=HIGHQA=0x%08lX\r\n", (unsigned long)a); n_high++; }
         }
-        LOG_ERR("DEBUG=ADDR_QUERY round=%u min=0x%08lX max=0x%08lX n_low=%u n_high=%u\r\n",
+        LOG_DBG("DEBUG=ADDR_QUERY round=%u min=0x%08lX max=0x%08lX n_low=%u n_high=%u\r\n",
                 (unsigned)round_count, (unsigned long)min_qa, (unsigned long)max_qa,
                 (unsigned)n_low, (unsigned)n_high);
     }
@@ -3133,18 +3024,18 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             }
 
             if (has_hash == 1) {
-                LOG_INFO("DEBUG=Console-computed hash: %s\r\n", console_hash);
+                LOG_DBG("DEBUG=Console-computed hash: %s\r\n", console_hash);
                 gameId = String(console_hash);
                 state = STATE_LOADING_GAME;
             } else {
                 // Fallback: lookup hash from the Wii game-ID table
                 const char *hash = wii_lookup_game_hash(gid);
                 if (hash) {
-                    LOG_INFO("DEBUG=Hash found in table: %s (%s)\r\n", hash, wii_lookup_game_name(gid));
+                    LOG_DBG("DEBUG=Hash found in table: %s (%s)\r\n", hash, wii_lookup_game_name(gid));
                     gameId = String(hash);  // store MD5 hash for loadGame()
                     state = STATE_LOADING_GAME;
                 } else {
-                    Serial.printf("ERROR=No hash for Wii game ID %s (no console hash either)\r\n", gid);
+                    LOG_ERR("ERROR=No hash for Wii game ID %s (no console hash either)\r\n", gid);
                     gameId = String(gid);
                     state = STATE_ERROR;
                 }
@@ -3208,7 +3099,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             uint32_t snap_now = (uint32_t)(esp_timer_get_time() / 1000);
             if (snap_now - last_snap_log_ms >= 5000) {
                 last_snap_log_ms = snap_now;
-                LOG_INFO("DEBUG=SNAP frame=%lu snap_count=%u esp_watch=%u state=%d\r\n",
+                LOG_DBG("DEBUG=SNAP frame=%lu snap_count=%u esp_watch=%u state=%d\r\n",
                          (unsigned long)frame_counter, (unsigned)count,
                          (unsigned)watch_count, (int)state);
             }
@@ -3391,7 +3282,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                         g_cm_us += (uint32_t)esp_timer_get_time() - t0;
                         g_cm_n++;
                         if (g_chain_gate_enabled && force && !by_pm && !by_inp && n_missing > 0)
-                            LOG_INFO("DEBUG=FORCE-collect found %u addr(s) the chain-root gate missed\r\n",
+                            LOG_DBG("DEBUG=FORCE-collect found %u addr(s) the chain-root gate missed\r\n",
                                      (unsigned)n_missing);
                     } else {
                         n_missing = 0;     /* steady state — converge now */
@@ -3640,17 +3531,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 break;
             }
 
-            /* v0.28.9 — also surface ra-module diag (VBI/PHB timing) when
-             * FRAME stats are on, so it shows up next to the FRAME lines
-             * WITHOUT raising RA_LOG_LEVEL (which would add the noisier ESP
-             * LOG_DBG traffic and perturb the cyc_us we're measuring). These
-             * GC messages are throttled (~2 per 5s), so the Serial cost is
-             * negligible. Revert this `|| RA_LOG_FRAME_STATS` after the test. */
-            if (RA_LOG_LEVEL >= 2 || RA_LOG_FRAME_STATS) {
-                Serial.print("DEBUG=GC: ");
-                Serial.write(p + 1, msg_len);
-                Serial.println();
-            }
+            /* ra-module diag passthrough (VBI/PHB timing, etc). These GC messages
+             * are throttled (~2 per 5s); emitted at LOG_DBG (RA_LOG_LEVEL >= 2). */
+            LOG_DBG("DEBUG=GC: %.*s\r\n", (int)msg_len, (const char *)(p + 1));
 
             /* Minimal ACK — we don't care about the response on the GC side. */
             ra_esp_header_t ack;
@@ -3736,25 +3619,27 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             for (uint16_t i = 0; i < n_in_chunk; i++)
                 addr_out[i] = ra_host_to_be32(g_watchlist_addrs[start + i]);
 
-            /* Log first 4 addresses so we can confirm the data on the GC side. */
+            /* Log first 4 addresses so we can confirm the data on the GC side.
+             * Build the whole line then emit once (the async ring is line-oriented;
+             * piecewise writes from other producers could interleave). */
             if (n_in_chunk > 0 && RA_LOG_LEVEL >= 2) {
-                Serial.printf("DEBUG=GET_CHUNK first addrs:");
-                for (uint16_t i = 0; i < n_in_chunk && i < 4; i++) {
-                    Serial.printf(" 0x%08lX",
-                                  (unsigned long)g_watchlist_addrs[start + i]);
-                }
-                if (n_in_chunk > 4) Serial.printf(" ...");
-                Serial.println();
+                char ab[96]; int ap = 0;
+                ap += snprintf(ab + ap, sizeof(ab) - ap, "DEBUG=GET_CHUNK first addrs:");
+                for (uint16_t i = 0; i < n_in_chunk && i < 4; i++)
+                    ap += snprintf(ab + ap, sizeof(ab) - ap, " 0x%08lX",
+                                   (unsigned long)g_watchlist_addrs[start + i]);
+                if (n_in_chunk > 4) ap += snprintf(ab + ap, sizeof(ab) - ap, " ...");
+                LOG_DBG("%s\r\n", ab);
             }
 
             /* Log first 22 bytes of the prepared response: 6 padding + the
              * first 16 bytes of actual content. */
             if (RA_LOG_LEVEL >= 2) {
-                Serial.printf("DEBUG=GET_CHUNK resp head:");
-                for (uint32_t i = 0; i < total_len && i < 22; i++) {
-                    Serial.printf(" %02X", buf[i]);
-                }
-                Serial.println();
+                char hb[112]; int hp = 0;
+                hp += snprintf(hb + hp, sizeof(hb) - hp, "DEBUG=GET_CHUNK resp head:");
+                for (uint32_t i = 0; i < total_len && i < 22; i++)
+                    hp += snprintf(hb + hp, sizeof(hb) - hp, " %02X", buf[i]);
+                LOG_DBG("%s\r\n", hb);
             }
 
             exi_spi_prepare_response(buf, total_len);
@@ -3883,7 +3768,7 @@ static void ensure_watchlist_capacity() {
      * cold during do_frame (collect/evict only), so they stay in PSRAM. */
     if (!memory_data) {
         memory_data = (uint8_t*)ra_hot_alloc(RA_MAX_WATCH_ADDRS, &g_memdata_internal);
-        LOG_INFO("DEBUG=hotbuf: memdata=%s internal-free=%uKB\r\n",
+        LOG_DBG("DEBUG=hotbuf: memdata=%s internal-free=%uKB\r\n",
                  g_memdata_internal ? "SRAM" : "PSRAM",
                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     }
@@ -3964,7 +3849,7 @@ static void watchlist_update_if_changed(uint32_t new_count) {
     g_watchlist_count   = expanded;
     g_watchlist_pending = true;
 
-    LOG_INFO("DEBUG=Watchlist updated: %u addresses (%u chunks) [static_byte_count=%u, base_addrs=%u]\r\n",
+    LOG_DBG("DEBUG=Watchlist updated: %u addresses (%u chunks) [static_byte_count=%u, base_addrs=%u]\r\n",
              (unsigned)expanded, RA_WATCHLIST_NUM_CHUNKS(expanded),
              (unsigned)static_watch_count, (unsigned)new_count);
 }
@@ -4150,11 +4035,11 @@ static void evict_lru(bool pressure) {
 
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
-        Serial.printf("ERROR=rc_client: game load failed: %s\r\n", error_message ? error_message : "?");
+        LOG_ERR("ERROR=rc_client: game load failed: %s\r\n", error_message ? error_message : "?");
         state = STATE_ERROR;
         return;
     }
-    LOG_INFO("DEBUG=Game loaded, building initial watchlist...\r\n");
+    LOG_DBG("DEBUG=Game loaded, building initial watchlist...\r\n");
 
     const rc_memrefs_t *memrefs = rc_client_get_memrefs(client);
     uint32_t n = 0;
@@ -4187,7 +4072,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
             g_rc_doframe_save_cap     = mrc;
             g_rc_doframe_gate_enabled = 1;
             g_rc_doframe_primed_cb    = doframe_primed_cb;   /* arm last (all fields set) */
-            LOG_INFO("DEBUG=doframe gate armed: %u memrefs, %u KB PSRAM rollback buf\r\n",
+            LOG_DBG("DEBUG=doframe gate armed: %u memrefs, %u KB PSRAM rollback buf\r\n",
                      (unsigned)mrc, (unsigned)((size_t)mrc * sizeof(rc_memref_value_t) / 1024));
         } else {
             LOG_ERR("ERROR=doframe gate: ps_malloc(%u memrefs) failed — gate DISABLED\r\n",
@@ -4204,7 +4089,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
     /* v0.27.8 — memory free right before the vblank stream starts (game
      * fully loaded: rcheevos structs allocated, watchlist built). This is
      * the steady-state baseline the do_frame/collect loop runs against. */
-    LOG_ERR("DEBUG=mem at game-loaded: sram-free=%uKB (maxblk=%uKB) psram-free=%uKB watch=%u\r\n",
+    LOG_INFO("DEBUG=mem at game-loaded: sram-free=%uKB (maxblk=%uKB) psram-free=%uKB watch=%u\r\n",
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
@@ -4233,8 +4118,8 @@ static char g_pending_hash[64];
 
 static void login_then_load_cb(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
-        Serial.printf("ERROR=RA login failed (%d): %s\r\n", result,
-                      error_message ? error_message : "?");
+        LOG_ERR("ERROR=RA login failed (%d): %s\r\n", result,
+                error_message ? error_message : "?");
         state = STATE_ERROR;
         return;
     }
@@ -4260,12 +4145,12 @@ void loadGame(const char *hash) {
      * marking pass (NOT here — see the note there; enabling before the pool is
      * allocated + chains dirtied would freeze the collect). */
     g_rc_chain_read_cb = incr_chain_read;
-    LOG_INFO("DEBUG=incr_collect: %s (reverse-hash; rebuild every %d vblanks)\r\n",
+    LOG_DBG("DEBUG=incr_collect: %s (reverse-hash; rebuild every %d vblanks)\r\n",
              g_incr_collect_active ? "ACTIVE" : "off", INCR_REBUILD_EVERY);
 #ifdef RC_INCREMENTAL_UPD
-    LOG_INFO("DEBUG=optB: RC_INCREMENTAL_UPD ACTIVE (B1+B2 wired into live do_frame update)\r\n");
+    LOG_DBG("DEBUG=optB: RC_INCREMENTAL_UPD ACTIVE (B1+B2 wired into live do_frame update)\r\n");
 #else
-    LOG_INFO("DEBUG=optB: RC_INCREMENTAL_UPD NOT compiled in\r\n");
+    LOG_DBG("DEBUG=optB: RC_INCREMENTAL_UPD NOT compiled in\r\n");
 #endif
     rc_client_enable_logging(g_client, RC_CLIENT_LOG_LEVEL_VERBOSE, log_message);
     rc_client_set_event_handler(g_client, event_handler);
@@ -4360,173 +4245,6 @@ String try_login_RA(String user, String pass) {
 // ============================================================================
 // Core tasks
 // ============================================================================
-/* ===================================================================
- * Live cache dump for Kirby's Return to Dream Land "Kirby to the Past"
- * cheevo. Prints the values rcheevos would see when evaluating the chain:
- *   0x008c2760 (32-bit BE)  → player object pointer (mask 0x7FFFFFF)
- *   *(player & 0x7FFFFFF) + 0x1af4 → player_data pointer (mask 0x7FFFFFF)
- *   *(player_data & 0x7FFFFFF) + 0xa64 → CURRENT ABILITY (target: 0x01 = Sword)
- *   0x015ed0c0 (32-bit BE) → Game Mode (target: 0x00 Main or 0x01 Extra)
- *   0x015ee8ea (16-bit BE) → Level/Room ID (must NOT be in exclusion list)
- * If any address is missing from cache, prints "MISS" for that field.
- * Throttled to every 2 seconds. =================================== */
-static uint32_t cache_read_u32_be(uint32_t addr, bool *ok) {
-    int32_t i0 = hash_lookup(addr + 0);
-    int32_t i1 = hash_lookup(addr + 1);
-    int32_t i2 = hash_lookup(addr + 2);
-    int32_t i3 = hash_lookup(addr + 3);
-    if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) { if (ok) *ok = false; return 0; }
-    if (ok) *ok = true;
-    return ((uint32_t)memory_data[i0] << 24)
-         | ((uint32_t)memory_data[i1] << 16)
-         | ((uint32_t)memory_data[i2] <<  8)
-         | ((uint32_t)memory_data[i3]      );
-}
-static uint16_t cache_read_u16_be(uint32_t addr, bool *ok) {
-    int32_t i0 = hash_lookup(addr + 0);
-    int32_t i1 = hash_lookup(addr + 1);
-    if (i0 < 0 || i1 < 0) { if (ok) *ok = false; return 0; }
-    if (ok) *ok = true;
-    return ((uint16_t)memory_data[i0] << 8) | memory_data[i1];
-}
-static void dump_kirby_chain() {
-    if (RA_LOG_LEVEL < 2) return;  /* investigation-only diag — 3 lines/2s */
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < 2000) return;
-    last = now;
-
-    bool ok_pp, ok_pd_masked, ok_pd_raw, ok_mode, ok_room;
-    uint32_t player_ptr  = cache_read_u32_be(0x008c2760, &ok_pp);
-    uint32_t game_mode   = cache_read_u32_be(0x015ed0c0, &ok_mode);
-    uint16_t room_id     = cache_read_u16_be(0x015ee8ea, &ok_room);
-
-
-    /* Try BOTH the masked address (what cheevo logic actually reads at)
-     * AND the raw unmasked address (what rc_memrefs_get_addresses MAY be
-     * outputting — without applying the mask modifier). If raw-addr hits
-     * but masked-addr misses, we know the issue is rcheevos generating
-     * addresses without mask application, and our cache is storing them
-     * at the "wrong" key. */
-    uint32_t pd_addr_masked = (player_ptr & 0x07FFFFFF) + 0x1af4;
-    uint32_t pd_addr_raw    =  player_ptr               + 0x1af4;
-    uint32_t pd_val_masked  = cache_read_u32_be(pd_addr_masked, &ok_pd_masked);
-    uint32_t pd_val_raw     = cache_read_u32_be(pd_addr_raw,    &ok_pd_raw);
-
-    Serial.printf("DEBUG=KIRBY pptr=%s%08X mode=%s%08X room=%s%04X\r\n",
-                  ok_pp   ? "" : "MISS:", player_ptr,
-                  ok_mode ? "" : "MISS:", game_mode,
-                  ok_room ? "" : "MISS:", room_id);
-    Serial.printf("DEBUG=KIRBY pd_masked@%08X=%s%08X pd_raw@%08X=%s%08X\r\n",
-                  pd_addr_masked, ok_pd_masked ? "" : "MISS:", pd_val_masked,
-                  pd_addr_raw,    ok_pd_raw    ? "" : "MISS:", pd_val_raw);
-
-    /* Compute the FINAL ability address using the fully-masked chain. If
-     * both pointer levels resolved to something other than 0x80000000
-     * (= null pointer in Kirby's menu state) and we have the value
-     * cached, this prints the live ability code: 0x01 = Sword, 0x00 =
-     * none, 0x05 = Beam, etc. When ability transitions to 0x01 while
-     * Kirby is in a normal level, "Kirby to the Past" should fire. */
-    bool ok_ability;
-    uint32_t pd_masked = pd_val_masked & 0x07FFFFFF;
-    uint32_t ability_addr = pd_masked + 0x0a64;
-    uint32_t ability_val = cache_read_u32_be(ability_addr, &ok_ability);
-    bool valid_chain = (player_ptr != 0x80000000) && (player_ptr != 0)
-                    && ok_pp && ok_pd_masked;
-    Serial.printf("DEBUG=KIRBY ability@%08X=%s%08X chain_valid=%s\r\n",
-                  ability_addr, ok_ability ? "" : "MISS:", ability_val,
-                  valid_chain ? "YES" : "no(player_null)");
-}
-
-/* One-shot micro-benchmark of the read_memory_ingame hot path (hash_lookup +
- * memory_data read) in the CURRENT memory tier (PSRAM). Combined with the
- * CATCHUP rm_bytes/df count, est. do_frame memory time ≈ rm_bytes × ns/lookup
- * — the number that decides whether moving hash/cache to SRAM is worth it. */
-static void bench_hash_once(void) {
-    if (!addr_hash || !memory_data || !watch_addresses || watch_count == 0) return;
-    const uint32_t N = 50000;
-    volatile uint32_t sink = 0;
-    uint32_t t0 = (uint32_t)esp_timer_get_time();
-    for (uint32_t i = 0; i < N; i++) {
-        uint16_t idx = (uint16_t)((i * 2654435761u) % watch_count);
-        int32_t widx = hash_lookup(watch_addresses[idx]);
-        if (widx >= 0) sink += memory_data[widx];
-    }
-    uint32_t dt = (uint32_t)esp_timer_get_time() - t0;
-    LOG_FRAME("DEBUG=BENCH hash+read PSRAM: %lu lookups / %lu us = %lu ns each (watch=%u sink=%lu)\r\n",
-              (unsigned long)N, (unsigned long)dt, (unsigned long)(dt * 1000UL / N),
-              (unsigned)watch_count, (unsigned long)sink);
-}
-
-/* v0.28.7 dual-core PSRAM contention probe. The ESP32-S3 has ONE PSRAM
- * controller; before committing to splitting rcheevos eval across both cores
- * we must know whether two cores reading PSRAM at once serialize on the
- * controller (which would cap the speedup well below 2x). A start barrier
- * (ready/go flags) makes both cores enter the loop together so the windows
- * fully overlap. hash_lookup is the WORST case (random PSRAM access, defeats
- * the cache); real condition eval walks structs more sequentially and would
- * contend LESS, so the measured per-core time here is a conservative upper
- * bound on what eval would see. Decision rule: if dual-core per-lookup stays
- * near the single-core ~244ns, the controller pipelines two cores well and
- * parallelizing eval is worth it; if it climbs toward ~488ns, the controller
- * serializes and we'd need a different lever (SRAM migration / fewer reads). */
-static volatile uint32_t s_bench_c0_dt = 0;
-static volatile int s_bench_ready = 0;
-static volatile int s_bench_go = 0;
-static SemaphoreHandle_t s_bench_done = NULL;
-
-static void bench_psram_loop(uint32_t N, volatile uint32_t* out_dt) {
-    volatile uint32_t sink = 0;
-    uint32_t t0 = (uint32_t)esp_timer_get_time();
-    for (uint32_t i = 0; i < N; i++) {
-        uint16_t idx = (uint16_t)((i * 2654435761u) % watch_count);
-        int32_t widx = hash_lookup(watch_addresses[idx]);
-        if (widx >= 0) sink += memory_data[widx];
-    }
-    *out_dt = (uint32_t)esp_timer_get_time() - t0;
-    (void)sink;
-}
-
-static void bench_worker_core0(void* arg) {
-    const uint32_t N = (uint32_t)(uintptr_t)arg;
-    s_bench_ready = 1;
-    while (!s_bench_go) { /* spin until core1 releases */ }
-    bench_psram_loop(N, &s_bench_c0_dt);
-    xSemaphoreGive(s_bench_done);
-    vTaskDelete(NULL);
-}
-
-static void bench_dualcore(void) {
-    if (!addr_hash || !memory_data || !watch_addresses || watch_count == 0) return;
-    const uint32_t N = 50000;
-    if (!s_bench_done) s_bench_done = xSemaphoreCreateBinary();
-    s_bench_ready = 0; s_bench_go = 0; s_bench_c0_dt = 0;
-
-    BaseType_t ok = xTaskCreatePinnedToCore(bench_worker_core0, "bench0", 4096,
-                        (void*)(uintptr_t)N, 5, NULL, 0);
-    if (ok != pdPASS) { LOG_FRAME("DEBUG=BENCH2 spawn failed\r\n"); return; }
-
-    uint32_t spin_t0 = (uint32_t)esp_timer_get_time();
-    while (!s_bench_ready) {        /* wait worker ready on core 0 */
-        if ((uint32_t)esp_timer_get_time() - spin_t0 > 100000) {
-            LOG_FRAME("DEBUG=BENCH2 worker never readied, aborting\r\n");
-            s_bench_go = 1;        /* let the worker finish & self-delete */
-            return;
-        }
-    }
-    uint32_t dt_c1 = 0;
-    s_bench_go = 1;                 /* release both cores together */
-    bench_psram_loop(N, &dt_c1);
-
-    xSemaphoreTake(s_bench_done, portMAX_DELAY);
-
-    uint32_t c0 = s_bench_c0_dt * 1000UL / N;
-    uint32_t c1 = dt_c1 * 1000UL / N;
-    LOG_FRAME("DEBUG=BENCH2 dualcore PSRAM: core1=%lu ns core0=%lu ns/lookup "
-              "(N=%lu/core; single~244ns => 2x if near 244, 1x if near 488)\r\n",
-              (unsigned long)c1, (unsigned long)c0, (unsigned long)N);
-}
-
 void processSnapshot() {
     if (!new_snapshot || state != STATE_ACTIVE || !g_client) return;
     new_snapshot = false;
@@ -4547,8 +4265,6 @@ void processSnapshot() {
         g_cycle_us = (last_ps_us > 0) ? (now_ps_us - last_ps_us) : 0;
         last_ps_us = now_ps_us;
     }
-
-    // dump_kirby_chain();
 
     /* All required addresses are guaranteed cached by the time we get
      * here — the SNAPSHOT/ADDR_RESPONSE handler chain iterates
@@ -4579,13 +4295,13 @@ void processSnapshot() {
     if (g_warmup_active) {
         if (g_warmup_end_frame == 0) {
             g_warmup_end_frame = frame_counter + WARMUP_GAME_FRAMES;
-            LOG_INFO("DEBUG=warmup: spectator until game frame %lu\r\n",
+            LOG_DBG("DEBUG=warmup: spectator until game frame %lu\r\n",
                      (unsigned long)g_warmup_end_frame);
         } else if (frame_counter >= g_warmup_end_frame) {
             rc_client_reset(g_client);
             rc_client_set_spectator_mode_enabled(g_client, 0);
             g_warmup_active = false;
-            LOG_INFO("DEBUG=warmup complete: triggers reset, going live (watch=%u)\r\n",
+            LOG_DBG("DEBUG=warmup complete: triggers reset, going live (watch=%u)\r\n",
                      (unsigned)watch_count);
         }
     }
@@ -4663,8 +4379,8 @@ void processSnapshot() {
             }
         }
 
-        /* Per-vblank frame summary (LOG_FRAME channel).
-         * Set RA_LOG_LEVEL 0 + RA_LOG_FRAME_STATS 1 for minimum-noise mode.
+        /* Per-vblank frame summary (LOG_FRAME channel = INFO, RA_LOG_LEVEL >= 1).
+         * Set RA_LOG_LEVEL 0 for minimum-noise mode (errors/banner/ACHIEVEMENT only).
          *
          * seq    = frame sequence number (PPC VBI counter from d2x)
          * ok     = Phase D2: seq+count matched, values accepted (1=ok, 0=skipped)
@@ -4697,7 +4413,13 @@ void processSnapshot() {
 #else
         unsigned long de_sk = 0, de_ev = 0;
 #endif
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu rearm_max=%lu\r\n",
+        /* FRAME line has two forms, chosen at compile time by RA_LOG_LEVEL:
+         *   level 1 (INFO)  = LEAN — the optimization outcomes (df/resolver):
+         *                     seq ok sa ms cm cmr it df df_us upd_us evl_us de_sk de_ev
+         *   level 2 (DEBUG) = FULL — every mechanism counter (skips/cache/parallel/EXI).
+         * To move a field between the two, edit the lists below. */
+#if RA_LOG_LEVEL >= 2
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -4722,11 +4444,22 @@ void processSnapshot() {
                   (unsigned long)g_rc_upd_resolves,
                   (unsigned long)g_rc_collect_skips, (unsigned long)g_rc_collect_walks,
                   (unsigned long)g_incr_rebuilds,
-                  (unsigned)incr_rev_count, (int)incr_rev_overflow, (unsigned long)g_incr_marks,
-                  (unsigned long)g_l1_hits, (unsigned long)g_l1_miss,
-                  (unsigned long)g_exi_rearm_gap_max_us);
-        g_exi_rearm_gap_max_us = 0;  /* reset so each FRAME reports ITS own max gap */
-        g_l1_hits = 0; g_l1_miss = 0;   /* per-FRAME L1 cache hit/miss */
+                  (unsigned)incr_rev_count, (int)incr_rev_overflow, (unsigned long)g_incr_marks);
+#else
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_sk=%lu de_ev=%lu\r\n",
+                  (unsigned long)fl_fc,
+                  (int)fl.data_ok,
+                  (unsigned)fl.snap_addr_count,
+                  (unsigned)fl.collect_miss_total,
+                  (unsigned)fl.collect_cm,
+                  cmr_buf,
+                  (unsigned)fl.iter_depth,
+                  df_ran,   /* v0.32: 1=evaluated, 0=deferred (cache not primed) */
+                  (unsigned long)this_df_us,
+                  (unsigned long)g_rc_update_us,
+                  (unsigned long)g_rc_eval_us,
+                  de_sk, de_ev);
+#endif
 #if RA_FLIGHT_RECORDER
         /* Bad frame (over budget / convergence spike)? Dump the ring = the
          * FR_BEFORE-1 frames leading up + this one + the next FR_AFTER. */
@@ -4758,11 +4491,7 @@ void processSnapshot() {
         if (df_now - last_df_log >= 5000) {
             uint32_t dt = df_now - last_df_log;
             uint32_t gf = frame_counter - g_df_prev_gameframe;
-            /* rm_b/df = mean bytes (== hash_lookups) read_memory served per
-             * do_frame. If rm_b/df × (BENCH ns/lookup) ≈ df_us, do_frame is
-             * memory-bound (SRAM migration helps); if it's a small fraction,
-             * it's CPU-bound (trigger eval) and SRAM won't move the needle. */
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu rm_b/df=%lu\r\n",
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -4771,21 +4500,13 @@ void processSnapshot() {
                      (unsigned long)(g_df_n ? g_df_us / g_df_n : 0),
                      (unsigned long)(g_cm_n ? g_cm_us / g_cm_n : 0),
                      (unsigned long)g_cm_n,
-                     (unsigned long)g_cm_skipped,
-                     (unsigned long)(g_df_n ? g_rm_bytes / g_df_n : 0));
+                     (unsigned long)g_cm_skipped);
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
             g_df_prev_gameframe = frame_counter;
-            g_df_us = g_df_n = g_cm_us = g_cm_n = g_cm_skipped = g_rm_bytes = 0;
+            g_df_us = g_df_n = g_cm_us = g_cm_n = g_cm_skipped = 0;
             last_df_log = df_now;
-            /* BENCH disabled 2026-06-14: already measured PSRAM contention
-             * (hash 1.53x single/dual; eval 1.8x → eval is PSRAM-bandwidth-bound).
-             * The one-shot run blocked Core 1 ~76ms at boot and polluted the
-             * boot logs (1522ns/lookup vs 244 steady = boot-time PSRAM saturation).
-             * Re-enable by uncommenting if we need to re-measure. */
-            // static bool benched = false;
-            // if (!benched) { benched = true; bench_hash_once(); bench_dualcore(); }
         }
     }
     /* INTENTIONAL: do NOT call watchlist_update_if_changed here.
@@ -4836,9 +4557,6 @@ void processEXI() {
         exi_spi_submit_response();   // ALWAYS submit (even len==0) so the servicer,
                                      // which is blocked on g_resp_sem, never deadlocks
     }
-    // Drain any queued markers AFTER the SPI slave has been re-armed.
-    // Serial.printf here no longer blocks the receive path.
-    drain_marker_queue();
 }
 
 void taskCore1(void *pvParameters) {
@@ -4867,43 +4585,11 @@ void taskCore1(void *pvParameters) {
         if (now - last_heartbeat >= 5000) {
             last_heartbeat = now;
             int cs = gpio_get_level((gpio_num_t)EXI_PIN_CS);
-            /* Echo firmware version + build stamp in every heartbeat so we can
-             * confirm a flashed binary is current without needing the boot log. */
-            LOG_DBG("DEBUG=fw v0.32.2-wsteal build=%s %s\n", __DATE__, __TIME__);
             LOG_DBG("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d | heap=%u maxblk=%u\n",
                     cs, (unsigned long)exi_spi_get_transaction_count(),
                     (unsigned long)exi_spi_get_total_bytes_rx(), (int)state,
                     (unsigned)ESP.getFreeHeap(),
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-            /* Capture the post-setup callback diagnostics. cb_invocations tells
-             * us whether the callback ever fires (and how many times) and
-             * cb_last_response_len / cb_last_tx6 capture the state seen by the
-             * cb at the most recent invocation. If response_len is small (14
-             * = default_ack) at every fire, the cb is running BEFORE main loop
-             * sets the dynamic response — race we'll fix differently. */
-            extern volatile uint32_t exi_cb_invocations;
-            extern volatile uint16_t exi_cb_last_response_len;
-            extern volatile uint8_t  exi_cb_last_response_b0;
-            extern volatile uint8_t  exi_cb_last_tx_b6;
-            extern volatile uint32_t exi_prepare_call_count;
-            extern volatile uint16_t exi_prepare_last_len;
-            extern volatile uint8_t  exi_prepare_post_tx_b6;
-            LOG_DBG("DEBUG=cb invocations=%lu last_response_len=%u resp[0]=%02X tx[6]=%02X\n",
-                    (unsigned long)exi_cb_invocations,
-                    (unsigned)exi_cb_last_response_len,
-                    (unsigned)exi_cb_last_response_b0,
-                    (unsigned)exi_cb_last_tx_b6);
-            LOG_DBG("DEBUG=prepare calls=%lu last_len=%u post_tx[6]=%02X\n",
-                    (unsigned long)exi_prepare_call_count,
-                    (unsigned)exi_prepare_last_len,
-                    (unsigned)exi_prepare_post_tx_b6);
-
-            /* Dump default_ack to confirm the dynamic-status update is in this
-             * firmware build (byte 5 should match the current state value). */
-            char ack_str[64] = {0};
-            exi_spi_dump_default_ack(ack_str, sizeof(ack_str));
-            LOG_DBG("DEBUG=default_ack: %s\n", ack_str);
-
             /* Per-command totals + delta since last heartbeat. Only print rows that
              * have nonzero total to keep the line short. Format:
              *   DEBUG=cmds | SNAP:1234(+300) POLL:5(+0) CHUNK:1(+0) IDENT:2(+0)
@@ -4969,7 +4655,7 @@ void setup() {
         LOG_ERR("ERROR=setup: PSRAM buffer alloc failed\r\n");
     }
     /* Report where the hot buffers landed + remaining internal headroom. */
-    LOG_INFO("DEBUG=hotbuf: hash=%s(%uKB) memdata=deferred internal-free=%uKB maxblk=%uKB\r\n",
+    LOG_DBG("DEBUG=hotbuf: hash=%s(%uKB) memdata=deferred internal-free=%uKB maxblk=%uKB\r\n",
              g_hash_internal ? "SRAM" : "PSRAM",
              (unsigned)(HASH_SIZE * sizeof(hash_entry_t) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -4999,14 +4685,14 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    Serial.printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
+    ralog_printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {
-        Serial.println("ERROR=SPI init failed!");
+        LOG_ERR("ERROR=SPI init failed!\r\n");
         while(1) yield();
     }
-    LOG_INFO("DEBUG=SPI slave initialized\r\n");
+    LOG_DBG("DEBUG=SPI slave initialized\r\n");
 
     // WiFi + RA login (same flow as fpga-ra-adapter)
     if (!isConfigured()) {
@@ -5022,7 +4708,7 @@ void setup() {
         wm->setAPStaticIPConfig(IPAddress(192,168,1,1), IPAddress(192,168,1,1), IPAddress(255,255,255,0));
         
         while (!isConfigured()) {
-            LOG_INFO("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
+            LOG_DBG("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
             if (wm->startConfigPortal("WII_RA_ADAPTER", "12345678")) {
                 String token = try_login_RA(custom_user.getValue(), custom_pass.getValue());
                 if (token != "null") {
@@ -5034,10 +4720,10 @@ void setup() {
         WiFi.mode(WIFI_STA);
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
-        LOG_INFO("DEBUG=WiFi OK\r\n");
+        LOG_DBG("DEBUG=WiFi OK\r\n");
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
-            LOG_INFO("DEBUG=RA login OK\r\n");
+            LOG_DBG("DEBUG=RA login OK\r\n");
         }
     }
 
@@ -5089,9 +4775,9 @@ static void exi_watchdog_task(void *arg) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t s = g_servicer_ticks, w = g_worker_ticks, d = g_doframe_ticks;
-        Serial.printf("DEBUG=WDOG srv=+%lu(st=%u) wrk=+%lu df=+%lu\r\n",
-                      (unsigned long)(s - ls), (unsigned)g_servicer_stage,
-                      (unsigned long)(w - lw), (unsigned long)(d - ld));
+        LOG_DBG("DEBUG=WDOG srv=+%lu(st=%u) wrk=+%lu df=+%lu\r\n",
+                (unsigned long)(s - ls), (unsigned)g_servicer_stage,
+                (unsigned long)(w - lw), (unsigned long)(d - ld));
         /* Servicer stalled (Wii stopped talking) -> dump the freeze forensics:
          * prev_stage (2=waiting for the Wii to READ a response; 3=waiting for the
          * Wii's next REQUEST) + the last 16 commands the Wii SENT and the last 16
@@ -5105,8 +4791,8 @@ static void exi_watchdog_task(void *arg) {
                 q += snprintf(evts + q, sizeof(evts) - q, "%02X ",
                               g_evt_ring[(g_evt_ring_idx + i) & (CMD_RING - 1)]);
             }
-            Serial.printf("DEBUG=WDOG-FREEZE prev_stage=%u lastcmds=[ %s] lastevts=[ %s]\r\n",
-                          (unsigned)g_servicer_prev_stage, cmds, evts);
+            LOG_DBG("DEBUG=WDOG-FREEZE prev_stage=%u lastcmds=[ %s] lastevts=[ %s]\r\n",
+                    (unsigned)g_servicer_prev_stage, cmds, evts);
         }
         ls = s; lw = w; ld = d;
     }

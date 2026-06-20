@@ -316,6 +316,7 @@ uint32_t rc_get_modified_memref_value(const rc_modified_memref_t* memref, rc_pee
 uint8_t rc_memref_shared_size(uint8_t size);
 uint32_t rc_memref_mask(uint8_t size);
 void rc_transform_memref_value(rc_typed_value_t* value, uint8_t size);
+uint32_t rc_transform_operand_value(uint32_t value, const rc_operand_t* self);
 uint32_t rc_peek_value(uint32_t address, uint8_t size, rc_peek_t peek, void* ud);
 
 void rc_memrefs_init(rc_memrefs_t* memrefs);

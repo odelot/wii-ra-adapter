@@ -1,5 +1,5 @@
 # Main component — the sketch (main.cpp) + its .cpp siblings.
-# arduino / FastLED / WiFiManager / rcheevos are components (managed + local).
+# arduino / WiFiManager / rcheevos are components (managed + local).
 idf_component_register(
     SRCS
         "main.cpp"
@@ -8,7 +8,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         arduino-esp32
-        FastLED
         WiFiManager
         rcheevos
         esp_timer

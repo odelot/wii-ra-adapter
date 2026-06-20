@@ -61,8 +61,6 @@ Pin 2  INT  ──────────────────── GPIO14
 #include <HTTPClient.h>
 #include "SPI.h"
 #include <time.h>
-#include <FastLED.h>
-#include <Ticker.h>
 
 // Project headers
 #include "gc_ra_protocol.h"
@@ -123,9 +121,90 @@ extern "C" {
 #ifndef RA_LOG_LEVEL
 #define RA_LOG_LEVEL 0
 #endif
-#define LOG_ERR(...)  do { Serial.printf(__VA_ARGS__); } while (0)
-#define LOG_INFO(...) do { if (RA_LOG_LEVEL >= 1) Serial.printf(__VA_ARGS__); } while (0)
-#define LOG_DBG(...)  do { if (RA_LOG_LEVEL >= 2) Serial.printf(__VA_ARGS__); } while (0)
+#include <stdarg.h>
+/* ============================================================================
+ * Async log ring (2026-06-19) — the definitive "logging NEVER blocks the EXI
+ * core" fix. Any task/core formats into a stack buffer then memcpys it into a
+ * ring in INTERNAL SRAM (not PSRAM — keeps the 64KB PSRAM data cache for the hot
+ * rcheevos/addr_hash data) under a brief spinlock (~1-2µs, no Serial). A drain
+ * task on the idle Core 0 copies chunks OUT (lock held only for the copy, NEVER
+ * during Serial.write) and blocks on the UART — so Core 1 never waits on Serial.
+ * Ring full → drop the whole line (graceful, never block). Lets us instrument
+ * fearlessly. Boot logs (before the drain task) fall back to direct Serial. */
+#define LOG_RING_SIZE 8192u   /* +8KB .bss; tune up if drops occur */
+static char              log_ring[LOG_RING_SIZE];   /* internal .bss SRAM */
+static volatile uint32_t log_head = 0, log_tail = 0;
+static portMUX_TYPE      log_mux  = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool     g_log_async_ready = false; /* false until the drain task runs */
+static volatile uint32_t log_dropped = 0;           /* diag: bytes dropped on overflow */
+
+static inline void ralog_write(const char *buf, uint32_t len) {
+    portENTER_CRITICAL(&log_mux);
+    uint32_t head = log_head;
+    uint32_t used = (head - log_tail + LOG_RING_SIZE) % LOG_RING_SIZE;
+    if (len > LOG_RING_SIZE - 1u - used) {           /* won't fit → drop the whole line */
+        log_dropped += len;
+        portEXIT_CRITICAL(&log_mux);
+        return;
+    }
+    for (uint32_t i = 0; i < len; i++) {
+        log_ring[head] = buf[i];
+        head = (head + 1u == LOG_RING_SIZE) ? 0u : head + 1u;
+    }
+    log_head = head;
+    portEXIT_CRITICAL(&log_mux);
+}
+
+static void ralog_vprintf(const char *fmt, va_list ap) {
+    char buf[384];   /* FRAME line is ~300ch + margin (vsnprintf truncates) */
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    if (n <= 0) return;
+    uint32_t len = (n < (int)sizeof(buf)) ? (uint32_t)n : (uint32_t)(sizeof(buf) - 1);
+    if (g_log_async_ready) ralog_write(buf, len);
+    else Serial.write((const uint8_t *)buf, len);    /* boot: no EXI yet, blocking ok */
+}
+
+static void ralog_printf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    ralog_vprintf(fmt, ap);
+    va_end(ap);
+}
+
+/* Drains the ring to Serial on Core 0. Lock held ONLY for the chunk copy, never
+ * during Serial.write — so a Core-1 producer spins at most a few µs. Blocks on
+ * the UART (yields IDLE0) when draining, and vTaskDelay when empty (TWDT-safe). */
+static void ralog_drain_task(void *pv) {
+    (void)pv;
+    static char chunk[512];
+    uint32_t last_dropped = 0;
+    g_log_async_ready = true;
+    for (;;) {
+        portENTER_CRITICAL(&log_mux);
+        uint32_t tail = log_tail;
+        uint32_t used = (log_head - tail + LOG_RING_SIZE) % LOG_RING_SIZE;
+        uint32_t n = used < sizeof(chunk) ? used : sizeof(chunk);
+        for (uint32_t i = 0; i < n; i++) {
+            chunk[i] = log_ring[tail];
+            tail = (tail + 1u == LOG_RING_SIZE) ? 0u : tail + 1u;
+        }
+        log_tail = tail;
+        portEXIT_CRITICAL(&log_mux);
+        if (n) { Serial.write((const uint8_t *)chunk, n); continue; }  /* drained a chunk */
+        /* ring empty: if we ever dropped, say so (so silent loss is visible), then yield */
+        if (log_dropped != last_dropped) {
+            char w[56];
+            int wn = snprintf(w, sizeof(w), "LOG_DROPPED total=%lu bytes\r\n",
+                              (unsigned long)log_dropped);
+            last_dropped = log_dropped;
+            if (wn > 0) Serial.write((const uint8_t *)w, (size_t)wn);
+        }
+        vTaskDelay(1);   /* empty → yield IDLE0 (TWDT-safe) */
+    }
+}
+
+#define LOG_ERR(...)  ralog_printf(__VA_ARGS__)
+#define LOG_INFO(...) do { if (RA_LOG_LEVEL >= 1) ralog_printf(__VA_ARGS__); } while (0)
+#define LOG_DBG(...)  do { if (RA_LOG_LEVEL >= 2) ralog_printf(__VA_ARGS__); } while (0)
 
 /* LOG_FRAME: per-vblank summary line (one per processed frame).
  * Emitted independently of RA_LOG_LEVEL.
@@ -152,7 +231,7 @@ extern "C" {
 #ifndef RA_LOG_FRAME_STATS
 #define RA_LOG_FRAME_STATS 1
 #endif
-#define LOG_FRAME(...) do { if (RA_LOG_FRAME_STATS) Serial.printf(__VA_ARGS__); } while (0)
+#define LOG_FRAME(...) do { if (RA_LOG_FRAME_STATS) ralog_printf(__VA_ARGS__); } while (0)
 
 /* ============================================================================
  * Flight recorder (2026-06-19). The per-frame FRAME line is the bulk of the
@@ -175,6 +254,13 @@ extern "C" {
 #define FR_LINE_MAX  384       /* a FRAME line is ~300ch + margin (vsnprintf truncates) */
 #define FR_BAD_DF_US 20000u    /* do_frame over ~budget (16.6ms) */
 #define FR_BAD_AP_US 30000u    /* convergence/EXI spike (matches the d2x SPK >30ms) */
+/* Mode toggle: logging is async (ralog ring, never blocks Core 1). DEFAULT here is
+ * flight-recorder mode = only the worst frames + before/after context. Set
+ * RA_LOG_ALL_FRAMES 1 (or flip g_log_all_frames at runtime) to log EVERY frame. */
+#ifndef RA_LOG_ALL_FRAMES
+#define RA_LOG_ALL_FRAMES 0
+#endif
+static volatile bool  g_log_all_frames = RA_LOG_ALL_FRAMES;
 static char          fr_ring[FR_BEFORE][FR_LINE_MAX];
 static uint8_t        fr_head   = 0;   /* next slot to write = oldest in the ring */
 static uint8_t        fr_after  = 0;   /* remaining after-context frames to print */
@@ -182,25 +268,31 @@ static unsigned long  fr_spikes = 0;   /* diag: total spikes dumped */
 
 static void fr_record(const char *fmt, ...) {
     if (!RA_LOG_FRAME_STATS) return;
-    char *slot = fr_ring[fr_head];
     va_list ap; va_start(ap, fmt);
+    if (g_log_all_frames) {                /* log-all mode: emit every frame (async, free) */
+        ralog_vprintf(fmt, ap);
+        va_end(ap);
+        return;
+    }
+    char *slot = fr_ring[fr_head];         /* flight-recorder mode: ring + dump on spike */
     vsnprintf(slot, FR_LINE_MAX, fmt, ap);
     va_end(ap);
     fr_head = (uint8_t)((fr_head + 1) % FR_BEFORE);
-    if (fr_after) { Serial.print(slot); fr_after--; }   /* inside the after-window → print live */
+    if (fr_after) { ralog_write(slot, strlen(slot)); fr_after--; }   /* after-window → emit live */
 }
 
 /* Call right after recording a frame that exceeded budget. Dumps the ring
  * (before-context + the bad frame) once, then arms the after-window. A second
  * bad frame while still draining just extends the window (no double dump). */
 static void fr_trigger(void) {
+    if (g_log_all_frames) return;   /* every frame already logged → nothing to dump */
     if (fr_after) { fr_after = FR_AFTER; return; }
     fr_spikes++;
-    Serial.printf("---- SPIKE #%lu (flight recorder: %u before + this + %u after) ----\r\n",
-                  fr_spikes, (unsigned)(FR_BEFORE - 1), (unsigned)FR_AFTER);
+    ralog_printf("---- SPIKE #%lu (flight recorder: %u before + this + %u after) ----\r\n",
+               fr_spikes, (unsigned)(FR_BEFORE - 1), (unsigned)FR_AFTER);
     for (uint8_t i = 0; i < FR_BEFORE; i++) {
         char *slot = fr_ring[(fr_head + i) % FR_BEFORE];   /* oldest → newest (the bad frame) */
-        if (slot[0]) Serial.print(slot);
+        if (slot[0]) ralog_write(slot, strlen(slot));
     }
     fr_after = FR_AFTER;
 }
@@ -245,8 +337,6 @@ static void fr_trigger(void) {
 #define EEPROM_ID_1 142
 #define EEPROM_ID_2 210  // Bumped from GC adapter (209) to force re-init on first Wii flash
 
-#define PIN_RGB 48
-#define NUM_LEDS 1
 #define RESET_PIN 8
 #define ENABLE_RESET 0
 #define RESET_PRESSED_TIME 5000L
@@ -267,28 +357,6 @@ enum AdapterState {
 
 volatile AdapterState state = STATE_INIT;
 
-// ============================================================================
-// LED (reused from fpga-ra-adapter)
-// ============================================================================
-enum LedMode { LED_OFF, LED_ON, LED_BLINK_SLOW, LED_BLINK_MEDIUM, LED_BLINK_FAST };
-enum LedColor { LED_RED, LED_GREEN, LED_YELLOW };
-
-struct Led {
-    LedMode mode;
-    bool ledState;
-    Ticker ticker;
-    CRGB color;
-};
-
-CRGB leds[NUM_LEDS];
-Led ledRGB = { LED_OFF, false, Ticker(), CRGB::Black };
-
-#line 221 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-void updateLed(Led* led);
-#line 228 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-void configureTicker(Led* led);
-#line 240 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-void setSemaphoreLED(LedMode mode, LedColor color);
 #line 346 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void dump_cache_lru(void);
 #line 429 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
@@ -441,36 +509,6 @@ void taskCore1(void *pvParameters);
 void setup();
 #line 4326 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void loop();
-#line 221 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-void updateLed(Led* led) {
-    /*if (led->mode == LED_OFF) { leds[0] = CRGB::Black; }
-    else if (led->mode == LED_ON) { leds[0] = led->color; }
-    else { led->ledState = !led->ledState; leds[0] = led->ledState ? led->color : CRGB::Black; }
-    FastLED.show(5);*/
-}
-
-void configureTicker(Led* led) {
-   /* led->ticker.detach();
-    float interval = 0;
-    switch (led->mode) {
-        case LED_BLINK_SLOW: interval = 0.9; break;
-        case LED_BLINK_MEDIUM: interval = 0.6; break;
-        case LED_BLINK_FAST: interval = 0.3; break;
-        default: updateLed(led); return;
-    }
-    led->ticker.attach(interval, updateLed, led);*/
-}
-
-void setSemaphoreLED(LedMode mode, LedColor color) {
-    /*ledRGB.mode = mode;
-    switch (color) {
-        case LED_RED: ledRGB.color = CRGB::Red; break;
-        case LED_GREEN: ledRGB.color = CRGB::Green; break;
-        case LED_YELLOW: ledRGB.color = CRGB::Yellow; break;
-    }
-    configureTicker(&ledRGB);*/
-}
-
 // ============================================================================
 // Memory tracking - adapted for 32-bit addresses and snapshot model
 // ============================================================================
@@ -947,7 +985,7 @@ static void trigger_watchlist_resync(const char *reason) {
     g_watchlist_count   = watch_count;
     g_watchlist_pending = true;
     mut_ring_clear();                  /* history is moot after a reload */
-    Serial.printf("ERROR=watchlist RESYNC (%s): esp_seq=%u ra_view=%u count=%u\r\n",
+    ralog_printf("ERROR=watchlist RESYNC (%s): esp_seq=%u ra_view=%u count=%u\r\n",
                   reason, (unsigned)wl_seq, (unsigned)ra_seq_view,
                   (unsigned)watch_count);
 }
@@ -1308,7 +1346,6 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
             memcpy(buf + sizeof(ra_achievement_t), ach->title, title_len);
 
             queue_event(RA_EVT_ACHIEVEMENT, buf, sizeof(ra_achievement_t) + title_len);
-            setSemaphoreLED(LED_BLINK_MEDIUM, LED_GREEN);
             Serial.printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
             break;
         }
@@ -4181,7 +4218,6 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
     g_warmup_active = true;
     g_warmup_end_frame = 0;
 
-    setSemaphoreLED(LED_ON, LED_GREEN);
     /* Transition to GAME_LOADED so WiiFlow sees status 0x06 (RA_STATUS_GAME_LOADED)
      * and knows it can proceed with the IOS reload + game boot.
      * STATE_ACTIVE (0x07) is set on the first SNAPSHOT received from ra-module. */
@@ -4952,12 +4988,14 @@ void setup() {
     Serial.setTxBufferSize(8192);
     Serial.begin(250000);
     delay(250);
+    /* Start the async log drain on the idle Core 0. From here, all ralog_printf /
+     * LOG_* / flight-recorder output goes through the SRAM ring → Core 1 never
+     * blocks on Serial. (Before this point g_log_async_ready=false → direct.) */
+    xTaskCreatePinnedToCore(ralog_drain_task, "LogDrain", 4096, nullptr, 1, nullptr, 0);
     /* Mark all hash buckets as empty BEFORE any potential lookup.
      * Static .bss gives us all-zero which would alias to "addr=0 is here". */
     hash_clear();
-    
-    FastLED.addLeds<NEOPIXEL, PIN_RGB>(leds, NUM_LEDS);
-    setSemaphoreLED(LED_BLINK_MEDIUM, LED_YELLOW);
+
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
@@ -4966,7 +5004,6 @@ void setup() {
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {
         Serial.println("ERROR=SPI init failed!");
-        setSemaphoreLED(LED_BLINK_FAST, LED_RED);
         while(1) yield();
     }
     LOG_INFO("DEBUG=SPI slave initialized\r\n");
@@ -4985,15 +5022,11 @@ void setup() {
         wm->setAPStaticIPConfig(IPAddress(192,168,1,1), IPAddress(192,168,1,1), IPAddress(255,255,255,0));
         
         while (!isConfigured()) {
-            setSemaphoreLED(LED_BLINK_MEDIUM, LED_YELLOW);
             LOG_INFO("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
             if (wm->startConfigPortal("WII_RA_ADAPTER", "12345678")) {
                 String token = try_login_RA(custom_user.getValue(), custom_pass.getValue());
                 if (token != "null") {
                     save_configuration_info_eeprom(custom_user.getValue(), custom_pass.getValue());
-                    setSemaphoreLED(LED_ON, LED_GREEN);
-                } else {
-                    setSemaphoreLED(LED_BLINK_FAST, LED_RED);
                 }
             }
         }
@@ -5001,11 +5034,9 @@ void setup() {
         WiFi.mode(WIFI_STA);
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
-        setSemaphoreLED(LED_BLINK_SLOW, LED_GREEN);
         LOG_INFO("DEBUG=WiFi OK\r\n");
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
-            setSemaphoreLED(LED_BLINK_MEDIUM, LED_GREEN);
             LOG_INFO("DEBUG=RA login OK\r\n");
         }
     }

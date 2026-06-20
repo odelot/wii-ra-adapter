@@ -440,7 +440,10 @@ int rc_operand_is_float(const rc_operand_t* self) {
   return rc_operand_is_float_memref(self);
 }
 
-static uint32_t rc_transform_operand_value(uint32_t value, const rc_operand_t* self) {
+/* de-static'd 2026-06-20 so rc_resolve_cached_raw (the collect resolver) can mirror
+ * rc_evaluate_operand's step 3 (BCD/INVERT) on a pointer-chain parent — see the
+ * resolver/evaluator divergence fix in memref.c. Prototype in BOTH rc_internal.h. */
+uint32_t rc_transform_operand_value(uint32_t value, const rc_operand_t* self) {
   switch (self->type)
   {
     case RC_OPERAND_BCD:

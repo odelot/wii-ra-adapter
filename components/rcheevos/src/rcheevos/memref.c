@@ -1101,6 +1101,16 @@ void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs) {
 }
 #endif
 
+/* Resolver/evaluator divergence-fix instrumentation (2026-06-20). Counts how often
+ * each audited parent-resolution path is taken so we can confirm on-device that the
+ * fix is exercised and the peek_miss/df=0 rate drops. d1 = static DELTA/PRIOR parent
+ * read from stored frame-history (matches the evaluator); d2 = BCD/INVERT transform
+ * that actually changed the parent value; chain_dp = DELTA/PRIOR-of-a-chain (no stored
+ * prior to reconstruct — falls through to current value, a rare residual the peek_miss
+ * net backstops). The collect walk is single-threaded, so plain volatile, no atomics. */
+volatile int g_rc_resfix_enabled = 1;   /* A/B + safety toggle: 0 = old diverging behavior */
+volatile unsigned long g_rc_resfix_d1 = 0, g_rc_resfix_d2 = 0, g_rc_resfix_chain_dp = 0;
+
 static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
                                       rc_peek_t peek, rc_is_cached_t is_cached, void* ud,
                                       uint32_t* pending_addr, uint8_t* pending_size,
@@ -1133,19 +1143,47 @@ static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
   /* Modified memref — the rc_memref_t is the first field, so cast back. */
   mm = (const rc_modified_memref_t*)m;
 
-  /* Resolve the parent EXACTLY as rc_evaluate_operand: raw stored value, then
-   * rc_transform_memref_value with the PARENT OPERAND's size. The parent is
-   * USUALLY a memref, but can be a constant/float in some shapes — only
-   * recurse when it really points at a memref, else evaluate it directly.
-   * (Recursing on a non-memref operand reads value.memref = garbage/NULL and
-   * faults: LoadProhibited at offset 0xb, the next level's memref_type.) */
+  /* Resolve the parent to EXACTLY mirror rc_evaluate_operand (operand.c:559) — all
+   * three steps: (1) value by operand TYPE (current/delta/prior), (2) size mask via
+   * rc_transform_memref_value, (3) BCD/INVERT via rc_transform_operand_value. The
+   * resolver historically did only step 2; D1/D2 below complete it (see the audit).
+   * The parent is USUALLY a memref, but can be a constant/float — only recurse when
+   * it really points at a memref, else evaluate it directly. (Recursing on a
+   * non-memref operand reads value.memref = garbage/NULL and faults: LoadProhibited
+   * at offset 0xb, the next level's memref_type.) */
   value.type = RC_VALUE_TYPE_UNSIGNED;
   if (rc_operand_type_is_memref(mm->parent.type)) {
-    value.value.u32 = rc_resolve_cached_raw(mm->parent.value.memref, peek, is_cached, ud,
-                                            pending_addr, pending_size, found_miss);
-    if (*found_miss)
-      return 0;
-    rc_transform_memref_value(&value, mm->parent.size);
+    const rc_operand_t* p = &mm->parent;
+    /* D1 (2026-06-20): a DELTA/PRIOR pointer reads stored frame-history
+     * (memref->prior), which a fresh snapshot peek CANNOT reproduce. For a STATIC
+     * parent the stored typed value IS maintained (rc_update_memref_values runs
+     * before collect), so read it exactly like rc_evaluate_operand -> the predicted
+     * leaf matches the evaluator. DELTA/PRIOR-of-a-chain has no stored prior; it
+     * falls through to the recursion (current value) — a rare residual the do_frame
+     * gate's peek_miss net still backstops (no false unlock, just a deferred frame). */
+    if (g_rc_resfix_enabled &&
+        (p->type == RC_OPERAND_DELTA || p->type == RC_OPERAND_PRIOR) &&
+        p->value.memref &&
+        p->value.memref->value.memref_type != RC_MEMREF_TYPE_MODIFIED_MEMREF) {
+      rc_get_memref_value(&value, p->value.memref, p->type);
+      ++g_rc_resfix_d1;
+    } else {
+      if (g_rc_resfix_enabled && (p->type == RC_OPERAND_DELTA || p->type == RC_OPERAND_PRIOR))
+        ++g_rc_resfix_chain_dp;   /* delta/prior of a chain: unreconstructable residual */
+      value.value.u32 = rc_resolve_cached_raw(p->value.memref, peek, is_cached, ud,
+                                              pending_addr, pending_size, found_miss);
+      if (*found_miss)
+        return 0;
+    }
+    rc_transform_memref_value(&value, p->size);
+    /* D2 (2026-06-20): mirror rc_evaluate_operand step 3 — BCD-decode / bitwise-INVERT
+     * the parent pointer. The resolver used to skip this, so a BCD/INVERTED pointer
+     * predicted a different leaf than the evaluator read -> peek_miss -> df=0. */
+    if (g_rc_resfix_enabled && value.type == RC_VALUE_TYPE_UNSIGNED) {
+      uint32_t pre = value.value.u32;
+      value.value.u32 = rc_transform_operand_value(value.value.u32, p);
+      if (value.value.u32 != pre) ++g_rc_resfix_d2;
+    }
     rc_typed_value_convert(&value, RC_VALUE_TYPE_UNSIGNED);
   } else {
     rc_evaluate_operand(&value, &mm->parent, NULL);

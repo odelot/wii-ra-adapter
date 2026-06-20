@@ -16,6 +16,7 @@
  */
 
 #include "exi_spi_slave.h"
+#include "ra_log.h"            /* async log ring facade (LOG_ERR/INFO/DBG) */
 #include "driver/spi_slave.h"
 #include "driver/gpio.h"
 #include "soc/gpio_reg.h"      /* GPIO_OUT_W1TC_REG — ISR-safe INT assert */
@@ -87,15 +88,6 @@ volatile uint32_t g_servicer_ticks = 0;
 volatile uint8_t  g_servicer_stage = 0;
 volatile uint8_t  g_servicer_prev_stage = 0;  /* stage last armed before blocking on get_trans_result */
 
-/* EXI re-arm gap instrumentation (project_exi_robust_handshake). g_trans_done_us
- * is stamped in the post_trans ISR the instant a transaction completes; the gap
- * to the NEXT exi_spi_arm() is the window during which the slave is un-armed and
- * an incoming (ungated) request CS-low would race -> "bad magic". If this max
- * spikes to ~10-100ms during the galaxy convergence storm, the self-starvation
- * hypothesis (heavy collect_missing in taskCore1 blocking the re-arm) is proven. */
-static volatile uint64_t g_trans_done_us  = 0;
-volatile uint32_t g_exi_rearm_gap_us      = 0;  // last gap
-volatile uint32_t g_exi_rearm_gap_max_us  = 0;  // max since last reset (FRAME log resets)
 
 // Callback diagnostics — observable from main loop heartbeat in
 // wii-ra-adapter.ino. cb_invocations counts how many times spi_pre_setup_cb
@@ -186,7 +178,6 @@ static void IRAM_ATTR spi_pre_setup_cb(spi_slave_transaction_t *trans)
 // there is no ISR task-notify here anymore.
 static void IRAM_ATTR spi_post_trans_cb(spi_slave_transaction_t *trans)
 {
-    g_trans_done_us = (uint64_t)esp_timer_get_time();  /* stamp completion for re-arm gap */
     size_t bytes = trans->trans_len / 8;
     if (trans->trans_len > 0 && bytes > 0 && bytes <= EXI_MAX_TRANSACTION_SIZE) {
         total_transactions++;
@@ -300,7 +291,7 @@ bool exi_spi_init(exi_transaction_cb_t callback)
 
     esp_err_t ret = spi_slave_initialize(SPI2_HOST, &bus_cfg, &slave_cfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
-        Serial.printf("ERROR=spi_slave_initialize failed: %d\n", ret);
+        LOG_ERR("ERROR=spi_slave_initialize failed: %d\n", ret);
         return false;
     }
 
@@ -354,13 +345,13 @@ bool exi_spi_init(exi_transaction_cb_t callback)
     g_resp_sem = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(exi_servicer_task, "EXI_Servicer", 4096, nullptr,
                             20, &g_servicer_task, 1);
-    Serial.printf("DEBUG=EXI sole-owner servicer task=%s (prio 20, Core 1)\n",
-                  (g_servicer_task && g_req_sem && g_resp_sem) ? "OK" : "FAILED");
+    LOG_DBG("DEBUG=EXI sole-owner servicer task=%s (prio 20, Core 1)\n",
+             (g_servicer_task && g_req_sem && g_resp_sem) ? "OK" : "FAILED");
 
-    Serial.printf("DEBUG=SPI Pins: MOSI=%d MISO=%d CLK=%d CS=%d INT=%d\n",
-                   EXI_PIN_MOSI, EXI_PIN_MISO, EXI_PIN_CLK, EXI_PIN_CS, EXI_PIN_INT);
+    LOG_DBG("DEBUG=SPI Pins: MOSI=%d MISO=%d CLK=%d CS=%d INT=%d\n",
+             EXI_PIN_MOSI, EXI_PIN_MISO, EXI_PIN_CLK, EXI_PIN_CS, EXI_PIN_INT);
     int cs_state = gpio_get_level((gpio_num_t)EXI_PIN_CS);
-    Serial.printf("DEBUG=CS pin state: %d (expect 1=HIGH when idle)\n", cs_state);
+    LOG_DBG("DEBUG=CS pin state: %d (expect 1=HIGH when idle)\n", cs_state);
 
     return true;
 }
@@ -427,8 +418,8 @@ bool exi_spi_poll(uint32_t timeout_ms)
             } else if (bytes > 0 && rx_buf[0] == 0xFF) {
                 cmd_name = "ALL_FF(idle?)";
             }
-            Serial.printf("DEBUG=EXI trans: %u bytes, cmd=%s, total=%lu\n",
-                          bytes, cmd_name, (unsigned long)total_transactions);
+            LOG_DBG("DEBUG=EXI trans: %u bytes, cmd=%s, total=%lu\n",
+                    bytes, cmd_name, (unsigned long)total_transactions);
         }
 
         return data_ready;
@@ -440,13 +431,6 @@ bool exi_spi_poll(uint32_t timeout_ms)
 void exi_spi_arm(void)
 {
     if (!spi_initialized) return;
-    /* Measure the un-armed window: time since the last transaction completed
-     * (stamped in the ISR) until now (the re-arm). Spikes here == the race. */
-    if (g_trans_done_us) {
-        uint32_t gap = (uint32_t)((uint64_t)esp_timer_get_time() - g_trans_done_us);
-        g_exi_rearm_gap_us = gap;
-        if (gap > g_exi_rearm_gap_max_us) g_exi_rearm_gap_max_us = gap;
-    }
     /* Queue the persistent transaction so the SPI peripheral is ready for
      * the next CS-low. Called from the main loop AFTER handle_exi_command
      * has had a chance to call exi_spi_prepare_response, so the queued

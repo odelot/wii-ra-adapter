@@ -92,3 +92,20 @@ CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_PSK=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_RSA_PSK=y
+
+# --- TLS memory: dynamic record buffers (2026-06-22, SSBM award failure) ---
+# With this OFF, every HTTPS connection statically reserves a 16 KB internal-RAM
+# RX buffer (CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN) and holds it for the whole
+# connection. Login/startsession run BEFORE the rcheevos game struct loads
+# (sram-free ~50-63 KB) so they fit; but heavy games (SSBM: 339 achievements,
+# +37 KB SRAM struct) drop sram-free to ~25 KB / largest-block ~21 KB. The next
+# HTTPS call (ping, awardachievement) then can't get the 16 KB block, and the
+# hardware-AES DMA alloc fails downstream -> "esp-aes: Failed to allocate memory"
+# -> start_ssl_client connect -1 -> the unlock is never submitted. SMG's smaller
+# core set never crossed that line, which is why this only bit on SSBM.
+# DYNAMIC_BUFFER allocates the RX buffer per-record and frees it when idle, and
+# right-sizes it (the award response is ~100 B), recovering ~16 KB contiguous
+# internal RAM exactly where the handshake needs it.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y

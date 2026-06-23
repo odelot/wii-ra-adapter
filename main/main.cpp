@@ -121,7 +121,7 @@ extern "C" {
  * Raise to 2 only while investigating. Combined with the enlarged UART
  * TX buffer in setup(), level 1 keeps hot windows burst-free. */
 #ifndef RA_LOG_LEVEL
-#define RA_LOG_LEVEL 1
+#define RA_LOG_LEVEL 2
 #endif
 #include <stdarg.h>
 /* ============================================================================
@@ -1223,6 +1223,52 @@ static void log_message(const char *message, const rc_client_t *client) {
     LOG_DBG("DEBUG=rcheevos: %s\r\n", message);
 }
 
+/* ============================================================================
+ * Achievement-unlock LED celebration (onboard WS2812 RGB, GPIO48).
+ *
+ * No external library: neopixelWrite() ships with arduino-esp32 (the
+ * arduino-as-component dependency, esp32-hal-rgb-led) and is RMT-backed —
+ * the hardware generates the WS2812 waveform, so it does NOT disable
+ * interrupts for a whole frame like a bit-bang would; it only blocks the
+ * CALLING task ~30us waiting on the RMT done signal.
+ *
+ * Cadence matches the d2x disc-slot LED exactly: ra_led_celebrate=54 @ 60Hz
+ * produces three 9-frame ON pulses with 9-frame OFF gaps (d2x ra-module
+ * main.c ra_poll_thread, the `ra_led_celebrate % 9` loop). 9 frames ≈ 150ms,
+ * so we mirror it as 3 × (150ms green ON / 150ms OFF) ≈ 0.9s.
+ *
+ * CRITICAL: neopixelWrite() MUST NOT run on Core 1 — that core runs the
+ * prio-19 EXI servicer and any stall mid-transaction corrupts SPI timing.
+ * So the blink runs in a dedicated low-prio task pinned to Core 0; the Core 1
+ * event_handler only bumps g_celebrate_req (a 32-bit atomic on Xtensa). */
+#define PIN_RGB               48
+#define RA_CELEBRATE_PULSES   3
+#define RA_CELEBRATE_ON_MS    150
+#define RA_CELEBRATE_OFF_MS   150
+#define RA_CELEBRATE_LEVEL    40    /* 0-255 per channel; full white WS2812 is blinding */
+static volatile uint32_t g_celebrate_req = 0;   /* bumped by event_handler (Core 1) */
+
+static inline void led_off(void)   { neopixelWrite(PIN_RGB, 0, 0, 0); }
+static inline void led_green(void) { neopixelWrite(PIN_RGB, 0, RA_CELEBRATE_LEVEL, 0); }
+
+static void ledCelebrateTask(void *arg) {
+    (void)arg;
+    led_off();
+    uint32_t seen = g_celebrate_req;
+    for (;;) {
+        if (g_celebrate_req != seen) {
+            seen = g_celebrate_req;
+            for (int i = 0; i < RA_CELEBRATE_PULSES; i++) {
+                led_green();
+                vTaskDelay(pdMS_TO_TICKS(RA_CELEBRATE_ON_MS));
+                led_off();
+                vTaskDelay(pdMS_TO_TICKS(RA_CELEBRATE_OFF_MS));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
     LOG_DBG("DEBUG=event: %d\r\n", event->type);
     switch (event->type) {
@@ -1251,6 +1297,10 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
             memcpy(buf + sizeof(ra_achievement_t), ach->title, title_len);
 
             queue_event(RA_EVT_ACHIEVEMENT, buf, sizeof(ra_achievement_t) + title_len);
+            /* Trigger the onboard RGB celebration (3 green pulses, d2x cadence).
+             * Just bump the counter — the actual neopixelWrite() runs on Core 0's
+             * ledCelebrateTask, NEVER here on the Core 1 EXI critical path. */
+            g_celebrate_req++;
             ralog_printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
             break;
         }
@@ -4759,6 +4809,11 @@ void setup() {
 
     // Core-0 deadlock watchdog (prio 2, Core 0) — survives a Core-1 hang.
     xTaskCreatePinnedToCore(exi_watchdog_task, "EXI_WDOG", 3072, nullptr, 2, nullptr, 0);
+
+    /* Achievement-unlock LED celebration. Dedicated task on Core 0 so the
+     * RMT-backed neopixelWrite() never stalls the Core 1 EXI realtime path.
+     * Prio 0, tiny stack (no rc_client here). */
+    xTaskCreatePinnedToCore(ledCelebrateTask, "LED_Task", 2048, nullptr, 0, nullptr, 0);
 }
 
 /* Core-0 deadlock watchdog (project_exi_robust_handshake). Runs on Core 0 so it

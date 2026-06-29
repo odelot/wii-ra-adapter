@@ -29,6 +29,42 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -w -fpermissive)
 # Validated host-side: upstream test suite stays 2313/2314 with the toggle ON.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_DIRTY_EVAL)
 
+# Clean-replay: extends dirty-eval to WARM+CLEAN triggers. Today dirty-eval must
+# fully re-evaluate any trigger with hit counts (has_hits); clean-replay instead
+# replays it with the CACHED condition truth (rc_test_condition returns is_true
+# without re-reading operands) since on a proven-clean frame the raw truth is
+# unchanged — the full accrual/pause/measured/state machinery still runs, so the
+# result is behavior-identical while skipping the scattered memref->value PSRAM
+# reads that dominate the eval (PSRAM-bandwidth-bound; +43% at 80MHz). The replay
+# request rides rc_evaluate_trigger's unused_L param as &g_rc_replay_sentinel
+# (per-call -> race-free across the 2 work-stealing eval cores). Runtime A/B via
+# g_rc_clean_replay_enabled. Host-validated 2313/2314 incl. stress (replay every
+# clean trigger = 5983 replays, bit-identical). REQUIRES RC_DIRTY_EVAL.
+target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_CLEAN_REPLAY)
+
+# Shadow-array (RC_SHADOW_VALUES): DISABLED 2026-06-29 — HW gave 0 perf gain. The
+# memref-value read latency is hidden by compute overlap in the real eval (MEMBENCH's
+# 13.7x was isolated-read latency, not the real critical path). Code kept (#ifdef'd,
+# compiles out) for reference; the real eval bottleneck is the rc_condition_t struct
+# streaming, attacked by the plan/state split instead. See project_shadow_array.
+# target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_SHADOW_VALUES)
+
+# DIAGNOSTIC: uncomment to ~2x the rc_condition_t size (inert padding) and double the
+# eval's condition-struct streaming. Build once WITH and once WITHOUT, compare evl_us in
+# the CATCHUP log: evl rises -> eval is memory-bound on condition streaming (the plan/
+# state compaction will pay); evl ~flat -> CPU-bound (compaction won't help, accept 80M).
+# Decisive memory-vs-CPU probe before the high-risk eval rewrite. See project_compiled_eval.
+# RESULT 2026-06-29: BLOAT added +5.4ms/+35% to evl_us (upd unchanged = clean control) ->
+# eval IS memory-bound on condition streaming (~35% of evl). Plan/state compaction justified.
+# target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_COND_BLOAT)
+
+# Compact operand (step 2 of the eval compaction): FP-const storage double->float, shrinking
+# rc_operand_t 16->8B => rc_condition_t 48->32B (-33% eval streaming) AND rc_modified_memref_t
+# 56->36B (-36% upd streaming). EVAL-SAFE (host: only 5 FP parse-storage asserts diverge, eval
+# already uses f32; all eval-logic tests pass). The low-risk first cut at the memory-bound eval
+# the bloat probe confirmed. Comment out to A/B the gain. See project_compiled_eval.
+target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_COMPACT_OPERAND)
+
 # Optimization C: enable the (otherwise-dead) condset short-circuit in
 # rc_evaluate_trigger. Logic-neutral for unlocks (hit-target/Measured always
 # evaluate; only cosmetic "other" tallies are skipped) and SYNERGIZES with
@@ -55,3 +91,13 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_INCREMENTAL_UPD)
 # (every N vblanks / on watchlist mutation) re-walks all and resets the index.
 # Attacks the 27ms collect_missing spike that drops df/s to 30-52 in heavy scenes.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_INCREMENTAL_COLLECT)
+
+# Pointer-aware dirtying: the reverse-index registers ONLY pointer reads (intermediate
+# chain levels, recursion depth>0), NOT the top-level leaf read. A chain's leaf address
+# only moves when a pointer above it changes; the leaf VALUE changing (most snap_changed
+# churn) does NOT need a re-walk. Registering the leaf made chains falsely-dirty -> the
+# collect over-walked ~9x (measured: 9 walks per real miss). Skipping it cuts the walk
+# on miss-frames (the 10% of frames costing ~40ms ap_us). SAFE: a wrongly-skipped dirty
+# is backstopped by the do_frame gate + peek_miss net (deferred frame, never false unlock).
+# Device-only (incr-collect not in upstream/host). Comment to A/B. See project_convergence_analysis.
+target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_POINTER_AWARE_DIRTY)

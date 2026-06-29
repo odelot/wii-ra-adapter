@@ -6,6 +6,79 @@
 
 #define MEMREF_PLACEHOLDER_ADDRESS 0xFFFFFFFF
 
+#ifdef RC_SHADOW_VALUES
+/* ===========================================================================
+ * Compact shadow value cache (RC_SHADOW_VALUES) — see project_shadow_array.
+ * Eval reads memref values out of 56-byte structs (strided -> busts cache, 13.7x
+ * slower per MEMBENCH). Keep compact arrays of {value,prior,changed} indexed by a
+ * slot carried in each rc_operand_t (cache-hot). UPD (single-threaded) mirrors
+ * struct->shadow; eval reads shadow (read-only -> parallel-safe). Shadow==struct by
+ * construction -> bit-identical (host-validated 2313/2314). Device: arena is PSRAM,
+ * set once at boot via rc_shadow_set_arena; slots built at game load.
+ * =========================================================================== */
+volatile int g_rc_shadow_enabled = 1;   /* runtime A/B */
+uint32_t* g_rc_sv_value = NULL;
+uint32_t* g_rc_sv_prior = NULL;
+uint8_t*  g_rc_sv_changed = NULL;
+uint32_t  g_rc_shadow_count = 0;
+uint32_t  g_rc_shadow_cap = 0;
+
+void rc_shadow_set_arena(uint32_t* value, uint32_t* prior, uint8_t* changed, uint32_t cap) {
+  g_rc_sv_value = value;
+  g_rc_sv_prior = prior;
+  g_rc_sv_changed = changed;
+  g_rc_shadow_cap = cap;
+  g_rc_shadow_count = 0;   /* reset on each game load (re-call with same arena) */
+}
+
+static uint16_t rc_shadow_assign(rc_memref_t* memref) {
+  if (memref->shadow_slot != 0xFFFF)
+    return memref->shadow_slot;
+  if (!g_rc_sv_value || g_rc_shadow_count >= g_rc_shadow_cap || g_rc_shadow_count >= 0xFFFF)
+    return 0xFFFF;
+  memref->shadow_slot = (uint16_t)g_rc_shadow_count++;
+  return memref->shadow_slot;
+}
+
+static void rc_shadow_build_operand(rc_operand_t* op) {
+  op->shadow_slot = rc_operand_is_memref(op) ? rc_shadow_assign(op->value.memref) : 0xFFFF;
+}
+
+static void rc_shadow_build_condset(rc_condset_t* cs) {
+  rc_condition_t* c;
+  if (!cs)
+    return;
+  for (c = cs->conditions; c != NULL; c = c->next) {
+    rc_shadow_build_operand(&c->operand1);
+    rc_shadow_build_operand(&c->operand2);
+  }
+}
+
+void rc_shadow_build_trigger(rc_trigger_t* trigger) {
+  rc_condset_t* cs;
+  if (!trigger)
+    return;
+  rc_shadow_build_condset(trigger->requirement);
+  for (cs = trigger->alternative; cs != NULL; cs = cs->next)
+    rc_shadow_build_condset(cs);
+}
+
+/* UPD side: mirror one memref's value into the compact shadow. Lazy-assigns the slot
+ * (works whether UPD runs before or after the build). Skipped (incr-upd) memrefs keep
+ * their last shadow = still correct (skip implies the value is unchanged). */
+void rc_shadow_mirror(rc_memref_t* m) {
+  uint16_t s = m->shadow_slot;
+  if (s == 0xFFFF) {
+    s = rc_shadow_assign(m);
+    if (s == 0xFFFF)
+      return;
+  }
+  g_rc_sv_value[s]   = m->value.value;
+  g_rc_sv_prior[s]   = m->value.prior;
+  g_rc_sv_changed[s] = m->value.changed;
+}
+#endif /* RC_SHADOW_VALUES */
+
 rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t size) {
   rc_memref_list_t* memref_list = NULL;
   rc_memref_t* memref = NULL;
@@ -75,6 +148,9 @@ rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t 
   memref->value.type = RC_VALUE_TYPE_UNSIGNED;
   memref->value.size = size;
   memref->address = address;
+#ifdef RC_SHADOW_VALUES
+  memref->shadow_slot = 0xFFFF;
+#endif
 
   return memref;
 }
@@ -156,6 +232,9 @@ rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t 
   modified_memref->modifier_type = modifier_type;
   modified_memref->depth = 0;
   modified_memref->memref.address = rc_operand_is_memref(modifier) ? modifier->value.memref->address : modifier->value.num;
+#ifdef RC_SHADOW_VALUES
+  modified_memref->memref.shadow_slot = 0xFFFF;
+#endif
 
   if (rc_operand_is_memref(parent) && parent->value.memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF) {
     const rc_modified_memref_t* parent_modified_memref = (rc_modified_memref_t*)parent->value.memref;
@@ -870,6 +949,9 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_peek_t peek, void* ud) {
     for (; memref < memref_stop; ++memref) {
       if (memref->value.type != RC_VALUE_TYPE_NONE)
         rc_update_memref_value(&memref->value, rc_peek_value(memref->address, memref->value.size, peek, ud));
+#ifdef RC_SHADOW_VALUES
+      rc_shadow_mirror(memref);
+#endif
     }
 
     memref_list = memref_list->next;
@@ -896,6 +978,9 @@ void rc_update_memref_values(rc_memrefs_t* memrefs, rc_peek_t peek, void* ud) {
         ++g_rc_upd_resolves;
 #endif
         rc_update_memref_value(&modified_memref->memref.value, rc_get_modified_memref_value(modified_memref, peek, ud));
+#ifdef RC_SHADOW_VALUES
+        rc_shadow_mirror(&modified_memref->memref);
+#endif
       }
 
       modified_memref_list = modified_memref_list->next;
@@ -1111,10 +1196,24 @@ void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs) {
 volatile int g_rc_resfix_enabled = 1;   /* A/B + safety toggle: 0 = old diverging behavior */
 volatile unsigned long g_rc_resfix_d1 = 0, g_rc_resfix_d2 = 0, g_rc_resfix_chain_dp = 0;
 
+/* Pointer-aware dirtying (RC_POINTER_AWARE_DIRTY): only register POINTER reads (the
+ * intermediate chain levels, reached via recursion at depth>0) in the reverse index,
+ * NOT the top-level LEAF read (depth 0). A chain's resolved leaf ADDRESS only changes
+ * when a pointer above it MOVES; the leaf VALUE changing (most snap_changed churn) does
+ * NOT need a re-walk. Registering the leaf made it falsely-dirty every time its value
+ * changed -> ~9 wasted walks per real miss (measured). Skipping it cuts that. SAFE: a
+ * missed dirty (wrongly-skipped pointer) is backstopped by the do_frame gate + peek_miss
+ * net (deferred frame, never a false unlock). Device-only (no upstream/host coverage). */
+#ifdef RC_POINTER_AWARE_DIRTY
+#define RC_REGISTER_READ(depth) ((depth) > 0)
+#else
+#define RC_REGISTER_READ(depth) 1
+#endif
+
 static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
                                       rc_peek_t peek, rc_is_cached_t is_cached, void* ud,
                                       uint32_t* pending_addr, uint8_t* pending_size,
-                                      int* found_miss) {
+                                      int* found_miss, int depth) {
   rc_typed_value_t value, modifier;
   const rc_modified_memref_t* mm;
   uint8_t num_bytes;
@@ -1127,8 +1226,8 @@ static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
   if (m->value.memref_type != RC_MEMREF_TYPE_MODIFIED_MEMREF) {
     num_bytes = rc_memref_addr_bytes(m->value.size);
 #ifdef RC_INCREMENTAL_COLLECT
-    /* Record this read against the chain being walked (reverse index). */
-    if (g_rc_chain_read_cb && g_rc_incr_chain)
+    /* Record this read against the chain being walked (reverse index) — pointers only. */
+    if (g_rc_chain_read_cb && g_rc_incr_chain && RC_REGISTER_READ(depth))
       g_rc_chain_read_cb(m->address, num_bytes, g_rc_incr_chain);
 #endif
     if (!is_cached(m->address, num_bytes, ud)) {
@@ -1171,7 +1270,7 @@ static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
       if (g_rc_resfix_enabled && (p->type == RC_OPERAND_DELTA || p->type == RC_OPERAND_PRIOR))
         ++g_rc_resfix_chain_dp;   /* delta/prior of a chain: unreconstructable residual */
       value.value.u32 = rc_resolve_cached_raw(p->value.memref, peek, is_cached, ud,
-                                              pending_addr, pending_size, found_miss);
+                                              pending_addr, pending_size, found_miss, depth + 1);
       if (*found_miss)
         return 0;
     }
@@ -1200,7 +1299,7 @@ static uint32_t rc_resolve_cached_raw(const rc_memref_t* m,
       addr = value.value.u32;
       num_bytes = rc_memref_addr_bytes(m->value.size);
 #ifdef RC_INCREMENTAL_COLLECT
-      if (g_rc_chain_read_cb && g_rc_incr_chain)
+      if (g_rc_chain_read_cb && g_rc_incr_chain && RC_REGISTER_READ(depth))
         g_rc_chain_read_cb(addr, num_bytes, g_rc_incr_chain);
 #endif
       if (!is_cached(addr, num_bytes, ud)) {
@@ -1285,7 +1384,7 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
       /* Walk this chain's leaf through the cache; the first uncached
        * address on the path is reported. */
       rc_resolve_cached_raw(&mm->memref, peek, is_cached, ud,
-                            &pending_addr, &pending_size, &found_miss);
+                            &pending_addr, &pending_size, &found_miss, 0);
 
 #ifdef RC_INCREMENTAL_COLLECT
       /* Clean iff fully resolved (no miss). A miss keeps it dirty so the next

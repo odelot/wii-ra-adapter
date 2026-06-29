@@ -122,6 +122,16 @@ typedef enum {
      * is fragile / impractical.
      */
     RA_CMD_DEBUG_LOG         = 0x09,
+
+    /**
+     * Wipe the WiFi + RetroAchievements credentials stored on the ESP32 by
+     * WiFiManager / EEPROM, then reboot the ESP32 into its config portal.
+     * No payload. The response in the same transaction is unreliable (the ESP
+     * reboots shortly after), so the sender should not depend on it.
+     * Replaces the physical "reset button on the memory card" used by the
+     * nes-ra-adapter: WiiFlow triggers it from a Settings menu entry.
+     */
+    RA_CMD_RESET_CREDENTIALS = 0x0A,
 } ra_gc_command_t;
 
 /*

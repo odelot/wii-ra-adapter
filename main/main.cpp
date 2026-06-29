@@ -38,17 +38,19 @@ Pin 5: DI    (MOSI — Wii escreve, ESP32 lê)
 Pin 6: DO    (MISO — ESP32 escreve, Wii lê)
 Pin 7: 3.3V
 
-Diagrama de ligação
+Diagrama de ligação  (pinos exatos vêm de board_config.h / BOARD_VARIANT)
 
-Wii Memory Card Slot A          ESP32-S3 DevKit
-────────────────────────        ─────────────────────
-Pin 7  3.3V ──────────────────── 3.3V  (alimentação)
-Pin 1  GND  ──────────────────── GND       
-Pin 3  CS   ──────────────────── GPIO10  (EXI_PIN_CS)
-Pin 4  CLK  ──────────────────── GPIO12  (EXI_PIN_CLK)
-Pin 5  DI   ──────────────────── GPIO11  (EXI_PIN_MOSI)
-Pin 6  DO   ──────────────────── GPIO13  (EXI_PIN_MISO)
-Pin 2  INT  ──────────────────── GPIO14
+Wii Memory Card Slot A    BOARD_DEV (S3 DevKit)   BOARD_XIAO (XIAO ESP32S3)
+────────────────────────  ─────────────────────   ─────────────────────────
+Pin 7  3.3V ───────────── 3.3V  (alimentação)      3.3V
+Pin 1  GND  ───────────── GND                      GND
+Pin 3  CS   ───────────── GPIO10 (EXI_PIN_CS)      GPIO7  (pad D8)
+Pin 4  CLK  ───────────── GPIO12 (EXI_PIN_CLK)     GPIO8  (pad D9)
+Pin 5  DI   ───────────── GPIO11 (EXI_PIN_MOSI)    GPIO9  (pad D10)
+Pin 6  DO   ───────────── GPIO13 (EXI_PIN_MISO)    GPIO5  (pad D4)
+Pin 2  INT  ───────────── GPIO14 (EXI_PIN_INT)     GPIO6  (pad D5)
+
+Unlock LED:               WS2812 RGB GPIO48        yellow user LED GPIO21 (active-low)
 
 
  */
@@ -63,6 +65,7 @@ Pin 2  INT  ──────────────────── GPIO14
 #include <time.h>
 
 // Project headers
+#include "board_config.h"   // BOARD_VARIANT switch: EXI pin map + LED back-end
 #include "gc_ra_protocol.h"
 #include "exi_spi_slave.h"
 #include "ra_http.h"
@@ -99,6 +102,10 @@ extern "C" {
   extern volatile int g_rc_dirty_eval_enabled;
   extern volatile uint32_t g_rc_de_skipped;
   extern volatile uint32_t g_rc_de_evaled;
+#ifdef RC_CLEAN_REPLAY
+  extern volatile uint32_t g_rc_de_replayed;   /* warm+clean cached-truth replays (subset of de_ev) */
+  extern volatile int g_rc_clean_replay_enabled;
+#endif
 #endif
 }
 
@@ -208,6 +215,20 @@ static void ralog_drain_task(void *pv) {
 #define LOG_ERR(...)  ralog_printf(__VA_ARGS__)
 #define LOG_INFO(...) do { if (RA_LOG_LEVEL >= 1) ralog_printf(__VA_ARGS__); } while (0)
 #define LOG_DBG(...)  do { if (RA_LOG_LEVEL >= 2) ralog_printf(__VA_ARGS__); } while (0)
+
+/* RA_WDOG_VERBOSE: gates the Core-0 deadlock watchdog's serial output. The task
+ * always RUNS (tracking srv/wrk/df heartbeat deltas) — this only controls whether
+ * it PRINTS. Default OFF because both of its lines are noisy in normal operation:
+ *   - "DEBUG=WDOG ..." is an unconditional 1-line/s heartbeat.
+ *   - "DEBUG=WDOG-FREEZE ..." fires whenever the servicer didn't tick for a second,
+ *     which also happens when the GameCube is simply IDLE (not streaming snapshots),
+ *     so it spams with all-zero rings even when nothing is wrong.
+ * Flip to 1 at compile time, or set g_wdog_verbose=true at runtime, ONLY when
+ * chasing a real freeze (project_exi_robust_handshake / project_spike_root_cause). */
+#ifndef RA_WDOG_VERBOSE
+#define RA_WDOG_VERBOSE 0
+#endif
+static volatile bool g_wdog_verbose = RA_WDOG_VERBOSE;
 
 /* LOG_FRAME: per-vblank summary line (one per processed frame). This is the
  * INFO channel — FRAME (and the periodic CATCHUP line) are emitted at
@@ -467,6 +488,9 @@ static void ensure_watchlist_capacity();
 static void watchlist_update_if_changed(uint32_t new_count);
 #line 3423 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata);
+#ifdef RC_SHADOW_VALUES
+extern "C" void rc_shadow_set_arena(uint32_t* value, uint32_t* prior, uint8_t* changed, uint32_t cap);  /* memref.c (C linkage) */
+#endif
 #line 3507 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void login_then_load_cb(int result, const char *error_message, rc_client_t *client, void *userdata);
 #line 3519 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
@@ -501,6 +525,8 @@ uint16_t watch_count = 0;
 uint8_t *memory_data = NULL;          // Current values for each watched address
 volatile bool new_snapshot = false;    // Flag: new snapshot received from GC
 volatile uint32_t frame_counter = 0;
+// Set by the RA_CMD_RESET_CREDENTIALS handler; loop() wipes WiFi + RA creds and reboots.
+volatile bool g_factory_reset_pending = false;
 
 /* opt B2 (incremental upd, INDIRECT skip — see project_incremental_upd_b).
  * snap_changed[i] = 1 iff memory_data[i] differed from the previous snapshot
@@ -1224,42 +1250,59 @@ static void log_message(const char *message, const rc_client_t *client) {
 }
 
 /* ============================================================================
- * Achievement-unlock LED celebration (onboard WS2812 RGB, GPIO48).
+ * Achievement-unlock LED celebration.
  *
- * No external library: neopixelWrite() ships with arduino-esp32 (the
- * arduino-as-component dependency, esp32-hal-rgb-led) and is RMT-backed —
- * the hardware generates the WS2812 waveform, so it does NOT disable
- * interrupts for a whole frame like a bit-bang would; it only blocks the
- * CALLING task ~30us waiting on the RMT done signal.
+ * Two LED back-ends, selected by board_config.h:
+ *   LED_USE_RGB  (BOARD_DEV)  — onboard WS2812 RGB on GPIO48. neopixelWrite()
+ *                ships with arduino-esp32 (esp32-hal-rgb-led), is RMT-backed —
+ *                the hardware generates the WS2812 waveform, so it does NOT
+ *                disable interrupts for a whole frame like a bit-bang would; it
+ *                only blocks the CALLING task ~30us waiting on the RMT done.
+ *   LED_USE_GPIO (BOARD_XIAO) — single yellow user LED on GPIO21, active-low.
+ *                Plain digitalWrite(), no addressable LED on the XIAO module.
  *
  * Cadence matches the d2x disc-slot LED exactly: ra_led_celebrate=54 @ 60Hz
  * produces three 9-frame ON pulses with 9-frame OFF gaps (d2x ra-module
  * main.c ra_poll_thread, the `ra_led_celebrate % 9` loop). 9 frames ≈ 150ms,
- * so we mirror it as 3 × (150ms green ON / 150ms OFF) ≈ 0.9s.
+ * so we mirror it as 3 × (150ms ON / 150ms OFF) ≈ 0.9s.
  *
- * CRITICAL: neopixelWrite() MUST NOT run on Core 1 — that core runs the
- * prio-19 EXI servicer and any stall mid-transaction corrupts SPI timing.
- * So the blink runs in a dedicated low-prio task pinned to Core 0; the Core 1
- * event_handler only bumps g_celebrate_req (a 32-bit atomic on Xtensa). */
-#define PIN_RGB               48
+ * CRITICAL: the LED write MUST NOT run on Core 1 — that core runs the prio-19
+ * EXI servicer and any stall mid-transaction corrupts SPI timing. So the blink
+ * runs in a dedicated low-prio task pinned to Core 0; the Core 1 event_handler
+ * only bumps g_celebrate_req (a 32-bit atomic on Xtensa). */
 #define RA_CELEBRATE_PULSES   3
 #define RA_CELEBRATE_ON_MS    150
 #define RA_CELEBRATE_OFF_MS   150
 #define RA_CELEBRATE_LEVEL    40    /* 0-255 per channel; full white WS2812 is blinding */
 static volatile uint32_t g_celebrate_req = 0;   /* bumped by event_handler (Core 1) */
 
+#if defined(LED_USE_RGB)
+static inline void led_init(void)  { /* WS2812 needs no pin setup */ }
 static inline void led_off(void)   { neopixelWrite(PIN_RGB, 0, 0, 0); }
-static inline void led_green(void) { neopixelWrite(PIN_RGB, 0, RA_CELEBRATE_LEVEL, 0); }
+static inline void led_on(void)    { neopixelWrite(PIN_RGB, 0, RA_CELEBRATE_LEVEL, 0); }
+#elif defined(LED_USE_GPIO)
+static inline void led_init(void)  { pinMode(PIN_LED_GPIO, OUTPUT); }
+#if PIN_LED_ACTIVE_LOW
+static inline void led_off(void)   { digitalWrite(PIN_LED_GPIO, HIGH); }
+static inline void led_on(void)    { digitalWrite(PIN_LED_GPIO, LOW);  }
+#else
+static inline void led_off(void)   { digitalWrite(PIN_LED_GPIO, LOW);  }
+static inline void led_on(void)    { digitalWrite(PIN_LED_GPIO, HIGH); }
+#endif
+#else
+#error "board_config.h must define LED_USE_RGB or LED_USE_GPIO"
+#endif
 
 static void ledCelebrateTask(void *arg) {
     (void)arg;
+    led_init();
     led_off();
     uint32_t seen = g_celebrate_req;
     for (;;) {
         if (g_celebrate_req != seen) {
             seen = g_celebrate_req;
             for (int i = 0; i < RA_CELEBRATE_PULSES; i++) {
-                led_green();
+                led_on();
                 vTaskDelay(pdMS_TO_TICKS(RA_CELEBRATE_ON_MS));
                 led_off();
                 vTaskDelay(pdMS_TO_TICKS(RA_CELEBRATE_OFF_MS));
@@ -1909,7 +1952,7 @@ static void json_keep_first_set(PsramStream &buf) {
  * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
  * ─────────────────────────────────────────────────────────────────────── */
 #ifndef CAP_TOTAL_OPERATIONS
-#define CAP_TOTAL_OPERATIONS 1            // 1 = on, 0 = keep every achievement
+#define CAP_TOTAL_OPERATIONS 0            // 1 = on, 0 = keep every achievement
 #endif
 #ifndef MAX_TOTAL_OPERATIONS
 #define MAX_TOTAL_OPERATIONS 20000        // target ceiling (~60% of SMG's 32768)
@@ -2650,7 +2693,20 @@ static volatile bool g_diag_dry_update = false;  /* OFF for the servicer build �
  * recorded). ~2000 chains x ~3 levels x ~4 bytes ~= 24k worst case. Generous so
  * the steady state never overflow-churns; overflow just forces a safe rebuild. */
 #define INCR_REV_POOL_MAX 40000      /* (watch_index,chain) pair capacity */
-#define INCR_REBUILD_EVERY 60        /* full rebuild cadence (vblanks) */
+#define INCR_REBUILD_EVERY 600       /* TIME-BASED full rebuild cadence (vblanks). 2026-06-29: 60->600
+                                      * (step toward DISABLING the periodic entirely). The every-60
+                                      * rebuild does mark_all_dirty -> the collect then walks ALL ~1552
+                                      * chains = the periodic ~30ms apc spike (the mk=0/cwk=1552 frames).
+                                      * It was only (a) a staleness backstop and (b) a missed-dirty
+                                      * correctness backstop. (b) is moot now (dirty-tracking bugs long
+                                      * fixed; do_frame gate + peek_miss are the real net). (a) is
+                                      * covered by the OVERFLOW trigger (incr_rev_overflow rebuilds when
+                                      * the 40000-pair pool fills) — i.e. rebuild becomes NEED-based, not
+                                      * time-based. The force-collect (every 60, KEPT) still pre-fetches.
+                                      * TO FULLY DISABLE the periodic: set this huge (e.g. 0xFFFFFFFF) —
+                                      * remap (evict/defrag) + overflow rebuilds still fire. A/B 600 vs
+                                      * 60 first; if the steady cwk stays bounded (overflow not thrashing)
+                                      * and df/s p10 rises with no false-unlocks, then disable. */
 static volatile bool g_incr_collect_active = true;   /* A/B master toggle */
 static uint16_t *incr_rev_head = NULL;               /* [RA_MAX_WATCH_ADDRS]; 0xFFFF=empty */
 struct incr_rev_node { void* chain; uint16_t next; };
@@ -3738,6 +3794,26 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             send_esp_header_response_4pad(&resp);
             break;
         }
+
+        case RA_CMD_RESET_CREDENTIALS: {
+            // WiiFlow asks us to forget the stored WiFi + RA credentials and
+            // reboot into the config portal (replaces the nes-ra-adapter's
+            // physical memory-card reset button). We can't safely erase NVS +
+            // restart from inside the EXI servicer, so just ACK and arm the
+            // flag — loop() performs the wipe + ESP.restart() on Core 1. The
+            // ACK is best-effort: by the time the Wii reads, we may already be
+            // rebooting, which is fine — the Wii side doesn't depend on it.
+            LOG_INFO("DEBUG=EXI: RESET_CREDENTIALS requested\r\n");
+            g_factory_reset_pending = true;
+            ra_esp_header_t resp;
+            resp.magic = RA_MAGIC_ESP_TO_GC;
+            resp.status = (uint8_t)state;
+            resp.event_type = RA_EVT_NONE;
+            resp.event_count = 0;
+            resp.data_len = 0;
+            send_esp_header_response_4pad(&resp);
+            break;
+        }
     }
 }
 
@@ -4130,6 +4206,39 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         }
     }
 
+#ifdef RC_SHADOW_VALUES
+    /* Shadow-array arena: compact PSRAM {value,prior,changed} so the eval reads memref
+     * values densely instead of strided 56-byte structs (MEMBENCH: 13.7x cheaper read;
+     * the lever to crave 60 df/s at 80MHz). Sized to the exact memref count, re-allocated
+     * each game load. rc_shadow_set_arena resets the slot counter; rc_de_build_game (first
+     * do_frame) assigns the slots. Alloc fail -> arena NULL -> eval falls back to struct. */
+    {
+        static uint32_t* sv_value = NULL;
+        static uint32_t* sv_prior = NULL;
+        static uint8_t*  sv_changed = NULL;
+        uint32_t svc = rc_client_memref_count(client);
+        free(sv_value);   sv_value = NULL;
+        free(sv_prior);   sv_prior = NULL;
+        free(sv_changed); sv_changed = NULL;
+        if (svc > 0) {
+            sv_value   = (uint32_t*)ps_malloc((size_t)svc * sizeof(uint32_t));
+            sv_prior   = (uint32_t*)ps_malloc((size_t)svc * sizeof(uint32_t));
+            sv_changed = (uint8_t*)ps_malloc((size_t)svc);
+        }
+        if (sv_value && sv_prior && sv_changed) {
+            rc_shadow_set_arena(sv_value, sv_prior, sv_changed, svc);
+            LOG_DBG("DEBUG=shadow arena: %u memrefs, %u KB PSRAM\r\n",
+                    (unsigned)svc, (unsigned)(((size_t)svc * 9) / 1024));
+        } else {
+            free(sv_value); sv_value = NULL;
+            free(sv_prior); sv_prior = NULL;
+            free(sv_changed); sv_changed = NULL;
+            rc_shadow_set_arena(NULL, NULL, NULL, 0);   /* shadow off -> struct fallback */
+            LOG_ERR("ERROR=shadow arena alloc failed (%u memrefs) -> shadow disabled\r\n", (unsigned)svc);
+        }
+    }
+#endif
+
     const rc_client_game_t *game = rc_client_get_game_info(client);
     if (game) {
         gameName = String(game->title);
@@ -4407,6 +4516,9 @@ void processSnapshot() {
             g_rc_b1_skips = 0; g_rc_b2_skips = 0; g_rc_upd_resolves = 0;  /* per-frame */
 #ifdef RC_DIRTY_EVAL
             g_rc_de_skipped = 0; g_rc_de_evaled = 0;  /* per-frame skip% */
+#ifdef RC_CLEAN_REPLAY
+            g_rc_de_replayed = 0;  /* per-frame replay count */
+#endif
 #endif
             // disable the loop to pay for missing do_frame
             //for (uint32_t f = 0; f < run; f++) {
@@ -4463,13 +4575,18 @@ void processSnapshot() {
 #else
         unsigned long de_sk = 0, de_ev = 0;
 #endif
+#ifdef RC_CLEAN_REPLAY
+        unsigned long de_rp = (unsigned long)g_rc_de_replayed;  /* warm+clean replays (subset of de_ev) */
+#else
+        unsigned long de_rp = 0;
+#endif
         /* FRAME line has two forms, chosen at compile time by RA_LOG_LEVEL:
          *   level 1 (INFO)  = LEAN — the optimization outcomes (df/resolver):
          *                     seq ok sa ms cm cmr it df df_us upd_us evl_us de_sk de_ev
          *   level 2 (DEBUG) = FULL — every mechanism counter (skips/cache/parallel/EXI).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -4489,14 +4606,14 @@ void processSnapshot() {
                   (unsigned long)g_par_a_us,
                   (unsigned long)g_par_b_us,
                   (unsigned long)g_par_runs,
-                  de_sk, de_ev,
+                  de_sk, de_ev, de_rp,
                   (unsigned long)g_rc_b1_skips, (unsigned long)g_rc_b2_skips,
                   (unsigned long)g_rc_upd_resolves,
                   (unsigned long)g_rc_collect_skips, (unsigned long)g_rc_collect_walks,
                   (unsigned long)g_incr_rebuilds,
                   (unsigned)incr_rev_count, (int)incr_rev_overflow, (unsigned long)g_incr_marks);
 #else
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_sk=%lu de_ev=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_sk=%lu de_ev=%lu de_rp=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -4508,7 +4625,7 @@ void processSnapshot() {
                   (unsigned long)this_df_us,
                   (unsigned long)g_rc_update_us,
                   (unsigned long)g_rc_eval_us,
-                  de_sk, de_ev);
+                  de_sk, de_ev, de_rp);
 #endif
 #if RA_FLIGHT_RECORDER
         /* Bad frame (over budget / convergence spike)? Dump the ring = the
@@ -4541,7 +4658,14 @@ void processSnapshot() {
         if (df_now - last_df_log >= 5000) {
             uint32_t dt = df_now - last_df_log;
             uint32_t gf = frame_counter - g_df_prev_gameframe;
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu\r\n",
+            {
+#ifdef RC_SHADOW_VALUES
+            extern uint32_t g_rc_shadow_count; extern volatile int g_rc_shadow_enabled;
+            unsigned long sv_slots = (unsigned long)g_rc_shadow_count, sv_on = (unsigned long)g_rc_shadow_enabled;
+#else
+            unsigned long sv_slots = 0, sv_on = 0;
+#endif
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu sv=%lu/%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -4550,7 +4674,9 @@ void processSnapshot() {
                      (unsigned long)(g_df_n ? g_df_us / g_df_n : 0),
                      (unsigned long)(g_cm_n ? g_cm_us / g_cm_n : 0),
                      (unsigned long)g_cm_n,
-                     (unsigned long)g_cm_skipped);
+                     (unsigned long)g_cm_skipped,
+                     sv_slots, sv_on);
+            }
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
@@ -4665,6 +4791,56 @@ void taskCore1(void *pvParameters) {
 // ============================================================================
 static void exi_watchdog_task(void *arg);  // defined below loop(); fwd-decl for setup()
 
+#ifndef RA_MEMBENCH
+#define RA_MEMBENCH 1
+#endif
+#if RA_MEMBENCH
+/* Decisive pre-surgery probe for the shadow-array (memref->value -> SRAM) lever.
+ * Measures, on the real S3 @80MHz, the read cost the eval pays vs the shadow target,
+ * with NO rcheevos changes. Three patterns over ~SMG memref count:
+ *   strided_psram = read one u32 out of every 56-byte slot (= the eval reading
+ *                   ->value.value from rc_modified_memref_t structs; 56B stride busts
+ *                   the 64KB cache at N*56=149KB working set -> true PSRAM cost).
+ *   compact_psram = read from an 8-byte-packed array in PSRAM (N*8=21KB FITS cache
+ *                   -> shows if compactness alone, via cache residency, is the win).
+ *   compact_sram  = same packed array in INTERNAL SRAM (off the MSPI bus -> the
+ *                   shadow-array ideal; immune to the 80M bandwidth cut + cache pressure).
+ * If strided >> compact_sram the surgery pays (proportional to read volume). If
+ * compact_psram already ~= compact_sram, compactness suffices (less invasive: keep
+ * the shadow in PSRAM, no SRAM budget fight). If all three ~equal -> eval is CPU-bound,
+ * ABORT the surgery (would be another clean-replay). */
+static void ra_membench(void) {
+  const int N = 2666;       /* ~SMG distinct memref count */
+  const int STRIDE = 56;    /* ~sizeof(rc_modified_memref_t): the eval's read stride */
+  const int PASSES = 8;     /* ~reads-per-memref per do_frame (≈8000 reads / ~1336 distinct) */
+  uint8_t*  strided = (uint8_t*)heap_caps_malloc((size_t)N * STRIDE, MALLOC_CAP_SPIRAM);
+  uint32_t* cpsram  = (uint32_t*)heap_caps_malloc((size_t)N * 8, MALLOC_CAP_SPIRAM);
+  uint32_t* csram   = (uint32_t*)heap_caps_malloc((size_t)N * 8, MALLOC_CAP_INTERNAL);
+  if (!strided || !cpsram || !csram) {
+    ralog_printf("MEMBENCH alloc fail strided=%p cpsram=%p csram=%p\n",
+                 (void*)strided, (void*)cpsram, (void*)csram);
+    if (strided) heap_caps_free(strided);
+    if (cpsram) heap_caps_free(cpsram);
+    if (csram) heap_caps_free(csram);
+    return;
+  }
+  for (int i = 0; i < N; i++) { *(volatile uint32_t*)(strided + (size_t)i * STRIDE) = (uint32_t)i; cpsram[i*2] = i; csram[i*2] = i; }
+  volatile uint32_t sink = 0;
+  unsigned long t0, t1, t2, t3;
+  t0 = micros();
+  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += *(uint32_t*)(strided + (size_t)i * STRIDE);
+  t1 = micros();
+  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += cpsram[i*2];
+  t2 = micros();
+  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += csram[i*2];
+  t3 = micros();
+  ralog_printf("MEMBENCH N=%d passes=%d sink=%u | strided_psram=%luus compact_psram=%luus compact_sram=%luus\n",
+               N, PASSES, (unsigned)sink,
+               (unsigned long)(t1 - t0), (unsigned long)(t2 - t1), (unsigned long)(t3 - t2));
+  heap_caps_free(strided); heap_caps_free(cpsram); heap_caps_free(csram);
+}
+#endif
+
 void setup() {
     /* v0.24.3 — route big allocations to PSRAM. Field forensics showed
      * the INTERNAL heap collapsing to 2.6KB after game load (rcheevos
@@ -4736,6 +4912,11 @@ void setup() {
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
     ralog_printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
+
+#if RA_MEMBENCH
+    /* one-shot shadow-array feasibility probe (read-only; see ra_membench comment) */
+    ra_membench();
+#endif
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {
@@ -4830,6 +5011,7 @@ static void exi_watchdog_task(void *arg) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t s = g_servicer_ticks, w = g_worker_ticks, d = g_doframe_ticks;
+        if (!g_wdog_verbose) { ls = s; lw = w; ld = d; continue; }  /* silent unless chasing a hang */
         LOG_DBG("DEBUG=WDOG srv=+%lu(st=%u) wrk=+%lu df=+%lu\r\n",
                 (unsigned long)(s - ls), (unsigned)g_servicer_stage,
                 (unsigned long)(w - lw), (unsigned long)(d - ld));
@@ -4853,8 +5035,35 @@ static void exi_watchdog_task(void *arg) {
     }
 }
 
+/* Wipe stored WiFi + RetroAchievements credentials and reboot into the config
+ * portal. Triggered from WiiFlow via RA_CMD_RESET_CREDENTIALS — the software
+ * replacement for the nes-ra-adapter's physical memory-card reset button.
+ * Runs on Core 1 (loop task), NOT from the EXI servicer, so the NVS write +
+ * restart can't corrupt an in-flight SPI transaction. */
+static void do_factory_reset() {
+    LOG_INFO("DEBUG=Factory reset: wiping WiFi + RA credentials\r\n");
+    // 1. RA username/password + the "configured" flag live in our EEPROM blob.
+    //    Force-wipe rewrites the header and zeros the rest -> isConfigured()==0.
+    beginEEPROM(true);
+    // 2. WiFi SSID/password are stored by the WiFi stack. resetSettings() erases
+    //    them so the next boot falls back into the captive portal. Construct on
+    //    heap with debug off (the global ctor is Serial-noisy — see note above).
+    WiFiManager *wm = new WiFiManager();
+    wm->setDebugOutput(false);
+    wm->resetSettings();
+    LOG_INFO("DEBUG=Factory reset done — rebooting into 'WII_RA_ADAPTER' portal\r\n");
+    delay(300);   // let the Serial drain + the best-effort EXI ACK clock out
+    ESP.restart();
+}
+
 void loop() {
     g_doframe_ticks++;
+    // Service a pending credentials reset BEFORE anything that can block (the
+    // WiFi reconnect loop below spins forever if creds were just erased).
+    if (g_factory_reset_pending) {
+        g_factory_reset_pending = false;
+        do_factory_reset();   // does not return (ESP.restart())
+    }
     // Reconnect WiFi if needed
     if (WiFi.status() != WL_CONNECTED) {
         WiFi.begin();

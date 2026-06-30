@@ -82,6 +82,12 @@ extern "C" {
    * evl = condition evaluation (achievement loop). */
   extern volatile uint32_t g_rc_update_us;
   extern volatile uint32_t g_rc_eval_us;
+  /* v0.33 upd phase split: upd1=leaf peeks (free), upd2=chain resolves (the cost). */
+  extern volatile uint32_t g_rc_upd1_us;
+  extern volatile uint32_t g_rc_upd2_us;
+  /* v0.33 parallel upd Phase-2: uda=core-1 time, udb=core-0 worker time (0 = serial). */
+  extern volatile uint32_t g_upd_a_us;
+  extern volatile uint32_t g_upd_b_us;
   /* v0.29.1 — parallel-eval diag: a=core-1 half, b=core-0 worker half, runs=worker fires. */
   extern volatile uint32_t g_par_a_us;
   extern volatile uint32_t g_par_b_us;
@@ -549,7 +555,22 @@ extern "C" {
     extern volatile unsigned long g_rc_collect_skips, g_rc_collect_walks;
     void rc_modified_memref_mark_dirty(void* chain);
     void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs);
+#ifdef RC_EVAL_PLAN
+    /* eval HOT/COLD split (RC_EVAL_PLAN): point the hot-array alloc at PSRAM so the
+     * compact 16B-per-condition arrays don't consume internal RAM (project_compiled_eval).
+     * Guarded: the symbol only exists in condset.c under RC_EVAL_PLAN, so an OFF build
+     * (flag commented for A/B) must not reference it or the link fails. */
+    extern void* (*g_rc_eval_hot_alloc)(size_t);
+#endif
 }
+
+#ifdef RC_EVAL_PLAN
+/* PSRAM allocator for the rcheevos eval-hot arrays (g_rc_eval_hot_alloc hook). A NULL
+ * return is handled gracefully by rc_build_eval_hot (falls back to the cold rc_condition_t). */
+extern "C" void* rc_eval_hot_psram_alloc(size_t n) {
+    return heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
+}
+#endif
 /* Deadlock locator (project_exi_robust_handshake): a Core-0 watchdog dumps these
  * each second. Whichever STOPS advancing during the galaxy convergence is the
  * task that hung; g_servicer_stage says where in the servicer it stalled. */
@@ -1313,7 +1334,38 @@ static void ledCelebrateTask(void *arg) {
 }
 
 static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
-    LOG_DBG("DEBUG=event: %d\r\n", event->type);
+    /* Diagnostic logging: name the event and, for the achievement-bearing ones,
+     * print id + title + measured progress so a flickering CHALLENGE indicator can be
+     * told apart (same ach SHOWing repeatedly w/o a HIDE = is_primed oscillating) from
+     * normal multi-achievement priming (different ach ids). net_shown = running
+     * (SHOW - HIDE) tally: it should hover at the count of currently-primed achievements;
+     * if it drifts unbounded up (or negative) the SHOW/HIDE events are imbalanced. */
+    const rc_client_achievement_t *a = event->achievement;
+    switch (event->type) {
+        case RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_SHOW:
+        case RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_HIDE: {
+            static int net_shown = 0;
+            int show = (event->type == RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_SHOW);
+            net_shown += show ? 1 : -1;
+            LOG_DBG("DEBUG=event: CHALLENGE_%s ach=%lu \"%s\" prog=%s net_shown=%d\r\n",
+                    show ? "SHOW" : "HIDE",
+                    a ? (unsigned long)a->id : 0UL, a ? a->title : "?",
+                    (a && a->measured_progress[0]) ? a->measured_progress : "-", net_shown);
+            break;
+        }
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_SHOW:
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_HIDE:
+        case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_UPDATE:
+            LOG_DBG("DEBUG=event: PROGRESS_%lu ach=%lu \"%s\" prog=%s pct=%d\r\n",
+                    (unsigned long)event->type,
+                    a ? (unsigned long)a->id : 0UL, a ? a->title : "?",
+                    (a && a->measured_progress[0]) ? a->measured_progress : "-",
+                    a ? (int)a->measured_percent : 0);
+            break;
+        default:
+            LOG_DBG("DEBUG=event: %d\r\n", event->type);
+            break;
+    }
     switch (event->type) {
         case RC_CLIENT_EVENT_ACHIEVEMENT_TRIGGERED: {
             /* v0.26.3 warm-up: triggers fired against boot-storm garbage
@@ -2693,20 +2745,19 @@ static volatile bool g_diag_dry_update = false;  /* OFF for the servicer build �
  * recorded). ~2000 chains x ~3 levels x ~4 bytes ~= 24k worst case. Generous so
  * the steady state never overflow-churns; overflow just forces a safe rebuild. */
 #define INCR_REV_POOL_MAX 40000      /* (watch_index,chain) pair capacity */
-#define INCR_REBUILD_EVERY 600       /* TIME-BASED full rebuild cadence (vblanks). 2026-06-29: 60->600
-                                      * (step toward DISABLING the periodic entirely). The every-60
-                                      * rebuild does mark_all_dirty -> the collect then walks ALL ~1552
-                                      * chains = the periodic ~30ms apc spike (the mk=0/cwk=1552 frames).
-                                      * It was only (a) a staleness backstop and (b) a missed-dirty
-                                      * correctness backstop. (b) is moot now (dirty-tracking bugs long
-                                      * fixed; do_frame gate + peek_miss are the real net). (a) is
-                                      * covered by the OVERFLOW trigger (incr_rev_overflow rebuilds when
-                                      * the 40000-pair pool fills) — i.e. rebuild becomes NEED-based, not
-                                      * time-based. The force-collect (every 60, KEPT) still pre-fetches.
-                                      * TO FULLY DISABLE the periodic: set this huge (e.g. 0xFFFFFFFF) —
-                                      * remap (evict/defrag) + overflow rebuilds still fire. A/B 600 vs
-                                      * 60 first; if the steady cwk stays bounded (overflow not thrashing)
-                                      * and df/s p10 rises with no false-unlocks, then disable. */
+#define INCR_REBUILD_EVERY 0         /* TIME-BASED periodic rebuild cadence (vblanks); 0 = DISABLED.
+                                      * 2026-06-29: 60 -> 600 -> 0 (disabled). The every-N rebuild does
+                                      * mark_all_dirty -> the collect then walks ALL ~1552 chains = the
+                                      * periodic ~30ms apc spike (mk=0/cwk=1552 frames). It was only a
+                                      * staleness backstop + a missed-dirty correctness backstop; the
+                                      * latter is moot (dirty-tracking bugs long fixed; do_frame gate +
+                                      * peek_miss are the real net), and the former is now NEED-based via
+                                      * the OVERFLOW trigger (rebuild when the 40000-pair pool fills).
+                                      * A/B at 600 confirmed staleness stays bounded (overflow 5->4, no
+                                      * thrash) so the time-based periodic is removed. remap (evict/
+                                      * defrag) + overflow rebuilds still fire. NOTE: collect is NOT the
+                                      * df/s gate (proven: cutting walks 28% didn't move df/s) — this is
+                                      * EXI-task hygiene, not a df/s win; the df/s lever is do_frame work. */
 static volatile bool g_incr_collect_active = true;   /* A/B master toggle */
 static uint16_t *incr_rev_head = NULL;               /* [RA_MAX_WATCH_ADDRS]; 0xFFFF=empty */
 struct incr_rev_node { void* chain; uint16_t next; };
@@ -2753,7 +2804,7 @@ static void incr_mark_dirty(uint16_t count) {
     if (!memrefs) return;
 
     bool remapped   = g_incr_remapped; g_incr_remapped = false;  /* evict/defrag/init, NOT append */
-    bool periodic   = (++g_incr_since_rebuild >= INCR_REBUILD_EVERY);
+    bool periodic   = (INCR_REBUILD_EVERY != 0) && (++g_incr_since_rebuild >= INCR_REBUILD_EVERY);
     if (remapped || periodic || incr_rev_overflow) {
         /* FULL REBUILD: reset the index, dirty every chain (they all walk this
          * vblank, repopulating the index from scratch). Only on a true remap now
@@ -4299,6 +4350,9 @@ void loadGame(const char *hash) {
 
     g_client = rc_client_create(read_memory_nop, server_call);
     g_rc_leaf_unchanged = rc_leaf_unchanged_impl;   /* opt B2 INDIRECT-skip hook */
+#ifdef RC_EVAL_PLAN
+    g_rc_eval_hot_alloc = rc_eval_hot_psram_alloc;  /* RC_EVAL_PLAN hot arrays -> PSRAM */
+#endif
     /* opt: reverse-hash incremental collect. Register the reverse-index builder;
      * the resolver skip is enabled later by incr_mark_dirty's first successful
      * marking pass (NOT here — see the note there; enabling before the pool is
@@ -4586,7 +4640,7 @@ void processSnapshot() {
          *   level 2 (DEBUG) = FULL — every mechanism counter (skips/cache/parallel/EXI).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -4601,6 +4655,10 @@ void processSnapshot() {
                   df_ran,   /* v0.32: 1=evaluated, 0=deferred (cache not primed) */
                   (unsigned long)this_df_us,
                   (unsigned long)g_rc_update_us,
+                  (unsigned long)g_rc_upd1_us,
+                  (unsigned long)g_rc_upd2_us,
+                  (unsigned long)g_upd_a_us,
+                  (unsigned long)g_upd_b_us,
                   (unsigned long)g_rc_eval_us,
                   (unsigned long)g_cycle_us,
                   (unsigned long)g_par_a_us,

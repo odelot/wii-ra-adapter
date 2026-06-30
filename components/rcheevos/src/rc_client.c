@@ -27,6 +27,11 @@
 #include "esp_timer.h"
 volatile uint32_t g_rc_update_us = 0;
 volatile uint32_t g_rc_eval_us = 0;
+/* v0.33 upd phase split: upd1 = leaf memref peeks (static addresses, INDEPENDENT ->
+ * the parallelization target); upd2 = modified_memref pointer-chain resolves (have
+ * dependencies + already incr-skipped). Confirms which phase to parallelize. */
+volatile uint32_t g_rc_upd1_us = 0;
+volatile uint32_t g_rc_upd2_us = 0;
 
 /* v0.29.0 — parallel achievement evaluation across both ESP32-S3 cores. */
 #include "freertos/FreeRTOS.h"
@@ -39,6 +44,13 @@ volatile uint32_t g_rc_eval_us = 0;
 volatile uint32_t g_par_a_us = 0;
 volatile uint32_t g_par_b_us = 0;
 volatile uint32_t g_par_runs = 0;
+
+/* v0.33 — parallel upd Phase 2 (modified_memref chain resolves split by dependency
+ * depth across both cores). Always-defined so the FRAME log can read them regardless
+ * of RC_PARALLEL_UPD; uda/udb = the two cores' Phase-2 time (0 when serial). */
+volatile int g_par_upd_enabled = 1;        /* runtime A/B toggle */
+volatile uint32_t g_upd_a_us = 0;          /* core-1 (do_frame) Phase-2 time */
+volatile uint32_t g_upd_b_us = 0;          /* core-0 worker Phase-2 time (summed over depths) */
 
 #define RC_CLIENT_UNKNOWN_GAME_ID (uint32_t)-1
 #define RC_CLIENT_RECENT_UNLOCK_DELAY_SECONDS (10 * 60) /* ten minutes */
@@ -5792,11 +5804,17 @@ int rc_client_is_processing_required(rc_client_t* client)
   return (client->game->runtime.richpresence && client->game->runtime.richpresence->richpresence);
 }
 
+/* Resolve all modified_memref pointer chains (do_frame upd Phase 2). Serial (list
+ * order) by default; parallel-by-depth under RC_PARALLEL_UPD. Defined after the
+ * shared work-stealing infra it reuses. */
+static void rc_upd_run(rc_client_t* client, rc_memrefs_t* memrefs, int incr);
+
 static void rc_client_update_memref_values(rc_client_t* client) {
   rc_memrefs_t* memrefs = client->game->runtime.memrefs;
   rc_memref_list_t* memref_list;
   rc_modified_memref_list_t* modified_memref_list;
   int invalidated_memref = 0;
+  int64_t _u0 = esp_timer_get_time();
 
   memref_list = &memrefs->memrefs;
   do {
@@ -5829,38 +5847,25 @@ static void rc_client_update_memref_values(rc_client_t* client) {
   } while (memref_list);
 
   client->state.processing_memref = NULL;
+  { int64_t _u1 = esp_timer_get_time(); g_rc_upd1_us = (uint32_t)(_u1 - _u0); }
 
   modified_memref_list = &memrefs->modified_memrefs;
   if (modified_memref_list->count) {
-#ifdef RC_INCREMENTAL_UPD
     /* opt B: skip re-resolving chains whose value provably didn't change. Only
-     * after the first full pass warms every chain (incr_warmed in the head
-     * memref list's padding). THIS is the live do_frame update path (1330
-     * modified_memrefs) — the generic rc_update_memref_values is NOT used here. */
-    const int incr = memrefs->memrefs.incr_warmed;
-#endif
-    do {
-      rc_modified_memref_t* modified_memref = modified_memref_list->items;
-      const rc_modified_memref_t* modified_memref_stop = modified_memref + modified_memref_list->count;
-
-      for (; modified_memref < modified_memref_stop; ++modified_memref) {
+     * after the first full pass warms every chain (incr_warmed in the head memref
+     * list's padding). rc_upd_run dispatches the chain resolves either serially (list
+     * order = topological) or, under RC_PARALLEL_UPD, split across both cores by
+     * dependency depth (independent within a depth, barrier between depths). */
+    int incr = 0;
 #ifdef RC_INCREMENTAL_UPD
-        if (rc_modified_memref_can_skip(modified_memref, incr))
-          continue;
-        ++g_rc_upd_resolves;
+    incr = memrefs->memrefs.incr_warmed;
 #endif
-        rc_update_memref_value(&modified_memref->memref.value, rc_get_modified_memref_value(modified_memref, client->state.legacy_peek, client));
-#ifdef RC_SHADOW_VALUES
-        rc_shadow_mirror(&modified_memref->memref);
-#endif
-      }
-
-      modified_memref_list = modified_memref_list->next;
-    } while (modified_memref_list);
+    rc_upd_run(client, memrefs, incr);
   }
 #ifdef RC_INCREMENTAL_UPD
   memrefs->memrefs.incr_warmed = 1;
 #endif
+  { int64_t _u2 = esp_timer_get_time(); g_rc_upd2_us = (uint32_t)(_u2 - _u0) - g_rc_upd1_us; }
 
   if (invalidated_memref)
     rc_client_update_active_achievements(client->game);
@@ -6122,7 +6127,37 @@ static void rc_client_eval_achievement_range(rc_client_t* client,
   }
 }
 
+/* Resolve ONE modified_memref (the shared do_frame upd Phase-2 body — identical logic
+ * for serial and parallel so they can't diverge). Writes only mm->memref.value (disjoint
+ * per chain) + the relaxed diagnostic skip counters. The B2 leaf-unchanged hook is
+ * read-only and g_rc_chain_read_cb does NOT fire here (g_rc_incr_chain==0 outside the
+ * collect walk), so concurrent calls on DISJOINT chains are race-free. */
+static void rc_upd_resolve_one(rc_client_t* client, rc_modified_memref_t* mm, int incr) {
+#ifdef RC_INCREMENTAL_UPD
+  if (rc_modified_memref_can_skip(mm, incr))
+    return;
+  ++g_rc_upd_resolves;
+#else
+  (void)incr;
+#endif
+  rc_update_memref_value(&mm->memref.value, rc_get_modified_memref_value(mm, client->state.legacy_peek, client));
+#ifdef RC_SHADOW_VALUES
+  rc_shadow_mirror(&mm->memref);
+#endif
+}
+
 #if RC_PARALLEL_EVAL
+/* Worker job kind: 0 = eval achievements (the v0.29 path), 1 = upd Phase-2 chain range. */
+static volatile int g_par_kind = 0;
+#ifdef RC_PARALLEL_UPD
+static struct {
+  rc_client_t* client;
+  rc_modified_memref_t** items;   /* one dependency-depth bucket */
+  uint32_t n;
+  int incr;
+} g_upd_job;
+#endif
+
 /* Core-0 worker: blocks on g_par_start, evaluates the assigned range, signals
  * g_par_done. One persistent task, created lazily on first use. The do_frame
  * thread holds client->state.mutex and is blocked on g_par_done while this
@@ -6148,6 +6183,25 @@ static void rc_par_worker(void* arg) {
     rc_client_achievement_info_t* base;
     xSemaphoreTake(g_par_start, portMAX_DELAY);
     _b0 = esp_timer_get_time();
+#ifdef RC_PARALLEL_UPD
+    if (g_par_kind == 1) {
+      /* upd Phase-2 Pass A: work-steal chunks of the INDEPENDENT chain list (neither
+       * operand is a chain -> disjoint writes, no cross-chain deps). Pass B (dependent
+       * chains) runs serially on the do_frame core after the barrier. */
+      rc_client_t* ucl = g_upd_job.client;
+      rc_modified_memref_t** items = g_upd_job.items;
+      uint32_t un = g_upd_job.n;
+      int uincr = g_upd_job.incr;
+      while ((c = (uint32_t)__atomic_fetch_add(&g_par_next, RC_PAR_CHUNK, __ATOMIC_RELAXED)) < un) {
+        uint32_t end = c + RC_PAR_CHUNK; if (end > un) end = un;
+        for (; c < end; ++c) rc_upd_resolve_one(ucl, items[c], uincr);
+      }
+      g_upd_b_us += (uint32_t)(esp_timer_get_time() - _b0);
+      ++g_par_runs;
+      xSemaphoreGive(g_par_done);
+      continue;
+    }
+#endif
     memset(&g_par_job.result, 0, sizeof(g_par_job.result));
     client = g_par_job.client; base = g_par_job.base; n = g_par_job.n;
     /* Work-stealing: pull chunks until exhausted. The faster (less-interrupted)
@@ -6177,7 +6231,139 @@ static int rc_par_init(void) {
   }
   return 1;
 }
+
+#ifdef RC_PARALLEL_UPD
+#define RC_PAR_MIN_UPD 24      /* below this Pass A runs on the calling core (no handshake) */
+/* Two lists, built once per game (cache key = memrefs ptr):
+ *  - indep: chains with NEITHER operand a modified_memref -> both inputs come from the
+ *    free Phase-1 leaf update / constants, so they are independent of every other chain
+ *    and of each other -> resolved IN PARALLEL (Pass A).
+ *  - dep: every other chain (parent OR modifier is a chain), kept in LIST ORDER, which is
+ *    topological for BOTH operands -> resolved SERIALLY after Pass A's barrier (Pass B).
+ * NOTE: the rcheevos `depth` field counts PARENT levels only and ignores the modifier, so
+ * it can't be used to bucket safely; the operand-type test below is exact. */
+static rc_modified_memref_t** g_upd_indep = NULL;
+static uint32_t g_upd_indep_n = 0;
+static rc_modified_memref_t** g_upd_dep = NULL;
+static uint32_t g_upd_dep_n = 0;
+static const rc_memrefs_t* g_upd_built_for = NULL;
+static int g_upd_buckets_ok = 0;
+
+static int rc_upd_operand_is_chain(const rc_operand_t* op) {
+  return rc_operand_is_memref(op) &&
+         op->value.memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF;
+}
+static int rc_upd_is_independent(const rc_modified_memref_t* m) {
+  return !rc_upd_operand_is_chain(&m->parent) && !rc_upd_operand_is_chain(&m->modifier);
+}
+
+/* One-time per game; single-threaded. Leaves g_upd_buckets_ok=0 on any failure so
+ * rc_upd_run falls back to the serial list-order resolve. */
+static void rc_upd_build_buckets(rc_memrefs_t* memrefs) {
+  rc_modified_memref_list_t* l;
+  uint32_t indep = 0, dep = 0, ci = 0, cd = 0;
+
+  if (g_upd_indep) { free(g_upd_indep); g_upd_indep = NULL; }
+  if (g_upd_dep)   { free(g_upd_dep);   g_upd_dep   = NULL; }
+  g_upd_indep_n = g_upd_dep_n = 0;
+  g_upd_buckets_ok = 0;
+  g_upd_built_for = memrefs;   /* mark attempted so a failure doesn't retry every frame */
+
+  for (l = &memrefs->modified_memrefs; l; l = l->next) {
+    rc_modified_memref_t* m = l->items;
+    rc_modified_memref_t* e = m + l->count;
+    for (; m < e; ++m) { if (rc_upd_is_independent(m)) ++indep; else ++dep; }
+  }
+  if (indep + dep == 0)
+    return;
+
+  if (indep) {
+    g_upd_indep = (rc_modified_memref_t**)malloc((size_t)indep * sizeof(rc_modified_memref_t*));
+    if (!g_upd_indep) return;
+  }
+  if (dep) {
+    g_upd_dep = (rc_modified_memref_t**)malloc((size_t)dep * sizeof(rc_modified_memref_t*));
+    if (!g_upd_dep) { if (g_upd_indep) { free(g_upd_indep); g_upd_indep = NULL; } return; }
+  }
+
+  for (l = &memrefs->modified_memrefs; l; l = l->next) {
+    rc_modified_memref_t* m = l->items;
+    rc_modified_memref_t* e = m + l->count;
+    for (; m < e; ++m) {
+      if (rc_upd_is_independent(m)) g_upd_indep[ci++] = m;
+      else                         g_upd_dep[cd++]   = m;
+    }
+  }
+
+  g_upd_indep_n = indep;
+  g_upd_dep_n = dep;
+  g_upd_buckets_ok = 1;
+}
+
+/* Pass A (independent chains) split across both cores; Pass B (dependent chains) serial
+ * in list order after the barrier. */
+static void rc_upd_parallel(rc_client_t* client, int incr) {
+  int64_t a0 = esp_timer_get_time();
+  uint32_t n = g_upd_indep_n;
+  uint32_t i;
+  g_upd_b_us = 0;
+
+  if (n >= RC_PAR_MIN_UPD) {
+    g_upd_job.client = client;
+    g_upd_job.items  = g_upd_indep;
+    g_upd_job.n      = n;
+    g_upd_job.incr   = incr;
+    g_par_kind = 1;
+    __atomic_store_n(&g_par_next, 0, __ATOMIC_RELAXED);
+    xSemaphoreGive(g_par_start);
+    {
+      uint32_t c;
+      while ((c = (uint32_t)__atomic_fetch_add(&g_par_next, RC_PAR_CHUNK, __ATOMIC_RELAXED)) < n) {
+        uint32_t end = c + RC_PAR_CHUNK; if (end > n) end = n;
+        for (; c < end; ++c) rc_upd_resolve_one(client, g_upd_indep[c], incr);
+      }
+    }
+    xSemaphoreTake(g_par_done, portMAX_DELAY);   /* barrier: Pass A fully resolved */
+  }
+  else {
+    for (i = 0; i < n; ++i) rc_upd_resolve_one(client, g_upd_indep[i], incr);
+  }
+
+  for (i = 0; i < g_upd_dep_n; ++i)
+    rc_upd_resolve_one(client, g_upd_dep[i], incr);
+
+  g_upd_a_us = (uint32_t)(esp_timer_get_time() - a0);
+}
+#endif /* RC_PARALLEL_UPD */
+#endif /* RC_PARALLEL_EVAL */
+
+/* Serial Phase 2 (list order = topological): the original behavior + the default/fallback. */
+static void rc_upd_serial(rc_client_t* client, rc_memrefs_t* memrefs, int incr) {
+  rc_modified_memref_list_t* l = &memrefs->modified_memrefs;
+  int64_t a0 = esp_timer_get_time();
+  do {
+    rc_modified_memref_t* m = l->items;
+    const rc_modified_memref_t* e = m + l->count;
+    for (; m < e; ++m) rc_upd_resolve_one(client, m, incr);
+    l = l->next;
+  } while (l);
+  g_upd_a_us = (uint32_t)(esp_timer_get_time() - a0);
+  g_upd_b_us = 0;
+}
+
+static void rc_upd_run(rc_client_t* client, rc_memrefs_t* memrefs, int incr) {
+#if RC_PARALLEL_EVAL && defined(RC_PARALLEL_UPD)
+  if (g_par_upd_enabled && rc_par_init()) {
+    if (g_upd_built_for != memrefs)
+      rc_upd_build_buckets(memrefs);
+    if (g_upd_buckets_ok) {
+      rc_upd_parallel(client, incr);
+      return;
+    }
+  }
 #endif
+  rc_upd_serial(client, memrefs, incr);
+}
 
 static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_client_subset_info_t* subset)
 {
@@ -6203,6 +6389,7 @@ static void rc_client_do_frame_process_achievements(rc_client_t* client, rc_clie
     g_par_job.client = client;
     g_par_job.base   = base;
     g_par_job.n      = n;
+    g_par_kind = 0;   /* eval job (the upd Phase-2 passes set this to 1) */
     __atomic_store_n(&g_par_next, 0, __ATOMIC_RELAXED);
     xSemaphoreGive(g_par_start);
 

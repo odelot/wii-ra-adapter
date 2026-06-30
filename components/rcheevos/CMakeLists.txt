@@ -20,6 +20,14 @@ idf_component_register(
 #                 e.g. rc_validate.c passes uint32_t* where unsigned* is wanted
 #                 (same width on xtensa but a distinct type). -fpermissive
 #                 downgrades those C permerrors back to (then-silenced) warnings.
+# -O2 -DNDEBUG TESTED 2026-06-29 -> NO benefit, reverted. Controlled same-scene compare
+# (bunny convergence, per-trigger evl/de_ev): -Os 89 us/trig vs -O2 -DNDEBUG 92 us/trig =
+# equal within noise; df_us p50 18336 vs 17858 = unchanged. The do_frame is PSRAM-memory-
+# latency-bound, NOT compute-bound (same reason eval_plan + shadow-array gave 0) -> faster
+# code / dropped asserts don't reduce the PSRAM wait. The earlier "evl -50%" read was a
+# SCENE artifact (calm-heavy complete log vs convergence-only bunny log). The lever that
+# DID work (step 2, RC_COMPACT_OPERAND) cut BYTES/cache-lines, not compute. Keeping -Os +
+# asserts (the known-good baseline). To A/B -O2 rigorously: same scene, per-trigger metric.
 target_compile_options(${COMPONENT_LIB} PRIVATE -w -fpermissive)
 
 # Dirty/incremental eval: skip cold+clean triggers in rc_client's do_frame eval
@@ -101,3 +109,37 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_INCREMENTAL_COLLECT)
 # is backstopped by the do_frame gate + peek_miss net (deferred frame, never false unlock).
 # Device-only (incr-collect not in upstream/host). Comment to A/B. See project_convergence_analysis.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_POINTER_AWARE_DIRTY)
+
+# Eval HOT/COLD split (eval-read rewrite, steps A-E, project_compiled_eval): a compact
+# 16B-per-condition rc_eval_hot_t array (op1/op2/current_hits + type/oper/cmp/flags),
+# built once per condset, that rc_test_condition + the condset evaluators stream in the
+# common (optimized_comparator) path instead of the 32B rc_condition_t. The COLD fields
+# (operand metadata, required_hits value, next, transformed/non-optimized operands) stay
+# in rc_condition_t for the rare paths. Host-validated 2308/2314 (-DRC_EVAL_PLAN
+# -DRC_COMPACT_OPERAND -DRC_EVAL_PLAN_HOST_SYNC; only the 5 FP-storage + user_agent fails).
+# Do NOT define RC_EVAL_PLAN_HOST_SYNC on device: that per-frame hot->cold mirror is host-
+# only (it re-touches the 32B cold struct, negating the win) and exists so the host tests /
+# serialization can read the cold struct. On device current_hits/is_true live canonically in
+# hot; rc_reset_condset resets hot too. Hot arrays go to PSRAM iff main sets g_rc_eval_hot_alloc
+# (else libc malloc; a NULL/failed alloc falls back to the cold path, still correct).
+# Comment out to A/B the eval-compaction gain. Expected: evl ~-50% of its streaming portion.
+#target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_EVAL_PLAN)
+
+# Parallel upd Phase 2 (v0.33): the do_frame memref UPDATE splits into upd1 (leaf peeks,
+# ~free) and upd2 (modified_memref pointer-chain resolves = ~100% of upd, ~5.3ms). This
+# splits upd2 across both cores BY DEPENDENCY DEPTH: chains are bucketed by their `depth`
+# field (0 = parent is a leaf resolved in the free Phase 1; N = parent is a depth-(N-1)
+# chain), each depth is work-stolen across the 2 cores (reusing the v0.29 eval worker),
+# with a barrier between depths so a chain's parent is always resolved first. SAFE: each
+# chain writes only its own value (disjoint), the B2 leaf-unchanged hook is read-only, and
+# g_rc_chain_read_cb does NOT fire during upd (g_rc_incr_chain==0 outside collect). Runtime
+# A/B via g_par_upd_enabled; uda/udb in the FRAME log show the 2-core balance. Falls back to
+# the serial list-order resolve if buckets can't build (alloc fail / depth>=16). Comment to
+# A/B. Expected: upd2 ~5.3->~2.7ms -> df_us p50 ~17.9->~15.3ms -> steady 60. RC_PARALLEL_EVAL
+# must be on (it is by default). See project_optimization_backlog / the upd-parallel work.
+# HW RESULT 2026-06-29 (wii-coelho2.log vs wii-coelho.log): NET NEGATIVE, reverted. Only
+# ~15% of upd2 is independent (Pass A); 84% are dependency-bound deep pointer chains (Pass
+# B, serial). Pass A (~1.7ms) is too small to amortize the Core-0 worker-wake latency (Core
+# 0 is busy with WiFi/lwIP), so the per-frame barrier made df/s p50 50->48 and upd2 didn't
+# drop. Code + uda/udb instrumentation kept for reference; flag OFF.
+#target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_PARALLEL_UPD)

@@ -286,6 +286,14 @@ struct rc_condset_t {
   uint8_t has_pause; /* DEPRECATED - just check num_pause_conditions != 0 */
   /* True if the set is currently paused. */
   uint8_t is_paused;
+
+#ifdef RC_EVAL_PLAN
+  /* Compact 16B-per-condition HOT array parallel to the trailing conditions[]
+   * (built lazily on first eval). The eval streams this instead of the 32B
+   * rc_condition_t in the common path (~50% less). NULL until built / if alloc fails
+   * (then the eval falls back to the cold rc_condition_t). See rc_eval_hot_t. */
+  struct rc_eval_hot_t* hot;
+#endif
 };
 
 /*****************************************************************************\

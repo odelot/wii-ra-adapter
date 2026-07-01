@@ -66,6 +66,21 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_CLEAN_REPLAY)
 # eval IS memory-bound on condition streaming (~35% of evl). Plan/state compaction justified.
 # target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_COND_BLOAT)
 
+# DIAGNOSTIC (2026-06-30): the SECOND eval memory stream. RC_COND_BLOAT measured the
+# condition-struct stream (~35% of evl). This ~2x's rc_memref_t (16->32B) to measure the
+# memref-VALUE stream the eval reads per operand. Build once WITH, compare evl_us in
+# CATCHUP: Δevl ≈ the memref-value read % of eval. (upd_us ALSO rises — modified_memrefs
+# embed rc_memref_t — but Δevl still cleanly isolates the eval side; read evl only.)
+# Purpose: the 120M result showed eval is memory-bound but MULTI-STREAM (cond+values), so
+# single compactions (plan, shadow) each gave 0 by Amdahl. This finds if the value stream
+# is big enough that cutting cond+values TOGETHER could pay at 80M. See project_compiled_eval.
+# RESULT 2026-06-30: BLOAT added +0.7% to evl (FLAT) while upd2 rose +9% (positive control:
+# the struct IS bigger, upd feels it, eval doesn't). => the memref-VALUE stream is ~0% of eval,
+# because RC_CLEAN_REPLAY already skips operand reads on clean frames. So there is NO second
+# stream to cut -> plan+shadow combined is DEAD; eval = ~35% cond-struct (step 2 captured it) +
+# ~65% compute (irreducible). Eval EXHAUSTED at 80M. See project_compiled_eval.
+# target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_MEMREF_BLOAT)
+
 # Compact operand (step 2 of the eval compaction): FP-const storage double->float, shrinking
 # rc_operand_t 16->8B => rc_condition_t 48->32B (-33% eval streaming) AND rc_modified_memref_t
 # 56->36B (-36% upd streaming). EVAL-SAFE (host: only 5 FP parse-storage asserts diverge, eval

@@ -86,6 +86,12 @@ struct rc_memref_t {
   /* The memory address of this variable. */
   uint32_t address;
 
+#ifdef RC_MEMREF_BLOAT
+  /* DIAGNOSTIC: inert padding, 16->32B (8-aligned, allocator-safe). Doubles the
+   * memref-VALUE stream the eval reads per operand -> Δevl isolates that stream.
+   * See CMake RC_MEMREF_BLOAT + project_compiled_eval. */
+  uint8_t _bloat_diag[16];
+#endif
 #ifdef RC_SHADOW_VALUES
   /* write-side slot into the compact shadow value arrays (UPD already touches this
    * struct). 0xFFFF = unassigned. Padded so sizeof(rc_memref_t) stays a multiple of 8

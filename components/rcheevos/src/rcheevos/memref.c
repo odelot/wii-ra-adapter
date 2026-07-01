@@ -889,6 +889,14 @@ unsigned long g_rc_b1_skips = 0;
 unsigned long g_rc_b2_skips = 0;
 unsigned long g_rc_upd_resolves = 0;
 
+/* U1 leaf-widx cache hooks + state (see rc_internal.h). NULL/0 default = original
+ * B2 path (g_rc_leaf_unchanged) or no skip, so host builds are unaffected. */
+int  (*g_rc_u1_cached)(uint32_t idx) = 0;
+int  (*g_rc_u1_populate)(uint32_t idx, uint32_t address, uint32_t num_bytes) = 0;
+void (*g_rc_u1_invalidate)(uint32_t idx) = 0;
+volatile uint32_t g_rc_u1_cursor = 0;
+volatile int g_rc_u1_active = 0;
+
 /* size enum -> number of memory bytes the leaf read actually touches (the
  * SHARED size; sub-byte sizes share an 8-bit read). Conservative: a sub-byte
  * field whose containing byte changed re-resolves even if its nibble didn't. */
@@ -909,9 +917,23 @@ static uint32_t rc_indirect_num_bytes(uint8_t size) {
  * move per the adapter hook (B2). Clears .changed + bumps a counter on a skip.
  * Skip-with-changed=0 == resolving an unchanged value (prior/delta stay right). */
 int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr) {
-  if (!incr
-      || !rc_operand_value_stable(&mm->parent)
-      || !rc_operand_value_stable(&mm->modifier))
+  /* Dense chain index for the U1 cache: advanced once per modified_memref, in the
+   * serial walk order (stable per game). Only meaningful while g_rc_u1_active. */
+  uint32_t u1_idx = g_rc_u1_active ? g_rc_u1_cursor++ : 0;
+
+  /* Stability check runs EVERY frame, including warmup (!incr): if the pointer
+   * (parent) or modifier moved, the leaf address may change, so any cached widxs
+   * are stale -> invalidate now. Doing this unconditionally (not gated by incr)
+   * closes the hole where a warmup frame after a defer-rollback lets a moved
+   * pointer leave a stale entry that the next stable frame would skip on. */
+  if (!rc_operand_value_stable(&mm->parent)
+      || !rc_operand_value_stable(&mm->modifier)) {
+    if (g_rc_u1_active && g_rc_u1_invalidate)
+      g_rc_u1_invalidate(u1_idx);
+    return 0;
+  }
+
+  if (!incr)
     return 0;
 
   if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ) {
@@ -920,16 +942,38 @@ int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr) {
     return 1;
   }
 
-  if (g_rc_indirect_skip_enabled && g_rc_leaf_unchanged) {  /* B2 */
-    rc_typed_value_t a, m;
-    rc_evaluate_operand(&a, &mm->parent, NULL);
-    rc_evaluate_operand(&m, &mm->modifier, NULL);
-    rc_typed_value_add(&a, &m);
-    rc_typed_value_convert(&a, RC_VALUE_TYPE_UNSIGNED);
-    if (g_rc_leaf_unchanged(a.value.u32, rc_indirect_num_bytes(mm->memref.value.size))) {
-      mm->memref.value.changed = 0;
-      ++g_rc_b2_skips;
-      return 1;
+  if (g_rc_indirect_skip_enabled) {   /* B2 */
+    if (g_rc_u1_active && g_rc_u1_cached) {
+      /* U1 fast path: pointer is stable, so the cached widxs are still valid.
+       * Check them with NO operand eval. -1 = not cached -> compute the leaf
+       * address once and populate; the cache carries it on subsequent frames. */
+      int r = g_rc_u1_cached(u1_idx);
+      if (r < 0) {
+        rc_typed_value_t a, m;
+        rc_evaluate_operand(&a, &mm->parent, NULL);
+        rc_evaluate_operand(&m, &mm->modifier, NULL);
+        rc_typed_value_add(&a, &m);
+        rc_typed_value_convert(&a, RC_VALUE_TYPE_UNSIGNED);
+        r = g_rc_u1_populate(u1_idx, a.value.u32, rc_indirect_num_bytes(mm->memref.value.size));
+      }
+      if (r == 1) {                   /* leaf unchanged -> skip */
+        mm->memref.value.changed = 0;
+        ++g_rc_b2_skips;
+        return 1;
+      }
+      return 0;                       /* leaf moved -> resolve (cache stays valid) */
+    }
+    else if (g_rc_leaf_unchanged) {   /* original B2 (U1 off / parallel upd) */
+      rc_typed_value_t a, m;
+      rc_evaluate_operand(&a, &mm->parent, NULL);
+      rc_evaluate_operand(&m, &mm->modifier, NULL);
+      rc_typed_value_add(&a, &m);
+      rc_typed_value_convert(&a, RC_VALUE_TYPE_UNSIGNED);
+      if (g_rc_leaf_unchanged(a.value.u32, rc_indirect_num_bytes(mm->memref.value.size))) {
+        mm->memref.value.changed = 0;
+        ++g_rc_b2_skips;
+        return 1;
+      }
     }
   }
   return 0;
@@ -1167,6 +1211,17 @@ static uint8_t rc_memref_addr_bytes(uint8_t size) {
 void (*g_rc_chain_read_cb)(uint32_t address, uint8_t num_bytes, void* chain) = 0;
 volatile int g_rc_incr_collect_enabled = 0;
 volatile unsigned long g_rc_collect_skips = 0, g_rc_collect_walks = 0;  /* per-collect diag */
+/* lever B (project_collect_resolver_handoff): per-VBLANK chain-walk budget.
+ * 0 = unlimited (baseline). When >0, rc_memrefs_get_pending_addresses stops
+ * walking once g_rc_collect_walks reaches it, leaving the remaining dirty chains
+ * dirty so the NEXT vblank's collect resumes — spreading a mega-spike (a rebuild
+ * walking all ~1373 chains = ~42ms) across several frames. The adapter resets
+ * g_rc_collect_walks once per vblank, so this caps cumulative walks per vblank,
+ * not per call. Set from main.cpp. Correctness: a leaf left unresolved this
+ * vblank is carried by peek_miss + the v0.32 do_frame gate (deferred frame,
+ * never a false unlock). Normal collect (~40 walks) is well under any sane
+ * budget and runs identically to baseline. */
+volatile int g_rc_collect_walk_budget = 0;
 static void* g_rc_incr_chain = 0;
 
 void rc_modified_memref_mark_dirty(void* chain) {
@@ -1377,6 +1432,12 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
         ++g_rc_collect_skips;
         continue;
       }
+      /* lever B: per-vblank walk budget. Stop BEFORE starting another walk;
+       * this chain (and the rest of the dirty list) keep incr_clean as-is
+       * (dirty) so the next vblank resumes here. */
+      if (g_rc_collect_walk_budget &&
+          g_rc_collect_walks >= (unsigned long)g_rc_collect_walk_budget)
+        goto budget_done;
       ++g_rc_collect_walks;
       g_rc_incr_chain = (void*)mm;   /* attribute this walk's reads to this chain */
 #endif
@@ -1415,6 +1476,7 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
   } while (modified_list);
 
 #ifdef RC_INCREMENTAL_COLLECT
+budget_done:                /* lever B early-exit: remaining dirty chains carried to next vblank */
   g_rc_incr_chain = 0;   /* don't attribute reads outside the collect walk */
 #endif
   return count;

@@ -32,6 +32,12 @@ volatile uint32_t g_rc_eval_us = 0;
  * dependencies + already incr-skipped). Confirms which phase to parallelize. */
 volatile uint32_t g_rc_upd1_us = 0;
 volatile uint32_t g_rc_upd2_us = 0;
+/* STEP 0 (2026-06-30): resolve-only time, summed over the ~378 chains that DON'T skip
+ * (rc_get_modified_memref_value). FRAME prints it as urs; skip-check time = upd2 - urs.
+ * Splits the ~6ms upd2 between the B2 skip-checks (the 1001 lookups) and the real
+ * resolves -> confirms (or refutes) the handoff's "skip-checks dominate" hypothesis.
+ * Reset to 0 each do_frame from main.cpp beside the b1sk/b2sk counters. */
+volatile uint32_t g_rc_upd_resolve_us = 0;
 
 /* v0.29.0 — parallel achievement evaluation across both ESP32-S3 cores. */
 #include "freertos/FreeRTOS.h"
@@ -6140,7 +6146,9 @@ static void rc_upd_resolve_one(rc_client_t* client, rc_modified_memref_t* mm, in
 #else
   (void)incr;
 #endif
+  { int64_t _r0 = esp_timer_get_time();   /* STEP 0: time only the real resolves */
   rc_update_memref_value(&mm->memref.value, rc_get_modified_memref_value(mm, client->state.legacy_peek, client));
+  g_rc_upd_resolve_us += (uint32_t)(esp_timer_get_time() - _r0); }
 #ifdef RC_SHADOW_VALUES
   rc_shadow_mirror(&mm->memref);
 #endif
@@ -6341,12 +6349,18 @@ static void rc_upd_parallel(rc_client_t* client, int incr) {
 static void rc_upd_serial(rc_client_t* client, rc_memrefs_t* memrefs, int incr) {
   rc_modified_memref_list_t* l = &memrefs->modified_memrefs;
   int64_t a0 = esp_timer_get_time();
+  /* U1: the serial list walk visits modified_memrefs in a fixed per-game order, so
+   * the cursor advanced inside rc_modified_memref_can_skip is a stable dense index
+   * into the leaf-widx cache. Reset it here and arm the hooks for this walk only. */
+  g_rc_u1_cursor = 0;
+  g_rc_u1_active = 1;
   do {
     rc_modified_memref_t* m = l->items;
     const rc_modified_memref_t* e = m + l->count;
     for (; m < e; ++m) rc_upd_resolve_one(client, m, incr);
     l = l->next;
   } while (l);
+  g_rc_u1_active = 0;
   g_upd_a_us = (uint32_t)(esp_timer_get_time() - a0);
   g_upd_b_us = 0;
 }
@@ -6793,6 +6807,19 @@ uint32_t rc_client_memref_count(const rc_client_t* client) {
   ml = &mr->memrefs;
   do { n += ml->count; ml = ml->next; } while (ml);
   mml = &mr->modified_memrefs;
+  if (mml->count) { do { n += mml->count; mml = mml->next; } while (mml); }
+  return n;
+}
+
+/* U1: count ONLY the modified_memrefs (the chains rc_modified_memref_can_skip walks)
+ * so the adapter can size the leaf-widx side-array exactly. Same walk order as the
+ * cursor in rc_upd_serial -> the dense index range is [0, this count). */
+uint32_t rc_client_modified_memref_count(const rc_client_t* client) {
+  const rc_modified_memref_list_t* mml;
+  uint32_t n = 0;
+  if (!client || !client->game || !client->game->runtime.memrefs)
+    return 0;
+  mml = &client->game->runtime.memrefs->modified_memrefs;
   if (mml->count) { do { n += mml->count; mml = mml->next; } while (mml); }
   return n;
 }

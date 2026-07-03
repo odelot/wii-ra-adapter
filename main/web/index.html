@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Wii RA Dashboard</title>
+  <style>
+    :root { --bg:#0d1017; --panel:#161b26; --accent:#4cc2ff; --gold:#ffd54a; --ok:#4CFF7A; --bad:#FF5C5C; }
+    * { box-sizing:border-box; }
+    html,body { margin:0; height:100%; background:var(--bg); color:#e8edf5;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    header { display:flex; align-items:center; gap:14px; padding:14px 18px;
+      background:linear-gradient(90deg,#131826,#0d1017); border-bottom:1px solid #222b3a; }
+    header h1 { font-size:16px; margin:0; letter-spacing:.5px; color:var(--accent); }
+    .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); box-shadow:0 0 8px var(--bad); }
+    .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+    .status { margin-left:auto; font-size:13px; opacity:.8; }
+    main { padding:18px; display:grid; gap:16px; grid-template-columns:1fr; max-width:900px; margin:0 auto; }
+    .card { background:var(--panel); border:1px solid #232c3d; border-radius:14px; padding:18px; }
+    .game { display:flex; align-items:center; gap:18px; }
+    .game .title { font-size:22px; font-weight:700; }
+    .game .sub { opacity:.6; font-size:13px; margin-top:4px; }
+    .ring { --pct:0; width:96px; height:96px; border-radius:50%; flex:0 0 auto;
+      background:conic-gradient(var(--gold) calc(var(--pct)*1%), #2a3346 0);
+      display:grid; place-items:center; position:relative; }
+    .ring::before { content:""; position:absolute; inset:9px; border-radius:50%; background:var(--panel); }
+    .ring span { position:relative; font-size:18px; font-weight:700; }
+    .bar { height:10px; background:#2a3346; border-radius:6px; overflow:hidden; margin-top:14px; }
+    .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--gold),#ffb020); transition:width .4s; }
+    .stats { display:flex; gap:22px; margin-top:12px; font-size:13px; opacity:.85; flex-wrap:wrap; }
+    .stats b { color:var(--gold); font-size:16px; display:block; }
+    .soon { opacity:.5; font-size:13px; text-align:center; padding:20px; }
+    footer { text-align:center; opacity:.35; font-size:11px; padding:16px; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
+    .tab { padding:7px 14px; border-radius:20px; background:#1b2230; border:1px solid #2a3346;
+      font-size:13px; cursor:pointer; user-select:none; color:#aeb9cc; }
+    .tab.sel { background:var(--accent); color:#04121c; border-color:var(--accent); font-weight:700; }
+    .tab .n { opacity:.7; font-weight:400; margin-left:5px; }
+    .grid { display:grid; gap:10px; grid-template-columns:1fr; }
+    @media(min-width:560px){ .grid{ grid-template-columns:1fr 1fr; } }
+    .ach { display:flex; gap:12px; align-items:center; background:#121826; border:1px solid #222c3d;
+      border-radius:12px; padding:10px 12px; }
+    .ach.locked { opacity:.62; }
+    .ach.challenge { border-color:var(--gold); box-shadow:0 0 0 1px var(--gold) inset; }
+    .ach img { width:52px; height:52px; border-radius:8px; flex:0 0 auto; background:#0a0e15; }
+    .ach.locked img { filter:grayscale(1) brightness(.7); }
+    .ach .info { flex:1; min-width:0; }
+    .ach .nm { font-weight:600; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .ach .ds { font-size:12px; opacity:.65; margin-top:2px; display:-webkit-box; -webkit-line-clamp:2;
+      -webkit-box-orient:vertical; overflow:hidden; }
+    .ach .meta { font-size:11px; opacity:.7; margin-top:4px; display:flex; gap:10px; align-items:center; }
+    .ach .pill { background:#233; padding:1px 7px; border-radius:10px; }
+    .ach .pill.gold { background:#3a2f0a; color:var(--gold); }
+    .ach .pbar { height:6px; background:#222c3d; border-radius:4px; overflow:hidden; margin-top:5px; }
+    .ach .pbar > i { display:block; height:100%; background:linear-gradient(90deg,var(--gold),#ffb020); }
+    .ach .badge-pts { color:var(--gold); font-weight:700; }
+    #toasts { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+      display:flex; flex-direction:column; gap:10px; align-items:center; z-index:1000; }
+    .toast { display:flex; align-items:center; gap:12px; background:#161b26ee; color:#fff;
+      border:1px solid var(--gold); border-radius:14px; padding:12px 18px; max-width:88vw;
+      box-shadow:0 8px 30px #000a; animation:pop .4s ease-out, fade .5s ease-in 4.5s forwards; }
+    .toast img { width:46px; height:46px; border-radius:8px; }
+    .toast .tt { font-size:12px; color:var(--gold); font-weight:700; letter-spacing:.4px; }
+    .toast .tn { font-size:15px; font-weight:700; }
+    @keyframes pop { from{ transform:translateY(16px) scale(.9); opacity:0 } to{ transform:none; opacity:1 } }
+    @keyframes fade { to{ opacity:0; transform:translateY(-8px) } }
+    #rp { font-size:12px; color:var(--accent); margin-top:6px; min-height:14px; opacity:.9;
+      overflow-wrap:anywhere; }
+
+    /* ---- mobile fit (2026-07-02): kill the lateral scroll, never redesign ----
+     * 1) hard guarantee: the page can never scroll sideways;
+     * 2) fix the actual overflow sources: grid/flex children default to
+     *    min-width:auto (refuse to shrink below content), and .meta didn't wrap;
+     * 3) "minimal zoom-out": on narrow phones shrink paddings/ring/badges a bit
+     *    so everything fits a 360px screen comfortably. */
+    html, body { overflow-x:hidden; max-width:100vw; }
+    img { max-width:100%; }
+    .grid > *, .ach, .ach .info, .game > div { min-width:0; }
+    .ach .meta { flex-wrap:wrap; row-gap:3px; }
+    .ach .nm, .game .title { overflow-wrap:anywhere; }
+    header h1 { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+    @media (max-width:400px){
+      header { padding:10px 12px; gap:10px; }
+      header h1 { font-size:13px; }
+      .status { font-size:11px; }
+      main { padding:10px; gap:12px; }
+      .card { padding:12px; border-radius:12px; }
+      .game { gap:12px; }
+      .game .title { font-size:17px; }
+      .ring { width:72px; height:72px; }
+      .ring::before { inset:7px; }
+      .ring span { font-size:14px; }
+      .stats { gap:14px; font-size:12px; }
+      .stats b { font-size:14px; }
+      .tab { padding:6px 11px; font-size:12px; }
+      .ach { padding:8px 10px; gap:10px; }
+      .ach img { width:44px; height:44px; }
+      .ach .nm { font-size:13px; }
+      .toast { padding:10px 14px; max-width:94vw; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dot" id="dot"></div>
+    <h1>WII RETROACHIEVEMENTS</h1>
+    <div class="status" id="status">connecting…</div>
+  </header>
+  <main>
+    <div class="card game">
+      <div class="ring" id="ring"><span id="ringpct">0%</span></div>
+      <div style="flex:1;min-width:0">
+        <div class="title" id="title">—</div>
+        <div class="sub" id="sub">waiting for a game…</div>
+        <div id="rp"></div>
+        <div class="bar"><i id="barfill"></i></div>
+        <div class="stats">
+          <div><b id="s-unlocked">0/0</b>achievements</div>
+          <div><b id="s-points">0/0</b>points</div>
+          <div><b id="s-state">–</b>fw state</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="tabs" id="tabs"></div>
+      <div class="grid" id="grid"></div>
+    </div>
+  </main>
+  <footer>Wii RA Adapter · live dashboard</footer>
+  <div id="toasts"></div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const STATE = {4:"loading",5:"loading",6:"loaded",7:"active"};
+
+    function setConn(ok){
+      $('dot').classList.toggle('on', ok);
+      $('status').textContent = ok ? 'connected' : 'offline';
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/api/state', {cache:'no-store'});
+        if(!r.ok) throw 0;
+        const d = await r.json();
+        setConn(true);
+        render(d);
+      }catch(e){ setConn(false); }
+    }
+
+    const BADGE = 'https://media.retroachievements.org/Badge/';
+    let filter = 'all';
+    let lastList = [];
+
+    const FILTERS = [
+      ['all',       'All',        a => true],
+      ['unlocked',  'Unlocked',   a => a.cat==='unlocked'],
+      ['challenge', 'Challenges', a => a.cat==='challenge'],
+      ['progress',  'In progress',a => a.cat==='progress' || (a.pct>0 && a.pct<100 && a.st!==2)],
+      ['locked',    'Locked',     a => a.cat==='locked' && a.st!==2],
+    ];
+
+    function render(d){
+      const total = d.total||0, unlocked = d.unlocked||0;
+      const pct = total ? Math.round(unlocked*100/total) : 0;
+      $('title').textContent = d.title && d.title.length ? d.title : 'No game loaded';
+      $('sub').textContent = d.game_id ? ('Game ID '+d.game_id) : 'waiting for a game…';
+      $('ring').style.setProperty('--pct', pct);
+      $('ringpct').textContent = pct+'%';
+      $('barfill').style.width = pct+'%';
+      $('s-unlocked').textContent = unlocked+'/'+total;
+      $('s-points').textContent = (d.points_unlocked||0)+'/'+(d.points_total||0);
+      $('s-state').textContent = STATE[d.state] || d.state;
+      lastList = d.achievements || [];
+      renderTabs();
+      renderList();
+    }
+
+    function renderTabs(){
+      const tabs = $('tabs');
+      tabs.innerHTML = '';
+      for (const [key,label,fn] of FILTERS){
+        const n = lastList.filter(fn).length;
+        const el = document.createElement('div');
+        el.className = 'tab' + (filter===key?' sel':'');
+        el.innerHTML = label + '<span class="n">'+n+'</span>';
+        el.onclick = () => { filter = key; renderTabs(); renderList(); };
+        tabs.appendChild(el);
+      }
+    }
+
+    function renderList(){
+      const grid = $('grid');
+      grid.innerHTML = '';
+      const fn = (FILTERS.find(f=>f[0]===filter)||FILTERS[0])[2];
+      const items = lastList.filter(fn);
+      if (!items.length){
+        grid.innerHTML = '<div class="soon">No achievements here.</div>';
+        return;
+      }
+      for (const a of items){
+        const unlocked = a.st===2;
+        const isChal = a.cat==='challenge';
+        const inProg = !unlocked && a.pct>0 && a.pct<100;
+        const div = document.createElement('div');
+        div.className = 'ach' + (unlocked?'':' locked') + (isChal?' challenge':'');
+        const img = a.badge ? (BADGE + a.badge + (unlocked?'':'_lock') + '.png') : '';
+        div.innerHTML =
+          '<img src="'+img+'" loading="lazy" onerror="this.style.visibility=\'hidden\'">'+
+          '<div class="info">'+
+            '<div class="nm">'+esc(a.t)+'</div>'+
+            '<div class="ds">'+esc(a.d)+'</div>'+
+            '<div class="meta">'+
+              '<span class="badge-pts">'+ (a.pts||0) +' pts</span>'+
+              (isChal ? '<span class="pill gold">CHALLENGE</span>' : '')+
+              (a.rare>0 ? '<span class="pill">'+a.rare+'% rare</span>' : '')+
+              (a.m ? '<span>'+esc(a.m)+'</span>' : '')+
+            '</div>'+
+            (inProg ? '<div class="pbar"><i style="width:'+a.pct+'%"></i></div>' : '')+
+          '</div>';
+        grid.appendChild(div);
+      }
+    }
+
+    function esc(s){ return (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+    /* ---- live push over WebSocket ---- */
+    let ws = null, wsOK = false, refreshT = null;
+
+    function scheduleRefresh(ms){ clearTimeout(refreshT); refreshT = setTimeout(poll, ms||400); }
+
+    function beep(){
+      try{
+        const c = new (window.AudioContext||window.webkitAudioContext)();
+        const o = c.createOscillator(), g = c.createGain();
+        o.connect(g); g.connect(c.destination);
+        o.type='triangle'; o.frequency.setValueAtTime(880,c.currentTime);
+        o.frequency.setValueAtTime(1320,c.currentTime+0.12);
+        g.gain.setValueAtTime(0.25,c.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.4);
+        o.start(); o.stop(c.currentTime+0.4);
+      }catch(e){}
+    }
+
+    function toastUnlock(m){
+      const box = $('toasts');
+      const el = document.createElement('div');
+      el.className = 'toast';
+      const img = m.badge ? (BADGE+m.badge+'.png') : '';
+      el.innerHTML = '<img src="'+img+'" onerror="this.style.display=\'none\'">'+
+        '<div><div class="tt">🏆 ACHIEVEMENT UNLOCKED</div><div class="tn">'+esc(m.t)+'</div></div>';
+      box.appendChild(el);
+      setTimeout(()=>el.remove(), 5200);
+      beep();
+      try{ navigator.vibrate([120,60,120]); }catch(e){}
+    }
+
+    function handleEvt(m){
+      switch(m.e){
+        case 'unlock':    toastUnlock(m); scheduleRefresh(600); break;
+        case 'reload':    scheduleRefresh(300); break;
+        case 'progress':  scheduleRefresh(500); break;
+        case 'challenge': scheduleRefresh(400); break;
+        case 'rp':        $('rp').textContent = m.m || ''; break;
+      }
+    }
+
+    function wsConnect(){
+      try{ ws = new WebSocket('ws://'+location.host+'/ws'); }catch(e){ return; }
+      ws.onopen  = () => { wsOK = true; setConn(true); };
+      ws.onmessage = (ev) => { try{ handleEvt(JSON.parse(ev.data)); }catch(e){} };
+      ws.onclose = () => { wsOK = false; setConn(false); setTimeout(wsConnect, 3000); };
+      ws.onerror = () => { try{ ws.close(); }catch(e){} };
+    }
+
+    poll();
+    wsConnect();
+    /* Polling is the fallback / periodic reconcile: fast when WS is down, slow
+       when WS is delivering live events. */
+    setInterval(() => { if(!wsOK) poll(); }, 2500);
+    setInterval(() => { if(wsOK)  poll(); }, 15000);
+  </script>
+</body>
+</html>

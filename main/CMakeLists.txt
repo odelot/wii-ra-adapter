@@ -5,6 +5,7 @@ idf_component_register(
         "main.cpp"
         "exi_spi_slave.cpp"
         "loop_stack.cpp"
+        "ra_web.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         arduino-esp32
@@ -13,6 +14,10 @@ idf_component_register(
         esp_timer
         driver
         nvs_flash
+        esp_http_server
+        mdns
+    # LAN dashboard (ra_web): single-file HTML embedded into flash, served at "/".
+    EMBED_TXTFILES "web/index.html"
 )
 
 # main.cpp is the Arduino .ino (lenient Arduino warning level). IDF's -Werror=all

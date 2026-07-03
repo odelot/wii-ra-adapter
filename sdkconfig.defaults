@@ -57,6 +57,16 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
 #     SRAM: sram-free 60KB (32KB) vs 76KB (16KB) at game-load. USER CHOSE 32KB, accepting
 #     the tighter SRAM (mbedTLS→PSRAM keeps the network stable at 60KB). To reclaim the
 #     16KB headroom instead, drop to _16KB/_32B. ---
+# --- 2026-07-02 (later): 32KB RE-ENABLED, funded by the L1 cache resize
+#     (4096->2048 slots, +13KB .bss back — see main.cpp L1_SLOTS comment).
+#     Rationale: HARDCORE-MODE frame fidelity — the measured 16KB cost was
+#     +0.85ms/frame on the SMG bunny chase (df_us p50 14.1->15.0ms), which
+#     turned into 17 vs 1 lost frames in the chase (0.51% vs 0.03%); every
+#     lost frame stretches timed challenges (the bunny's 1-minute timer), so
+#     emulator-equal timing wants the 32KB. Net SRAM vs the 16KB build:
+#     -16 (icache) +13 (L1) = -3KB; heap floor ~38KB expected (WS still fits).
+#     (The brief 16KB experiment lives in git history; its analysis is in
+#     memory: project_phase_c_chain_descriptors / project_sram_reclaim_backlog.) ---
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_64B=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
@@ -130,3 +140,13 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 # complains: CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC (big buffers PSRAM, small stay internal).
 # CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# WebSocket dashboard (ra_web): enable esp_http_server WS server support.
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# ra_web dashboard — keep the web/mDNS/WiFi network stack off the scarce internal
+# SRAM (rcheevos already leaves only ~18KB free). Without these, mDNS packet
+# allocs + RA-server TLS pings fail (mdns_send OOM / start_ssl_client socket err).
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y

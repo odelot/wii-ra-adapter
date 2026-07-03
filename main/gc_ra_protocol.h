@@ -326,12 +326,18 @@ typedef struct __attribute__((packed)) {
                               * window naturally covers the whole table. */
     uint16_t chain_count;    /* shipped slots in the window (0 = no chain data) */
     uint16_t chain_blob_len; /* bytes of chain leaf values in the window */
+    uint16_t dp_count;       /* Phase D: dp-parent verification values shipped
+                              * (distinct (parent,kind) entries, table-scan
+                              * order — both sides derive the same list) */
     /* Followed by addr_count bytes: flat values[0..addr_count-1]
      * (byte i corresponds to watch list index i),
      * then ceil(chain_count/8) validity-bitmap bytes (bit i = window slot i
      * walked to an in-range address; invalid slots ship zero-filled bytes),
      * then chain_blob_len bytes of leaf values (window order, widths from
-     * the chain table). */
+     * the chain table),
+     * then dp_count × uint32 (BE): the prev/prior parent values the walker
+     * used this frame — the ESP compares against its own memref delta/prior
+     * and DEFERS the frame on mismatch (desync detector, self-heals). */
 } ra_snapshot_header_t;
 
 /*
@@ -493,8 +499,25 @@ typedef struct __attribute__((packed)) {
 #define RA_CN_SZ_24_BE           16
 #define RA_CN_SZ_32_BE           17
 
+/* Phase D (2026-07-02): dp-kind rides the psize HIGH BITS — the edge may read
+ * the parent's CURRENT value (0), its PREVIOUS-frame value (1 = rcheevos
+ * DELTA) or its last-DIFFERENT value (2 = rcheevos PRIOR). Works on ANY node
+ * type (the delta typically sits on the mask-combine's parent edge). Sound
+ * because the snapshot queue guarantees walks == do_frames, so the walker's
+ * previous-walk value IS the ESP's delta by definition. The d2x keeps
+ * values_prev[]/prior[] per node and ships the dp-parent values it used
+ * (see the SNAPSHOT header) so the ESP can VERIFY alignment every frame. */
+#define RA_CN_PSZ_MEM_MASK       0x3F
+#define RA_CN_PSZ_DP_SHIFT       6
+#define RA_CN_DP_CUR             0
+#define RA_CN_DP_DELTA           1
+#define RA_CN_DP_PRIOR           2
+/* Cap on distinct (parent,kind) dp entries — both sides derive the SAME list
+ * by scanning the table in order; the emitter refuses chains beyond the cap. */
+#define RA_MAX_DP_PARENTS        128
+
 /** Console-side static cap; the ESP refuses to emit past its own cap. */
-#define RA_MAX_CHAIN_NODES       2048
+#define RA_MAX_CHAIN_NODES       3072  /* 2026-07-03: 2048->3072 for the LB+RP experiment (SMG ach-only was already 1797; d2x BSS +22.5KB, fits) */
 
 /** Nodes per GET_CHAIN_CHUNK response:
  *  6B esp hdr + 8B chunk hdr + N×8 <= EXI_MAX_TRANSACTION_SIZE (8192) */

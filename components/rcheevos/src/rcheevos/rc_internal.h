@@ -468,6 +468,14 @@ void rc_memrefs_phasec_census(const rc_memrefs_t* memrefs, rc_phasec_census_t* o
  *   root deref: parent == RC_PHASEC_PARENT_NONE, operand = absolute address
  *            (not shipped — roots stay in the flat watchlist). */
 #define RC_PHASEC_PARENT_NONE 0xFFFF
+/* Phase D: dp-kind in the psize HIGH bits (must match gc_ra_protocol.h
+ * RA_CN_PSZ_DP_SHIFT / RA_CN_DP_*): the edge reads the parent's CURRENT (0),
+ * PREVIOUS-frame (1 = rcheevos DELTA) or last-DIFFERENT (2 = PRIOR) value.
+ * RC_PHASEC_MAX_DP must match RA_MAX_DP_PARENTS. */
+#define RC_PHASEC_PSZ_DP_SHIFT 6
+#define RC_PHASEC_DP_DELTA     1
+#define RC_PHASEC_DP_PRIOR     2
+#define RC_PHASEC_MAX_DP       128
 #define RC_PHASEC_OP(n)       ((uint8_t)((n)->op & 0x1F))
 #define RC_PHASEC_WIDTH(n)    ((uint8_t)((((n)->op >> 5) & 3) + 1))
 #define RC_PHASEC_SHIPPED(n)  ((uint8_t)((n)->op >> 7))

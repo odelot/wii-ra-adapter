@@ -85,6 +85,9 @@ extern "C" {
   /* v0.33 upd phase split: upd1=leaf peeks (free), upd2=chain resolves (the cost). */
   extern volatile uint32_t g_rc_upd1_us;
   extern volatile uint32_t g_rc_upd2_us;
+  /* STEP 0 (2026-06-30): resolve-only time within upd2 (the ~378 rc_get_modified_memref_value
+   * calls). skip-check time = upd2 - urs → splits the 6ms between B2 skip-checks and resolves. */
+  extern volatile uint32_t g_rc_upd_resolve_us;
   /* v0.33 parallel upd Phase-2: uda=core-1 time, udb=core-0 worker time (0 = serial). */
   extern volatile uint32_t g_upd_a_us;
   extern volatile uint32_t g_upd_b_us;
@@ -97,6 +100,7 @@ extern "C" {
    * if it returns 0 it rolls the values back (into save_buf) and sets
    * g_rc_doframe_deferred=1 WITHOUT evaluating any condition. */
   uint32_t rc_client_memref_count(const rc_client_t* client);
+  uint32_t rc_client_modified_memref_count(const rc_client_t* client);   /* U1 sizing */
   extern int (*g_rc_doframe_primed_cb)(void);
   extern rc_memref_value_t* g_rc_doframe_save_buf;
   extern uint32_t g_rc_doframe_save_cap;
@@ -134,7 +138,7 @@ extern "C" {
  * Raise to 2 only while investigating. Combined with the enlarged UART
  * TX buffer in setup(), level 1 keeps hot windows burst-free. */
 #ifndef RA_LOG_LEVEL
-#define RA_LOG_LEVEL 2
+#define RA_LOG_LEVEL 1
 #endif
 #include <stdarg.h>
 /* ============================================================================
@@ -549,10 +553,17 @@ extern "C" {
     extern int (*g_rc_leaf_unchanged)(uint32_t address, uint32_t num_bytes);
     extern volatile int g_rc_indirect_skip_enabled;
     extern unsigned long g_rc_b1_skips, g_rc_b2_skips, g_rc_upd_resolves;
+    /* U1 leaf-widx cache hooks/state (defined in memref.c; the included rc_internal.h
+     * is the flattened "." copy without these decls, so re-declare locally — the same
+     * pattern as g_rc_leaf_unchanged above). */
+    extern int  (*g_rc_u1_cached)(uint32_t idx);
+    extern int  (*g_rc_u1_populate)(uint32_t idx, uint32_t address, uint32_t num_bytes);
+    extern void (*g_rc_u1_invalidate)(uint32_t idx);
     /* opt: reverse-hash incremental collect (see incr_* below + memref.c). */
     extern void (*g_rc_chain_read_cb)(uint32_t address, uint8_t num_bytes, void* chain);
     extern volatile int g_rc_incr_collect_enabled;
     extern volatile unsigned long g_rc_collect_skips, g_rc_collect_walks;
+    extern volatile int g_rc_collect_walk_budget;   /* lever B: per-vblank chain-walk cap (memref.c) */
     void rc_modified_memref_mark_dirty(void* chain);
     void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs);
 #ifdef RC_EVAL_PLAN
@@ -1096,6 +1107,12 @@ static inline uint32_t hash_addr(uint32_t addr) {
 static uint32_t g_l1_addr[L1_SLOTS];   /* internal .bss; slot = set*2 + way */
 static uint16_t g_l1_widx[L1_SLOTS];
 static uint8_t  g_l1_mru[L1_SETS];     /* which way was last used (evict the other) */
+/* STEP 0 diagnostic (2026-06-30): per-do_frame L1 hit/miss, reset beside b1sk/b2sk.
+ * Tells whether upd2 is PSRAM-lookup-bound (low hit) or the lookups are L1-cheap
+ * (high hit -> the upd cost is the operand-eval machinery, not the lookup). Plain
+ * uint32: do_frame + collect are cooperative on Core 1 so no mid-frame preemption,
+ * and an approximate count is fine for a diagnostic. */
+uint32_t g_l1_hits = 0, g_l1_miss = 0;
 static inline void l1_clear() {
     for (uint32_t i = 0; i < L1_SLOTS; i++) g_l1_addr[i] = L1_EMPTY;
 }
@@ -1110,11 +1127,14 @@ static inline void l1_clear() {
  * collect spike (cwk=1364, all chains re-walked). Same trigger as l1_clear. */
 static volatile bool g_incr_remapped = true;   /* start true -> rebuild first frame */
 
+static void u1_clear_all();     /* U1 leaf-widx cache wipe (defined below); remap-only */
+
 static void hash_clear() {
     for (uint32_t i = 0; i < HASH_SIZE; i++) {
         addr_hash[i].watch_index = HASH_EMPTY;
     }
     l1_clear();              /* watchlist remapped -> L1 widxs are stale */
+    u1_clear_all();          /* ...and the U1 leaf-widx cache is stale too */
     g_incr_remapped = true;  /* ...and the incr reverse index needs a rebuild */
 }
 
@@ -1141,8 +1161,9 @@ static void hash_insert(uint32_t addr, uint16_t watch_index) {
 static inline int32_t hash_lookup(uint32_t addr) {
     uint32_t set  = (addr * 0x9E3779B9u) & L1_SET_MASK;
     uint32_t base = set << 1;
-    if (g_l1_addr[base]   == addr) { g_l1_mru[set] = 0; return (int32_t)g_l1_widx[base]; }
-    if (g_l1_addr[base+1] == addr) { g_l1_mru[set] = 1; return (int32_t)g_l1_widx[base+1]; }
+    if (g_l1_addr[base]   == addr) { g_l1_mru[set] = 0; ++g_l1_hits; return (int32_t)g_l1_widx[base]; }
+    if (g_l1_addr[base+1] == addr) { g_l1_mru[set] = 1; ++g_l1_hits; return (int32_t)g_l1_widx[base+1]; }
+    ++g_l1_miss;   /* fell through to the PSRAM hash */
 
     uint32_t h = hash_addr(addr);
     while (addr_hash[h].watch_index != HASH_EMPTY) {
@@ -1184,6 +1205,72 @@ extern "C" int rc_leaf_unchanged_impl(uint32_t addr, uint32_t num_bytes) {
         if (snap_changed[widx]) return 0;  // moved this snapshot -> resolve
     }
     return 1;
+}
+
+// ============================================================================
+// U1 — leaf-widx side-array cache (STEP 0 confirmed B2 skip-checks = 66% of upd2,
+// ~5us each from 2 operand evals + per-byte hash lookups). When the pointer
+// (parent) is stable the leaf address is unchanged -> its watch indices are too.
+// Cache them per chain (dense index = the rc_modified_memref_can_skip cursor) so a
+// skip-check collapses to one snap_changed[] read: NO operand eval, NO hash lookup.
+//
+// Correctness (the false-unlock surface — device-only, not host-testable):
+//  - Populated only on the stable-pointer path; a stable pointer means the leaf
+//    address can't have moved, so the cached widxs stay valid frame-to-frame.
+//  - A leaf VALUE change (snap_changed[widx]=1) does NOT invalidate (address is
+//    the same) -> resolve the value, keep the cache.
+//  - A pointer/modifier MOVE invalidates the entry (rc_u1_invalidate) -> the next
+//    stable frame re-populates at the new address.
+//  - APPEND never shifts existing widxs (hash_insert, no remap) so it needs no
+//    invalidation; evict/defrag DO remap -> hash_clear()->u1_clear_all() wipes all.
+//  - do_frame gate backstops a true miss (deferred frame), but a stale-cache wrong
+//    value is NOT a miss -> the invalidation logic above is the real guarantee.
+// ============================================================================
+#define U1_MAX_BYTES 4                 /* up to a 32-bit leaf; bigger -> don't cache */
+struct u1_entry_t { uint16_t widx[U1_MAX_BYTES]; uint8_t n; };  /* n=0: empty/uncached */
+static u1_entry_t* g_u1 = NULL;        /* [g_u1_cap], internal SRAM */
+static uint32_t    g_u1_cap = 0;
+volatile int       g_u1_enabled = 1;   /* runtime A/B toggle */
+uint32_t           g_u1_fast = 0;      /* per-frame: cached skip-checks (no eval) */
+uint32_t           g_u1_pop = 0;       /* per-frame: cache-miss populates (full path) */
+
+static void u1_clear_all() {           /* remap -> every cached widx is stale */
+    if (g_u1) memset(g_u1, 0, (size_t)g_u1_cap * sizeof(u1_entry_t));
+}
+
+/* -1 = not cached (caller computes addr + calls rc_u1_populate); 0 = a leaf byte
+ * moved this snapshot; 1 = leaf unchanged. NO operand eval, NO hash lookup. */
+extern "C" int rc_u1_cached(uint32_t idx) {
+    if (!g_u1_enabled || !g_u1 || idx >= g_u1_cap || !snap_changed) return -1;
+    u1_entry_t* e = &g_u1[idx];
+    if (!e->n) return -1;                        /* not populated yet */
+    ++g_u1_fast;
+    for (uint8_t b = 0; b < e->n; b++)
+        if (snap_changed[e->widx[b]]) return 0;  /* moved -> resolve (cache kept) */
+    return 1;                                    /* unchanged -> skip */
+}
+
+/* cache-miss path: do the per-byte hash lookups, store the widxs, return 1 iff the
+ * leaf is unchanged. Falls back to a no-cache direct check when uncacheable. */
+extern "C" int rc_u1_populate(uint32_t idx, uint32_t addr, uint32_t num_bytes) {
+    ++g_u1_pop;
+    if (!g_u1_enabled || !g_u1 || idx >= g_u1_cap || !snap_changed || num_bytes > U1_MAX_BYTES)
+        return rc_leaf_unchanged_impl(addr, num_bytes);   /* uncacheable -> original B2 */
+    u1_entry_t* e = &g_u1[idx];
+    int unchanged = 1;
+    for (uint32_t b = 0; b < num_bytes; b++) {
+        int32_t widx = hash_lookup(addr + b);
+        if (widx < 0) { e->n = 0; return 0; }    /* leaf not cached yet -> resolve, don't store */
+        e->widx[b] = (uint16_t)widx;
+        if (snap_changed[widx]) unchanged = 0;
+    }
+    e->n = (uint8_t)num_bytes;                   /* now cached for the stable address */
+    return unchanged;
+}
+
+/* pointer/modifier moved -> the leaf address may change -> drop the cached widxs. */
+extern "C" void rc_u1_invalidate(uint32_t idx) {
+    if (g_u1 && idx < g_u1_cap) g_u1[idx].n = 0;
 }
 
 // ============================================================================
@@ -2263,8 +2350,12 @@ static void server_call_blocking(const http_job_t *job) {
      * (~2-3s on ESP32) + request + response. Off the hot path since the
      * v0.24 core split — blocking longer here costs nothing on Core 1. */
     https.setTimeout(15000);
-    //https.setReuse(false);    // desabilita keep-alive: força conexão nova em vez de reusar stale
-    //https.setTimeout(15000);  // 15s: TLS handshake (~2-3s no ESP32) + request + response
+    /* Robustness — force a fresh TCP+TLS connection per request. With
+     * keep-alive on, a connection left idle (long menu time before launching
+     * a game) is silently dropped by the server/NAT, and the reused socket
+     * fails on first use ("first request after idle breaks"). The handshake
+     * costs ~2-3s but runs on Core 0, off the do_frame hot path. */
+    https.setReuse(false);
     https.setUserAgent("WII_RA_ADAPTER/0.1 rcheevos/12.3");
     uint32_t req_start_ms = millis();
     int httpCode = 0;
@@ -2318,9 +2409,23 @@ static void server_call_blocking(const http_job_t *job) {
         // Implements the same chunked-transfer and identity encoding logic
         // as HTTPClient::writeToStream but yields every iteration.
         int written = 0;
+        bool dl_stalled = false;
         {
             WiFiClient *dl_stream = https.getStreamPtr();
-            const uint32_t dl_deadline = millis() + 120000UL;  // 120s hard limit
+            /* Two independent limits guard the download:
+             *  - dl_deadline: absolute cap for a well-behaved but slow link.
+             *  - stall guard: abort shortly after the LAST byte arrives. A
+             *    TLS-level failure mid-download (mbedTLS -29184 "invalid SSL
+             *    record") leaves https.connected() lying true while
+             *    readStringUntil/readBytes return empty INSTANTLY on the dead
+             *    fd. Without this guard the loop spins re-arming SO_RCVTIMEO on
+             *    a closed socket, flooding "setSocketOption EBADF" to the UART
+             *    until the 120s deadline — starving IDLE0 → task watchdog, and
+             *    (TWDT panic off) wedging the box until a manual reset. */
+            const uint32_t dl_deadline = millis() + 120000UL;  // 120s hard cap
+            const uint32_t DL_STALL_MS = 4000;                 // no-progress abort (< 5s TWDT)
+            uint32_t last_rx_ms = millis();
+            int empty_hdrs = 0;                                // fast TLS-death detector
             if (contentLen > 0) {
                 // Identity encoding: known length, read in blocks
                 uint8_t dl_buf[4096];
@@ -2330,8 +2435,9 @@ static void server_call_blocking(const http_job_t *job) {
                     if (avail > 0) {
                         int n = dl_stream->readBytes(dl_buf,
                                     (size_t)min(avail, (int)sizeof(dl_buf)));
-                        if (n > 0) { ps.write(dl_buf, n); written += n; }
+                        if (n > 0) { ps.write(dl_buf, n); written += n; last_rx_ms = millis(); }
                     } else if (!https.connected()) break;
+                    if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
                 }
             } else {
                 // Chunked transfer encoding: parse chunk-size headers manually
@@ -2339,9 +2445,19 @@ static void server_call_blocking(const http_job_t *job) {
                 while (millis() < dl_deadline) {
                     vTaskDelay(1);  // yield to IDLE0 every chunk
                     if (!https.connected() && !dl_stream->available()) break;
+                    if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
                     String chunk_hdr = dl_stream->readStringUntil('\n');
                     chunk_hdr.trim();
-                    if (chunk_hdr.length() == 0) continue;
+                    if (chunk_hdr.length() == 0) {
+                        /* Healthy-but-slow link: readStringUntil blocks up to its
+                         * ~1s stream timeout before returning empty. Dead TLS fd:
+                         * it returns instantly, so a burst of empties == the
+                         * connection is gone. Break fast (well under DL_STALL_MS)
+                         * to keep the EBADF flood to a handful of lines. */
+                        if (++empty_hdrs > 64) { dl_stalled = true; break; }
+                        continue;
+                    }
+                    empty_hdrs = 0;
                     int chunk_sz = (int)strtol(chunk_hdr.c_str(), NULL, 16);
                     if (chunk_sz == 0) break;  // final chunk
                     int remaining = chunk_sz;
@@ -2349,12 +2465,24 @@ static void server_call_blocking(const http_job_t *job) {
                         vTaskDelay(1);
                         int n = dl_stream->readBytes(dl_buf,
                                     (size_t)min(remaining, (int)sizeof(dl_buf)));
-                        if (n > 0) { ps.write(dl_buf, n); written += n; remaining -= n; }
+                        if (n > 0) { ps.write(dl_buf, n); written += n; remaining -= n; last_rx_ms = millis(); }
                         else if (!https.connected()) break;
+                        if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
                     }
+                    if (dl_stalled) break;
                     dl_stream->readStringUntil('\n');  // consume trailing CRLF
                 }
             }
+        }
+        if (dl_stalled) {
+            /* Forced teardown: the fd is already EBADF, but stop() clears the
+             * NetworkClientSecure state so the next request opens a clean
+             * socket. No callback → rcheevos re-issues on its ping cadence. */
+            LOG_ERR("DEBUG=HTTP patch stalled after %d bytes (TLS drop mid-download?), aborting; heap=%u rssi=%d wifi=%d\r\n",
+                    written, (unsigned)ESP.getFreeHeap(), (int)WiFi.RSSI(), (int)WiFi.status());
+            client.stop();
+            https.end();
+            return;
         }
         LOG_DBG("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
                 written, (unsigned)ESP.getFreePsram());
@@ -2426,6 +2554,7 @@ static void server_call_blocking(const http_job_t *job) {
         uint8_t chunk[512];
         int total_read = 0;
         uint32_t deadline = millis() + 15000;
+        uint32_t last_rx_ms = millis();   // stall guard (same TLS-drop rationale as patch path)
         while ((https.connected() || stream->available()) && millis() < deadline) {
             vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
             int avail = stream->available();
@@ -2433,10 +2562,12 @@ static void server_call_blocking(const http_job_t *job) {
                 int n = stream->readBytes(chunk, min(avail, (int)sizeof(chunk)));
                 responseStr.concat((const char*)chunk, n);
                 total_read += n;
+                last_rx_ms = millis();
             } else {
                 delay(1);
             }
             if (contentLen > 0 && total_read >= contentLen) break;
+            if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
         }
         LOG_DBG("DEBUG=HTTP body: declared=%d received=%d\r\n", contentLen, total_read);
 
@@ -2724,6 +2855,33 @@ static inline bool is_chain_root(uint32_t baddr) {
 extern "C" void rc_client_diag_dry_update(rc_client_t* client);
 static volatile bool g_diag_dry_update = false;  /* OFF for the servicer build — adds ~7ms in taskCore1 */
 
+/* STEP 0 diagnostic (project_collect_resolver_handoff) — "cap collect to 0 walks"
+ * causal test. When TRUE, collect_missing_addresses() returns 0 immediately,
+ * BEFORE the rc_memrefs_get_pending_addresses walk — so the EXI servicer does
+ * ZERO collect CPU (apc_us/cm_cpu_us -> ~0) and convergence is allowed to LAG.
+ * Correctness is backstopped by the v0.32 do_frame gate + peek_miss (a missed
+ * address -> DEFERred frame, never a false unlock), so this is safe to A/B on
+ * real hardware. A/B PROTOCOL: build with FALSE (baseline = current behavior),
+ * flash, capture the SAME bunny chase; then build with TRUE (collect capped),
+ * flash, capture the SAME scene. Compare CATCHUP df/s in the storm windows:
+ *   - dip DISAPPEARS with cap ON  -> the dip is collect-preemption  -> lever B.
+ *   - dip PERSISTS  with cap ON   -> residual is the eval spikes (apc already 0
+ *                                    on those frames) -> collect levers can't fix
+ *                                    it alone; pivot decision. */
+static volatile bool g_collect_cap_walks = false;  /* STEP 0 hard cap — OFF (was the confounded test) */
+
+/* lever B (project_collect_resolver_handoff) — per-VBLANK collect walk budget.
+ * 0 = OFF (baseline = coelho-capoff.log). >0 caps cumulative chain walks per
+ * vblank: the rare mega-spike (rebuild/scene-change walking all ~1373 chains =
+ * ~42ms apc) is clipped to ~K x 31us and the remainder carries to the next
+ * vblank (left dirty; do_frame gate + peek_miss backstop, never a false unlock).
+ * Normal collect (~40 walks) stays under K -> identical to baseline. K=250 ->
+ * ~7.7ms apc ceiling. Pushed to g_rc_collect_walk_budget each vblank so it can
+ * be A/B'd at runtime. EXPECT: collect-spike half of the dip lifts (apc/cyc
+ * spikes collapse, cwk caps at ~250 in the FRAME line); eval-spikes (apc=0)
+ * are untouched (separate lever). A/B: 250 vs 0, SAME bunny chase. */
+static volatile int g_collect_walk_budget = 250;
+
 /* ====================================================================
  * opt: reverse-hash incremental collect (project_incremental_collect)
  * --------------------------------------------------------------------
@@ -2839,6 +2997,11 @@ static uint16_t collect_missing_addresses(void) {
     const rc_memrefs_t *memrefs = (state == STATE_ACTIVE && g_client)
                                   ? rc_client_get_memrefs(g_client) : NULL;
     if (!memrefs || g_watchlist_pending) return 0;
+
+    /* STEP 0 cap-collect test (g_collect_cap_walks): short-circuit the whole
+     * resolver walk so apc_us drops to ~0 and convergence lags. See the toggle's
+     * comment for the A/B protocol. No-op when the flag is FALSE. */
+    if (g_collect_cap_walks) return 0;
 
     uint32_t cm_t0 = (uint32_t)esp_timer_get_time();
     uint32_t n = rc_memrefs_get_pending_addresses(
@@ -4257,6 +4420,33 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         }
     }
 
+    /* U1 leaf-widx cache: size it to the exact modified_memref count (the chains
+     * rc_modified_memref_can_skip walks). INTERNAL SRAM so the fast-path read is a
+     * cheap SRAM hit (PSRAM would defeat the purpose). Register the hooks only on a
+     * successful alloc; otherwise leave them NULL so memref.c keeps the original B2
+     * path (g_rc_leaf_unchanged). Re-allocated each game; freed first. */
+    {
+        free(g_u1); g_u1 = NULL; g_u1_cap = 0;
+        g_rc_u1_cached = NULL; g_rc_u1_populate = NULL; g_rc_u1_invalidate = NULL;
+        uint32_t mmc = rc_client_modified_memref_count(client);
+        if (mmc > 0) {
+            g_u1 = (u1_entry_t*)heap_caps_malloc((size_t)mmc * sizeof(u1_entry_t),
+                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (g_u1) {
+            g_u1_cap = mmc;
+            u1_clear_all();                 /* n=0 everywhere -> all miss until populated */
+            g_rc_u1_cached     = rc_u1_cached;
+            g_rc_u1_populate   = rc_u1_populate;
+            g_rc_u1_invalidate = rc_u1_invalidate;
+            LOG_DBG("DEBUG=U1 cache: %u chains, %u KB internal SRAM\r\n",
+                     (unsigned)mmc, (unsigned)((size_t)mmc * sizeof(u1_entry_t) / 1024));
+        } else {
+            LOG_ERR("ERROR=U1 cache: alloc(%u chains) failed — U1 OFF, original B2 path\r\n",
+                    (unsigned)mmc);
+        }
+    }
+
 #ifdef RC_SHADOW_VALUES
     /* Shadow-array arena: compact PSRAM {value,prior,changed} so the eval reads memref
      * values densely instead of strided 56-byte structs (MEMBENCH: 13.7x cheaper read;
@@ -4565,9 +4755,13 @@ void processSnapshot() {
              * indices -> snap_changed[] would be stale; a freshly-cached leaf
              * must resolve once). Count-stability within a session == membership
              * stability. Off-frames just do a full resolve (safe). */
+            g_rc_collect_walk_budget = g_collect_walk_budget;   /* lever B: per-vblank walk cap */
             g_rc_indirect_skip_enabled = (g_b2_enabled && watch_count == g_last_doframe_watch_count) ? 1 : 0;
             g_last_doframe_watch_count = watch_count;
             g_rc_b1_skips = 0; g_rc_b2_skips = 0; g_rc_upd_resolves = 0;  /* per-frame */
+            g_l1_hits = 0; g_l1_miss = 0;            /* STEP 0: per-frame L1 hit/miss */
+            g_rc_upd_resolve_us = 0;                 /* STEP 0: resolve-only time within upd2 */
+            g_u1_fast = 0; g_u1_pop = 0;             /* U1: per-frame fast skips / cache-miss populates */
 #ifdef RC_DIRTY_EVAL
             g_rc_de_skipped = 0; g_rc_de_evaled = 0;  /* per-frame skip% */
 #ifdef RC_CLEAN_REPLAY
@@ -4635,12 +4829,14 @@ void processSnapshot() {
         unsigned long de_rp = 0;
 #endif
         /* FRAME line has two forms, chosen at compile time by RA_LOG_LEVEL:
-         *   level 1 (INFO)  = LEAN — the optimization outcomes (df/resolver):
-         *                     seq ok sa ms cm cmr it df df_us upd_us evl_us de_sk de_ev
-         *   level 2 (DEBUG) = FULL — every mechanism counter (skips/cache/parallel/EXI).
+         *   level 1 (INFO)  = LEAN — health + the perf outcome only:
+         *                     seq ok sa df df_us upd_us evl_us de_ev
+         *   level 2 (DEBUG) = FULL — the LEAN set PLUS every mechanism/diagnostic
+         *                     counter (collect ms/cm/cmr/it, dirty-eval de_sk/de_rp,
+         *                     skips/cache/parallel/EXI, l1h/l1m/urs/u1f/u1p).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -4669,21 +4865,21 @@ void processSnapshot() {
                   (unsigned long)g_rc_upd_resolves,
                   (unsigned long)g_rc_collect_skips, (unsigned long)g_rc_collect_walks,
                   (unsigned long)g_incr_rebuilds,
-                  (unsigned)incr_rev_count, (int)incr_rev_overflow, (unsigned long)g_incr_marks);
+                  (unsigned)incr_rev_count, (int)incr_rev_overflow, (unsigned long)g_incr_marks,
+                  (unsigned long)g_l1_hits, (unsigned long)g_l1_miss,
+                  (unsigned long)g_rc_upd_resolve_us,
+                  (unsigned long)g_u1_fast, (unsigned long)g_u1_pop);
 #else
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_sk=%lu de_ev=%lu de_rp=%lu\r\n",
+        (void)cmr_buf; (void)de_sk; (void)de_rp;   /* level-2-only fields (computed above) */
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_ev=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
-                  (unsigned)fl.collect_miss_total,
-                  (unsigned)fl.collect_cm,
-                  cmr_buf,
-                  (unsigned)fl.iter_depth,
                   df_ran,   /* v0.32: 1=evaluated, 0=deferred (cache not primed) */
                   (unsigned long)this_df_us,
                   (unsigned long)g_rc_update_us,
                   (unsigned long)g_rc_eval_us,
-                  de_sk, de_ev, de_rp);
+                  de_ev);
 #endif
 #if RA_FLIGHT_RECORDER
         /* Bad frame (over budget / convergence spike)? Dump the ring = the
@@ -4970,6 +5166,10 @@ void setup() {
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
     ralog_printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
+    /* lever B: arm the per-vblank collect walk budget from boot (also refreshed
+     * each vblank). 0 = baseline; >0 = capped. Logged so the A/B run is labelled. */
+    g_rc_collect_walk_budget = g_collect_walk_budget;
+    ralog_printf("DEBUG=leverB: collect walk budget=%d (0=off)\n", g_collect_walk_budget);
 
 #if RA_MEMBENCH
     /* one-shot shadow-array feasibility probe (read-only; see ra_membench comment) */

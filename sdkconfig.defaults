@@ -24,6 +24,14 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+# 120M works on the BIG DEV BOARD (flash has HPM) — measured 2026-06-30 (df5 vs df4):
+# eval −27% (bandwidth-bound, scales with clock), df_us p50 −22%, df/s p10 50→54, but
+# NOT solid 60 (p90 convergence spikes remain). To switch to the big board @120M:
+#   CONFIG_ESPTOOLPY_FLASHFREQ_120M=y + CONFIG_BOOTLOADER_FLASH_DC_AWARE=y (this block)
+#   CONFIG_SPIRAM_SPEED_120M=y + CONFIG_IDF_EXPERIMENTAL_FEATURES=y (PSRAM block below)
+# The EXPERIMENTAL_FEATURES gate is MANDATORY — without it SPIRAM_SPEED_120M is
+# un-selectable and silently falls to 40M -> flash120/psram40 fails the MSPI
+# power-of-2 static_assert. The S3-MINI's GD flash has no HPM -> 120M impossible there.
 
 # --- PSRAM: N16R8 = Octal (OPI) 8MB @ 80MHz. ---
 # 2026-06-28: 80M for the S3-MINI target. The AP gen3 (APS6408) chip itself rates
@@ -41,12 +49,16 @@ CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
 
-# --- Caches — STAGE 2: data cache 32->64KB + line 32->64B (the whole point of
-#     the IDF migration). The ~84KB of SMG memref values thrash a 32KB cache;
-#     64KB holds ~76% → fewer random-access misses on upd + the eval's memref
-#     reads. Instruction cache left at the Arduino default (16KB/32B). ---
-CONFIG_ESP32S3_INSTRUCTION_CACHE_16KB=y
-CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
+# --- Caches — data cache 64KB/64B (the IDF-migration lever: the ~84KB of SMG memref
+#     values thrash a 32KB cache; 64KB holds ~76%). INSTRUCTION cache 32KB/64B.
+#     CLEAN A/B 2026-07-01 (wii.log 32KB vs wii2.log 16KB, same fw): 32KB was ~2.5% faster
+#     on evl (p50 10683 vs 10954) + df_us + frame-loss (2.9% vs 3.3%), ALL same direction
+#     -> a small REAL gain (partly scene-confounded, but consistent). Costs 16KB internal
+#     SRAM: sram-free 60KB (32KB) vs 76KB (16KB) at game-load. USER CHOSE 32KB, accepting
+#     the tighter SRAM (mbedTLS→PSRAM keeps the network stable at 60KB). To reclaim the
+#     16KB headroom instead, drop to _16KB/_32B. ---
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_64B=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
@@ -106,3 +118,15 @@ CONFIG_MBEDTLS_KEY_EXCHANGE_RSA_PSK=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# --- TLS memory: allocate mbedTLS buffers in PSRAM, not internal SRAM (2026-07-01). ---
+# Default was INTERNAL_MEM_ALLOC -> the ~16KB TLS RX buffer + handshake structs ate
+# internal SRAM, which starved the hardware-AES DMA alloc on low-headroom games (the
+# SSBM failure above) AND floods "setSocketOption fail errno 9" + task_wdt when SRAM is
+# tight. EXTERNAL routes mbedTLS to PSRAM: TLS is NOT speed-critical (one handshake at
+# login), and the ESP32-S3 GDMA CAN reach PSRAM so hardware SHA/AES still work (IDF uses
+# internal DMA bounce buffers where needed). Frees ~16-32KB internal SRAM -> fixes the
+# handshake starvation AND pays for the 32KB I-cache above. Fallback if crypto-DMA
+# complains: CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC (big buffers PSRAM, small stay internal).
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

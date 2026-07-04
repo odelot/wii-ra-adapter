@@ -341,6 +341,24 @@ int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr);
 extern int (*g_rc_leaf_unchanged)(uint32_t address, uint32_t num_bytes);
 extern volatile int g_rc_indirect_skip_enabled;
 extern unsigned long g_rc_b1_skips, g_rc_b2_skips, g_rc_upd_resolves;
+/* U1 (2026-06-30) — leaf-widx side-array cache. A B2 INDIRECT skip-check costs
+ * ~5us (2 operand evals + per-byte hash lookups); when the parent (pointer) is
+ * stable the leaf address is unchanged, so its watch indices are too. Cache them
+ * keyed by g_rc_u1_cursor (a dense chain index advanced once per modified_memref
+ * in rc_modified_memref_can_skip — serial walk order is stable per game) and the
+ * skip-check collapses to one snap_changed[] read. Hooks live in the adapter
+ * (main.cpp); g_rc_u1_active gates them to the serial upd path only.
+ *   g_rc_u1_cached(idx):  -1 = not cached, 0 = a leaf byte moved, 1 = unchanged.
+ *                          NO operand eval — the whole point.
+ *   g_rc_u1_populate(idx,addr,nbytes): cache-miss path; does the lookups, stores
+ *                          the widxs, returns 1 if unchanged.
+ *   g_rc_u1_invalidate(idx): parent/modifier moved -> leaf addr may change ->
+ *                          drop the entry so the next stable frame re-populates. */
+extern int  (*g_rc_u1_cached)(uint32_t idx);
+extern int  (*g_rc_u1_populate)(uint32_t idx, uint32_t address, uint32_t num_bytes);
+extern void (*g_rc_u1_invalidate)(uint32_t idx);
+extern volatile uint32_t g_rc_u1_cursor;   /* dense chain index, reset each upd2 */
+extern volatile int g_rc_u1_active;        /* 1 only while the serial upd walk runs */
 #endif
 void rc_update_memref_value(rc_memref_value_t* memref, uint32_t value);
 void rc_get_memref_value(rc_typed_value_t* value, rc_memref_t* memref, int operand_type);
@@ -404,6 +422,7 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
 extern void (*g_rc_chain_read_cb)(uint32_t address, uint8_t num_bytes, void* chain);
 extern volatile int g_rc_incr_collect_enabled;
 extern volatile unsigned long g_rc_collect_skips, g_rc_collect_walks;
+extern volatile int g_rc_collect_walk_budget;  /* lever B: per-vblank chain-walk cap, 0=unlimited */
 void rc_modified_memref_mark_dirty(void* chain);
 void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs);
 #endif

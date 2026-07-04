@@ -337,7 +337,10 @@ typedef struct __attribute__((packed)) {
      * the chain table),
      * then dp_count × uint32 (BE): the prev/prior parent values the walker
      * used this frame — the ESP compares against its own memref delta/prior
-     * and DEFERS the frame on mismatch (desync detector, self-heals). */
+     * and DEFERS the frame on mismatch (desync detector, self-heals),
+     * then ceil(dp_count/8) validity-bitmap bytes: bit i = that dp parent
+     * RESOLVED at the previous walk (0 = unloaded pointer; the ESP SKIPS the
+     * compare — the subtree evaluates as legacy zeros, no mis-eval possible). */
 } ra_snapshot_header_t;
 
 /*

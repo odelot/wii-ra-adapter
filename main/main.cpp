@@ -5567,7 +5567,7 @@ void loadGame(const char *hash) {
      * test. RA_HARDCORE_MODE 0 restores softcore. Must be set BEFORE
      * begin_load_game (lb activation happens at load). */
     #ifndef RA_HARDCORE_MODE
-    #define RA_HARDCORE_MODE 1
+    #define RA_HARDCORE_MODE 0
     #endif
     rc_client_set_hardcore_enabled(g_client, RA_HARDCORE_MODE);
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);
@@ -6292,7 +6292,7 @@ void setup() {
     WiFi.setSleep(false);
 
     state = STATE_WAIT_GAME_ID;
-    LOG_INFO("DEBUG=Ready, waiting for GameCube...\r\n");
+    LOG_INFO("DEBUG=Ready, waiting for Wii...\r\n");
 
     /* EXI task priority 19 (v0.24.2; was 1). Arduino-ESP32 leaves the
      * lwIP tcpip task UNPINNED (NO_AFFINITY, prio ~18) — during HTTP

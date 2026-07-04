@@ -50,36 +50,9 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_DIRTY_EVAL)
 # clean trigger = 5983 replays, bit-identical). REQUIRES RC_DIRTY_EVAL.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_CLEAN_REPLAY)
 
-# Shadow-array (RC_SHADOW_VALUES): DISABLED 2026-06-29 — HW gave 0 perf gain. The
-# memref-value read latency is hidden by compute overlap in the real eval (MEMBENCH's
-# 13.7x was isolated-read latency, not the real critical path). Code kept (#ifdef'd,
-# compiles out) for reference; the real eval bottleneck is the rc_condition_t struct
-# streaming, attacked by the plan/state split instead. See project_shadow_array.
+# RC_SHADOW_VALUES: dead experiment (2026-06-29, 0 HW gain — read latency hidden by
+# compute). Guarded code kept in-tree for reference. See project_shadow_array.
 # target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_SHADOW_VALUES)
-
-# DIAGNOSTIC: uncomment to ~2x the rc_condition_t size (inert padding) and double the
-# eval's condition-struct streaming. Build once WITH and once WITHOUT, compare evl_us in
-# the CATCHUP log: evl rises -> eval is memory-bound on condition streaming (the plan/
-# state compaction will pay); evl ~flat -> CPU-bound (compaction won't help, accept 80M).
-# Decisive memory-vs-CPU probe before the high-risk eval rewrite. See project_compiled_eval.
-# RESULT 2026-06-29: BLOAT added +5.4ms/+35% to evl_us (upd unchanged = clean control) ->
-# eval IS memory-bound on condition streaming (~35% of evl). Plan/state compaction justified.
-# target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_COND_BLOAT)
-
-# DIAGNOSTIC (2026-06-30): the SECOND eval memory stream. RC_COND_BLOAT measured the
-# condition-struct stream (~35% of evl). This ~2x's rc_memref_t (16->32B) to measure the
-# memref-VALUE stream the eval reads per operand. Build once WITH, compare evl_us in
-# CATCHUP: Δevl ≈ the memref-value read % of eval. (upd_us ALSO rises — modified_memrefs
-# embed rc_memref_t — but Δevl still cleanly isolates the eval side; read evl only.)
-# Purpose: the 120M result showed eval is memory-bound but MULTI-STREAM (cond+values), so
-# single compactions (plan, shadow) each gave 0 by Amdahl. This finds if the value stream
-# is big enough that cutting cond+values TOGETHER could pay at 80M. See project_compiled_eval.
-# RESULT 2026-06-30: BLOAT added +0.7% to evl (FLAT) while upd2 rose +9% (positive control:
-# the struct IS bigger, upd feels it, eval doesn't). => the memref-VALUE stream is ~0% of eval,
-# because RC_CLEAN_REPLAY already skips operand reads on clean frames. So there is NO second
-# stream to cut -> plan+shadow combined is DEAD; eval = ~35% cond-struct (step 2 captured it) +
-# ~65% compute (irreducible). Eval EXHAUSTED at 80M. See project_compiled_eval.
-# target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_MEMREF_BLOAT)
 
 # Compact operand (step 2 of the eval compaction): FP-const storage double->float, shrinking
 # rc_operand_t 16->8B => rc_condition_t 48->32B (-33% eval streaming) AND rc_modified_memref_t
@@ -125,36 +98,10 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_INCREMENTAL_COLLECT)
 # Device-only (incr-collect not in upstream/host). Comment to A/B. See project_convergence_analysis.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_POINTER_AWARE_DIRTY)
 
-# Eval HOT/COLD split (eval-read rewrite, steps A-E, project_compiled_eval): a compact
-# 16B-per-condition rc_eval_hot_t array (op1/op2/current_hits + type/oper/cmp/flags),
-# built once per condset, that rc_test_condition + the condset evaluators stream in the
-# common (optimized_comparator) path instead of the 32B rc_condition_t. The COLD fields
-# (operand metadata, required_hits value, next, transformed/non-optimized operands) stay
-# in rc_condition_t for the rare paths. Host-validated 2308/2314 (-DRC_EVAL_PLAN
-# -DRC_COMPACT_OPERAND -DRC_EVAL_PLAN_HOST_SYNC; only the 5 FP-storage + user_agent fails).
-# Do NOT define RC_EVAL_PLAN_HOST_SYNC on device: that per-frame hot->cold mirror is host-
-# only (it re-touches the 32B cold struct, negating the win) and exists so the host tests /
-# serialization can read the cold struct. On device current_hits/is_true live canonically in
-# hot; rc_reset_condset resets hot too. Hot arrays go to PSRAM iff main sets g_rc_eval_hot_alloc
-# (else libc malloc; a NULL/failed alloc falls back to the cold path, still correct).
-# Comment out to A/B the eval-compaction gain. Expected: evl ~-50% of its streaming portion.
+# RC_EVAL_PLAN (eval hot/cold split): validated but 0 HW gain — closed 2026-06-30.
+# Guarded code kept in-tree. See project_compiled_eval.
 #target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_EVAL_PLAN)
 
-# Parallel upd Phase 2 (v0.33): the do_frame memref UPDATE splits into upd1 (leaf peeks,
-# ~free) and upd2 (modified_memref pointer-chain resolves = ~100% of upd, ~5.3ms). This
-# splits upd2 across both cores BY DEPENDENCY DEPTH: chains are bucketed by their `depth`
-# field (0 = parent is a leaf resolved in the free Phase 1; N = parent is a depth-(N-1)
-# chain), each depth is work-stolen across the 2 cores (reusing the v0.29 eval worker),
-# with a barrier between depths so a chain's parent is always resolved first. SAFE: each
-# chain writes only its own value (disjoint), the B2 leaf-unchanged hook is read-only, and
-# g_rc_chain_read_cb does NOT fire during upd (g_rc_incr_chain==0 outside collect). Runtime
-# A/B via g_par_upd_enabled; uda/udb in the FRAME log show the 2-core balance. Falls back to
-# the serial list-order resolve if buckets can't build (alloc fail / depth>=16). Comment to
-# A/B. Expected: upd2 ~5.3->~2.7ms -> df_us p50 ~17.9->~15.3ms -> steady 60. RC_PARALLEL_EVAL
-# must be on (it is by default). See project_optimization_backlog / the upd-parallel work.
-# HW RESULT 2026-06-29 (wii-coelho2.log vs wii-coelho.log): NET NEGATIVE, reverted. Only
-# ~15% of upd2 is independent (Pass A); 84% are dependency-bound deep pointer chains (Pass
-# B, serial). Pass A (~1.7ms) is too small to amortize the Core-0 worker-wake latency (Core
-# 0 is busy with WiFi/lwIP), so the per-frame barrier made df/s p50 50->48 and upd2 didn't
-# drop. Code + uda/udb instrumentation kept for reference; flag OFF.
+# RC_PARALLEL_UPD: net negative on HW (2026-06-29, upd2 is dependency-bound; barrier
+# cost > gain). Guarded code kept in-tree. See project_optimization_backlog.
 #target_compile_definitions(${COMPONENT_LIB} PUBLIC RC_PARALLEL_UPD)

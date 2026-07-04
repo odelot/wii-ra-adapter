@@ -86,12 +86,6 @@ struct rc_memref_t {
   /* The memory address of this variable. */
   uint32_t address;
 
-#ifdef RC_MEMREF_BLOAT
-  /* DIAGNOSTIC: inert padding, 16->32B (8-aligned, allocator-safe). Doubles the
-   * memref-VALUE stream the eval reads per operand -> Δevl isolates that stream.
-   * See CMake RC_MEMREF_BLOAT + project_compiled_eval. */
-  uint8_t _bloat_diag[16];
-#endif
 #ifdef RC_SHADOW_VALUES
   /* write-side slot into the compact shadow value arrays (UPD already touches this
    * struct). 0xFFFF = unassigned. Padded so sizeof(rc_memref_t) stays a multiple of 8
@@ -246,14 +240,6 @@ struct rc_condition_t {
 
   /* Unique identifier of optimized comparator to use. (RC_PROCESSING_COMPARE_*) */
   uint8_t optimized_comparator;
-
-#ifdef RC_COND_BLOAT
-  /* DIAGNOSTIC ONLY (project_compiled_eval): inert padding that ~doubles sizeof to
-   * double the eval's condition-struct streaming. Build with -DRC_COND_BLOAT and
-   * compare evl_us vs normal: evl rises => eval is memory-bound on condition
-   * streaming (plan/state compaction will pay); evl flat => CPU-bound (don't bother). */
-  uint8_t _bloat_diag[48];
-#endif
 };
 
 /*****************************************************************************\

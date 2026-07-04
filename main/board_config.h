@@ -28,7 +28,7 @@
 
 /* >>> SELECT THE TARGET BOARD HERE <<< */
 #ifndef BOARD_VARIANT
-#define BOARD_VARIANT  BOARD_DEV
+#define BOARD_VARIANT  BOARD_XIAO
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -46,6 +46,11 @@
   /* Unlock LED: onboard WS2812 RGB on GPIO48. */
   #define LED_USE_RGB    1
   #define PIN_RGB        48
+
+  /* Passive buzzer for RA event sounds (login/error/unlock/mastery). GPIO9 is
+   * the SPI2 FSPIHD IO_MUX pin, but the EXI slave runs plain 4-wire SPI
+   * (quadhd_io_num = -1 in exi_spi_slave.cpp) so it is free here. */
+  #define PIN_BUZZER     9
 
 /* ---------------------------------------------------------------------------
  * BOARD_XIAO — Seeed Studio XIAO ESP32S3
@@ -70,8 +75,24 @@
   #define PIN_LED_GPIO        21
   #define PIN_LED_ACTIVE_LOW  1
 
+  /* Passive buzzer for RA event sounds (login/error/unlock/mastery). */
+  #define PIN_BUZZER          4   // XIAO pad D3
+
 #else
   #error "board_config.h: BOARD_VARIANT must be BOARD_DEV or BOARD_XIAO"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Buzzer type (applies to whichever board is selected above)
+ *
+ *   1 = ACTIVE buzzer  — has an internal oscillator with a FIXED pitch; the
+ *       GPIO only gates it on/off (via the driver transistor). Note frequencies
+ *       are ignored, so the jingles play as rhythm patterns of beeps.
+ *   0 = PASSIVE buzzer/piezo — no internal oscillator; LEDC PWM generates each
+ *       note's frequency on the pin, so the jingles play as real melodies.
+ * ------------------------------------------------------------------------- */
+#ifndef BUZZER_ACTIVE
+#define BUZZER_ACTIVE  1
 #endif
 
 #endif /* BOARD_CONFIG_H */

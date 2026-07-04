@@ -371,6 +371,17 @@ extern volatile int g_rc_u1_active;        /* 1 only while the serial upd walk r
  * NOTE: declared in BOTH rc_internal.h copies. */
 extern int (*g_rc_phasec_read)(uint32_t mm_index, uint32_t* raw_out);
 extern int (*g_rc_phasec_covered)(uint32_t mm_index);
+
+/* Phase C authoritative hooks (memref.c; adapter-registered, NULL = legacy).
+ * mm_index = dense modified_memref position in list order (== the U1 cursor
+ * ordering == the counter in rc_memrefs_get_pending_addresses).
+ *   g_rc_phasec_read: 0 = not covered, 1 = *raw_out is the LE-packed leaf
+ *     bytes (apply rc_memref_mask), 2 = slot not ready (gate bumped; keep
+ *     stale value, frame defers). Used by rc_upd_resolve_one (rc_client.c).
+ *   g_rc_phasec_covered: collect walk skips covered chains entirely.
+ * NOTE: declared in BOTH rc_internal.h copies. */
+extern int (*g_rc_phasec_read)(uint32_t mm_index, uint32_t* raw_out);
+extern int (*g_rc_phasec_covered)(uint32_t mm_index);
 void rc_update_memref_value(rc_memref_value_t* memref, uint32_t value);
 void rc_get_memref_value(rc_typed_value_t* value, rc_memref_t* memref, int operand_type);
 uint32_t rc_get_modified_memref_value(const rc_modified_memref_t* memref, rc_peek_t peek, void* ud);

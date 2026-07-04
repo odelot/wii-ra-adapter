@@ -1251,6 +1251,22 @@ void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs) {
 volatile int g_rc_resfix_enabled = 1;   /* A/B + safety toggle: 0 = old diverging behavior */
 volatile unsigned long g_rc_resfix_d1 = 0, g_rc_resfix_d2 = 0, g_rc_resfix_chain_dp = 0;
 
+/* Phase C authoritative hooks (adapter-registered; NULL = everything legacy).
+ * mm_index = dense position of the modified_memref in list order — the SAME
+ * ordering as the U1 cursor (rc_upd_serial walk) and as the collect loop in
+ * rc_memrefs_get_pending_addresses (which counts EVERY mm, indirect or not).
+ *   g_rc_phasec_read: upd leaf source for covered INDIRECT chains.
+ *     returns 0 = not covered (legacy path), 1 = *raw_out has the LE-packed
+ *     leaf bytes (caller applies rc_phasec_leaf_value), 2 = slot not ready
+ *     (adapter bumped the do_frame gate; caller keeps the stale value and
+ *     returns — the gate defers + rolls the frame back).
+ *   g_rc_phasec_covered: collect skip — a covered chain NEVER needs EXI
+ *     resolution (its leaf arrives positionally every snapshot), so the
+ *     collect walk must not surface its leaf (that would re-grow the flat
+ *     watchlist with bytes Phase C already ships). */
+int (*g_rc_phasec_read)(uint32_t mm_index, uint32_t* raw_out) = 0;
+int (*g_rc_phasec_covered)(uint32_t mm_index) = 0;
+
 /* Pointer-aware dirtying (RC_POINTER_AWARE_DIRTY): only register POINTER reads (the
  * intermediate chain levels, reached via recursion at depth>0) in the reverse index,
  * NOT the top-level LEAF read (depth 0). A chain's resolved leaf ADDRESS only changes
@@ -1398,6 +1414,7 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
   const rc_modified_memref_list_t* modified_list;
   uint32_t count = 0;
   uint32_t i;
+  uint32_t mm_index = 0;   /* dense mm position (Phase C map key) */
 
   if (!memrefs || !out_addresses || !out_sizes || out_capacity == 0 || !is_cached)
     return 0;
@@ -1415,12 +1432,20 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
       uint8_t pending_size = 1;
       int found_miss = 0;
       int already_present;
+      uint32_t this_idx = mm_index++;   /* counts EVERY mm, like the U1 cursor */
 
       /* Only INDIRECT chains introduce fetchable RAM addresses; other
        * modifiers (mask/accumulate) are value transforms with no own
        * address. (Their parents are still walked when reached via an
        * INDIRECT leaf's recursion.) */
       if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ)
+        continue;
+
+      /* Phase C authoritative: a covered chain's leaf ships positionally in
+       * every snapshot — it never needs EXI resolution, and surfacing it
+       * here would re-grow the flat watchlist with bytes Phase C already
+       * carries. Skipped BEFORE the walk budget (costs nothing). */
+      if (g_rc_phasec_covered && g_rc_phasec_covered(this_idx))
         continue;
 
 #ifdef RC_INCREMENTAL_COLLECT
@@ -1480,4 +1505,356 @@ budget_done:                /* lever B early-exit: remaining dirty chains carrie
   g_rc_incr_chain = 0;   /* don't attribute reads outside the collect walk */
 #endif
   return count;
+}
+
+/* ==== Phase C step-0 census (v2) ============================================
+ * One-shot, read-only classification of every INDIRECT_READ chain at game
+ * load: can the d2x-side chain walker ("Phase C" descriptors) resolve it?
+ * The walker node shape (mirrors rc_resolve_cached_raw's current-value path):
+ *   node value = INDIRECT: read(mask(parent) + modifier)
+ *              | combine:  ALU_op(mask(parent), modifier)   (MULT..SUB_ACC)
+ * with parent = current-value memref (static root or another eligible node),
+ * modifier = integer const (strict) or a current-value memref (grade 2 —
+ * needs modifier slots in the descriptor). v1 rejected combine parents and
+ * scored SMG 0% — Wii sets convert virtual pointers via `ptr & 0x01FFFFFF` /
+ * `- 0x80000000` combines, so combines in the path are THE common case.
+ * Ineligible chains stay on the legacy ADDR_QUERY path (Nintendont/GC keep
+ * legacy). Touches no state. */
+
+#define RC_PHASEC_R_NONE     0xFF
+#define RC_PHASEC_R_DP       0   /* delta/prior parent operand */
+#define RC_PHASEC_R_XFORM    1   /* bcd/inverted parent operand */
+#define RC_PHASEC_R_NONMEM   2   /* parent operand not a memref (const/func/recall) */
+#define RC_PHASEC_R_CHAIN    3   /* null memref / depth guard */
+#define RC_PHASEC_R_MODIFIER 4   /* modifier not const nor current-value memref */
+#define RC_PHASEC_R_OP       5   /* combine operator outside the ALU set */
+
+/* Transitive walk. Returns 0 = ineligible, 1 = strict (const-only),
+ * 2 = eligible if the descriptor supports memref modifiers. First blocking
+ * reason lands in *reason. record != 0 => second pass over a known-eligible
+ * chain filling the op/parent-size histograms (counts per level walked, i.e.
+ * walker work, not distinct mms). */
+static int rc_phasec_node(const rc_memref_t* m, int guard, uint8_t* reason,
+                          rc_phasec_census_t* out, int record);
+
+/* v3: follow a memref-yielding operand (parent or memref modifier).
+ * RECALL is a STATIC reference to the remembered expression's memref
+ * (operand.c: parse->remember is memcpy'd at parse; eval reads
+ * value.memref via memref_access_type) — so the walker can follow it
+ * like any other node. RECALL-of-a-constant is an immediate. */
+static int rc_phasec_follow(const rc_operand_t* op, int guard, uint8_t* reason,
+                            rc_phasec_census_t* out, int record) {
+  uint8_t access = op->type;
+
+  if (op->type == RC_OPERAND_RECALL) {
+    access = op->memref_access_type;
+    if (!rc_operand_type_is_memref(access))
+      return 1;   /* remembered constant — immediate value */
+    if (record) ++out->recall_hops;
+  }
+
+  if (access == RC_OPERAND_DELTA || access == RC_OPERAND_PRIOR) {
+    if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_DP;
+    return 0;
+  }
+  if (access != RC_OPERAND_ADDRESS) {
+    if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_XFORM;
+    return 0;
+  }
+  if (record) ++out->parent_size_hist[op->size & 31];
+  return rc_phasec_node(op->value.memref, guard, reason, out, record);
+}
+
+static int rc_phasec_node(const rc_memref_t* m, int guard, uint8_t* reason,
+                          rc_phasec_census_t* out, int record) {
+  const rc_modified_memref_t* mm;
+  int gp, gm = 1;
+
+  if (!m || guard <= 0) {
+    if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_CHAIN;
+    return 0;
+  }
+  if (m->value.memref_type != RC_MEMREF_TYPE_MODIFIED_MEMREF)
+    return 1;   /* static root — already in the d2x flat watchlist */
+
+  mm = (const rc_modified_memref_t*)m;
+
+  /* operator: INDIRECT_READ or an integer ALU combine (MULT..SUB_ACCUMULATOR) */
+  if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ) {
+    if (mm->modifier_type < RC_OPERATOR_MULT ||
+        mm->modifier_type > RC_OPERATOR_SUB_ACCUMULATOR) {
+      if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_OP;
+      return 0;
+    }
+    if (record) ++out->op_hist[mm->modifier_type];
+  }
+
+  /* modifier: integer const (strict), or memref/recall (grade 2 — the
+   * descriptor needs a modifier value slot) */
+  if (mm->modifier.type == RC_OPERAND_CONST) {
+    gm = 1;
+  }
+  else if (rc_operand_type_is_memref(mm->modifier.type) ||
+           mm->modifier.type == RC_OPERAND_RECALL) {
+    int g = rc_phasec_follow(&mm->modifier, guard - 1, reason, out, record);
+    if (!g) {
+      if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_MODIFIER;
+      return 0;
+    }
+    gm = (g > 2) ? g : 2;
+  }
+  else {
+    if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_MODIFIER;
+    return 0;
+  }
+
+  /* parent operand: const base, or a current-value memref/recall chain
+   * (masked with the OPERAND's size at each level) */
+  if (mm->parent.type == RC_OPERAND_CONST) {
+    if (record) ++out->const_base;
+    gp = 1;
+  }
+  else if (rc_operand_type_is_memref(mm->parent.type) ||
+           mm->parent.type == RC_OPERAND_RECALL) {
+    gp = rc_phasec_follow(&mm->parent, guard - 1, reason, out, record);
+    if (!gp) return 0;
+  }
+  else {
+    if (*reason == RC_PHASEC_R_NONE) {
+      *reason = RC_PHASEC_R_NONMEM;
+      ++out->nonmem_hist[mm->parent.type < 10 ? mm->parent.type : 9];
+    }
+    return 0;
+  }
+
+  return (gm > gp) ? gm : gp;
+}
+
+void rc_memrefs_phasec_census(const rc_memrefs_t* memrefs, rc_phasec_census_t* out) {
+  const rc_modified_memref_list_t* list;
+
+  if (!out)
+    return;
+  memset(out, 0, sizeof(*out));
+  if (!memrefs)
+    return;
+
+  list = &memrefs->modified_memrefs;
+  do {
+    const rc_modified_memref_t* mm = list->items;
+    const rc_modified_memref_t* stop = mm + list->count;
+
+    for (; mm < stop; ++mm) {
+      uint8_t reason = RC_PHASEC_R_NONE;
+      int g;
+
+      ++out->mm_total;
+      if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ)
+        continue;   /* combines are only walked as parents of INDIRECT leaves */
+      ++out->mm_indirect;
+
+      /* guard 64: SMG chains are deep (each deref level costs 2-3 nodes:
+       * indirect + its mask combine); 16 tripped on real chains (v2 chain=235) */
+      g = rc_phasec_node(&mm->memref, 64, &reason, out, 0);
+      if (g) {
+        uint8_t leaf_bytes = rc_memref_addr_bytes(mm->memref.value.size);
+        uint16_t d = mm->depth < 7 ? mm->depth : 7;
+        uint8_t r2 = RC_PHASEC_R_NONE;
+        if (g == 1) ++out->eligible; else ++out->eligible_mref_mod;
+        ++out->depth_hist[d];
+        ++out->leaf_bytes_hist[leaf_bytes < 4 ? leaf_bytes : 4];
+        out->eligible_value_bytes += leaf_bytes;
+        rc_phasec_node(&mm->memref, 64, &r2, out, 1);   /* histogram pass */
+      }
+      else switch (reason) {
+        case RC_PHASEC_R_DP:       ++out->inel_parent_dp;     break;
+        case RC_PHASEC_R_XFORM:    ++out->inel_parent_xform;  break;
+        case RC_PHASEC_R_NONMEM:   ++out->inel_parent_nonmem; break;
+        case RC_PHASEC_R_MODIFIER: ++out->inel_modifier;      break;
+        case RC_PHASEC_R_OP:       ++out->inel_op;            break;
+        default:                   ++out->inel_parent_chain;  break;
+      }
+    }
+
+    list = list->next;
+  } while (list);
+}
+
+/* ==== Phase C node-table emitter ============================================
+ * Serializes every eligible INDIRECT chain into the dependency-ordered,
+ * DAG-dedup'd rc_phasec_node_t table (see rc_internal.h for the wire layout).
+ * Semantics mirror rc_resolve_cached_raw's current-value path EXACTLY:
+ *   deref node value = LE-pack of `width` raw bytes at mask(parent)+operand
+ *   edge            = rc_transform_memref_value(parent_value, psize)
+ *   combine         = integer op(parent_value, operand); SUB_PARENT =
+ *                     operand - parent; ADD/SUB_ACCUMULATOR = value +/- mod
+ *   immediate       = operand (const parent / remembered constant)
+ * The emitter is STRICTER than the census: edge sizes limited to full-byte
+ * masks/swaps (raw-byte packing == rc_peek_value masking for those), FP
+ * immediates refused. Refused chains stay on the legacy ADDR_QUERY path. */
+
+/* Full-byte integer edge transforms the ARM walker implements. Sub-byte
+ * (LOW/HIGH/BIT0-7/BITCOUNT) edges are refused: their rc_peek_value masking
+ * differs from raw-byte packing when edge size != node size. */
+static int rc_phasec_edge_size_ok(uint8_t size) {
+  switch (size) {
+    case RC_MEMSIZE_8_BITS:
+    case RC_MEMSIZE_16_BITS:
+    case RC_MEMSIZE_24_BITS:
+    case RC_MEMSIZE_32_BITS:
+    case RC_MEMSIZE_16_BITS_BE:
+    case RC_MEMSIZE_24_BITS_BE:
+    case RC_MEMSIZE_32_BITS_BE:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+typedef struct rc_phasec_emit_ctx_t {
+  rc_phasec_node_t* nodes;
+  const void** keys;      /* dedup map: keys[slot] = memref/operand ptr */
+  uint32_t cap;
+  uint32_t count;
+  uint32_t blob;          /* per-frame value blob bytes (shipped derefs) */
+  uint32_t shipped;
+  int overflow;
+} rc_phasec_emit_ctx_t;
+
+static int32_t rc_phasec_emit_push(const void* key, uint32_t operand,
+                                   uint16_t parent, uint8_t op, uint8_t psize,
+                                   rc_phasec_emit_ctx_t* c) {
+  if (c->count >= c->cap) {
+    c->overflow = 1;
+    return -1;
+  }
+  c->keys[c->count] = key;
+  c->nodes[c->count].operand = operand;
+  c->nodes[c->count].parent  = parent;
+  c->nodes[c->count].op      = op;
+  c->nodes[c->count].psize   = psize;
+  return (int32_t)c->count++;
+}
+
+static int32_t rc_phasec_emit_memref(const rc_memref_t* m, int guard,
+                                     rc_phasec_emit_ctx_t* c) {
+  const rc_modified_memref_t* mm;
+  const rc_operand_t* p;
+  int32_t parent_slot, slot;
+  uint32_t operand;
+  uint8_t psize, width, access;
+  uint32_t i;
+
+  if (!m || guard <= 0 || c->overflow)
+    return -1;
+
+  /* dedup (linear scan — one-shot at game load) */
+  for (i = 0; i < c->count; ++i)
+    if (c->keys[i] == (const void*)m) return (int32_t)i;
+
+  if (m->value.memref_type != RC_MEMREF_TYPE_MODIFIED_MEMREF) {
+    /* static root: deref of an absolute address, not shipped (roots stay in
+     * the flat watchlist; the walker reads them fresh each frame anyway) */
+    width = rc_memref_addr_bytes(m->value.size);
+    if (width < 1 || width > 4) return -1;
+    return rc_phasec_emit_push(m, m->address, RC_PHASEC_PARENT_NONE,
+                               (uint8_t)(RC_OPERATOR_INDIRECT_READ | ((width - 1u) << 5)),
+                               0, c);
+  }
+
+  mm = (const rc_modified_memref_t*)m;
+
+  /* modifier: integer const only (mref-modifier chains refused in v1) */
+  if (mm->modifier.type != RC_OPERAND_CONST) return -1;
+  operand = mm->modifier.value.num;
+
+  /* parent operand -> slot + edge transform */
+  p = &mm->parent;
+  access = p->type;
+  if (p->type == RC_OPERAND_CONST) {
+    /* const base: immediate pseudo-node (keyed by the operand ptr). The
+     * resolver evaluates const parents with NO size transform. */
+    parent_slot = rc_phasec_emit_push(p, p->value.num, RC_PHASEC_PARENT_NONE,
+                                      RC_OPERATOR_NONE, 0, c);
+    psize = RC_MEMSIZE_32_BITS;
+  }
+  else {
+    if (p->type == RC_OPERAND_RECALL) {
+      access = p->memref_access_type;
+      if (!rc_operand_type_is_memref(access)) {
+        /* remembered immediate — rc_evaluate_operand returns the const with
+         * NO transform (early return). Integer only. */
+        if (access != RC_OPERAND_CONST) return -1;
+        parent_slot = rc_phasec_emit_push(p, p->value.num, RC_PHASEC_PARENT_NONE,
+                                          RC_OPERATOR_NONE, 0, c);
+        psize = RC_MEMSIZE_32_BITS;
+        goto have_parent;
+      }
+    }
+    if (access != RC_OPERAND_ADDRESS) return -1;   /* delta/prior/bcd/inv */
+    if (!rc_phasec_edge_size_ok(p->size)) return -1;
+    psize = p->size;
+    parent_slot = rc_phasec_emit_memref(p->value.memref, guard - 1, c);
+  }
+have_parent:
+  if (parent_slot < 0) return -1;
+
+  if (mm->modifier_type == RC_OPERATOR_INDIRECT_READ) {
+    width = rc_memref_addr_bytes(mm->memref.value.size);
+    if (width < 1 || width > 4) return -1;
+    slot = rc_phasec_emit_push(m, operand, (uint16_t)parent_slot,
+                               (uint8_t)(RC_OPERATOR_INDIRECT_READ | ((width - 1u) << 5) | 0x80u),
+                               psize, c);
+    if (slot >= 0) {
+      c->blob += width;
+      ++c->shipped;
+    }
+    return slot;
+  }
+
+  /* integer ALU combine */
+  if (mm->modifier_type < RC_OPERATOR_MULT ||
+      mm->modifier_type > RC_OPERATOR_SUB_ACCUMULATOR)
+    return -1;
+  return rc_phasec_emit_push(m, operand, (uint16_t)parent_slot,
+                             mm->modifier_type, psize, c);
+}
+
+uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
+                                rc_phasec_node_t* nodes, const void** keys,
+                                uint32_t cap, uint32_t* out_blob_bytes,
+                                uint32_t* out_shipped, uint32_t* out_refused) {
+  const rc_modified_memref_list_t* list;
+  rc_phasec_emit_ctx_t c;
+
+  memset(&c, 0, sizeof(c));
+  c.nodes = nodes;
+  c.keys = keys;
+  c.cap = cap;
+  if (out_blob_bytes) *out_blob_bytes = 0;
+  if (out_shipped)    *out_shipped = 0;
+  if (out_refused)    *out_refused = 0;
+  if (!memrefs || !nodes || !keys || !cap)
+    return 0;
+
+  list = &memrefs->modified_memrefs;
+  do {
+    const rc_modified_memref_t* mm = list->items;
+    const rc_modified_memref_t* stop = mm + list->count;
+
+    for (; mm < stop; ++mm) {
+      if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ)
+        continue;
+      if (rc_phasec_emit_memref(&mm->memref, 64, &c) < 0 && out_refused)
+        ++*out_refused;
+      if (c.overflow)
+        return 0xFFFFFFFFu;
+    }
+
+    list = list->next;
+  } while (list);
+
+  if (out_blob_bytes) *out_blob_bytes = c.blob;
+  if (out_shipped)    *out_shipped = c.shipped;
+  return c.count;
 }

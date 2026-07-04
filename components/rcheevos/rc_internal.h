@@ -324,6 +324,84 @@ uint32_t rc_memrefs_get_pending_addresses(const rc_memrefs_t* memrefs,
                                           rc_is_cached_t is_cached,
                                           void* ud);
 
+/* Phase C step-0 census v2 (memref.c): classify every INDIRECT_READ chain by
+ * whether the d2x-side chain walker can resolve it. Walker node shape:
+ * INDIRECT = read(mask(parent)+modifier); combine = ALU_op(mask(parent),
+ * modifier) for MULT..SUB_ACCUMULATOR. Parents = current-value memrefs
+ * (transitive); modifier = int const (strict) or current-value memref
+ * (grade 2, eligible_mref_mod). Read-only, one-shot at game load. Ineligible
+ * chains stay on legacy ADDR_QUERY. NOTE: declared in BOTH rc_internal.h. */
+typedef struct rc_phasec_census_t {
+  uint32_t mm_total;             /* all modified memrefs */
+  uint32_t mm_indirect;          /* INDIRECT_READ chains (leaf reads) */
+  uint32_t eligible;             /* strict: const-only walk */
+  uint32_t eligible_mref_mod;    /* needs memref-modifier slots in the descriptor */
+  uint32_t inel_parent_dp;       /* parent operand is DELTA/PRIOR */
+  uint32_t inel_parent_xform;    /* parent operand is BCD/INVERTED */
+  uint32_t inel_parent_nonmem;   /* parent operand not a memref (const/func/recall) */
+  uint32_t inel_parent_chain;    /* null memref / depth guard tripped */
+  uint32_t inel_modifier;        /* modifier not const nor current-value memref */
+  uint32_t inel_op;              /* combine operator outside MULT..SUB_ACCUMULATOR */
+  uint32_t op_hist[18];          /* combine RC_OPERATOR_* walked in eligible chains */
+  uint32_t nonmem_hist[10];      /* RC_OPERAND_* of the non-memref parents (idx 9 = other) */
+  uint32_t depth_hist[8];        /* eligible chains by mm->depth (clamped; levels = depth+1) */
+  uint32_t leaf_bytes_hist[5];   /* eligible chains by leaf byte width (1/2/3/4+) */
+  uint32_t parent_size_hist[32]; /* parent operand RC_MEMSIZE_* per level walked (eligible) */
+  uint32_t eligible_value_bytes; /* wire cost: sum of leaf bytes across eligible chains */
+  uint32_t recall_hops;          /* v3: RECALL edges followed in eligible chains (static
+                                  * refs to the remembered expression's memref) */
+  uint32_t const_base;           /* v3: const parent operands (fixed base) in eligible chains */
+} rc_phasec_census_t;
+void rc_memrefs_phasec_census(const rc_memrefs_t* memrefs, rc_phasec_census_t* out);
+
+/* Phase C node table (emitter in memref.c). One 8-byte node per distinct
+ * walker step, dependency-ordered (parents before children), DAG-dedup'd by
+ * memref pointer. Wire format for the d2x CHAIN_TABLE.
+ *   op byte: bits 0-4 = RC_OPERATOR_* (INDIRECT_READ = deref [read
+ *            mask(parent)+operand]; MULT..SUB_ACCUMULATOR = integer ALU
+ *            combine [SUB_PARENT = operand-parent, ACCs = add/sub, mirroring
+ *            rc_resolve_cached_raw]; NONE = integer immediate, operand =
+ *            value, no parent), bits 5-6 = deref read width - 1 (raw bytes,
+ *            LE-packed exactly like the adapter peek / memory_data), bit 7 =
+ *            shipped (leaf bytes present in the per-frame value blob, slot
+ *            order; blob offsets derivable by scanning shipped widths).
+ *   psize:   RC_MEMSIZE_* transform applied to the PARENT's value before
+ *            op/operand (only full-byte sizes 8/16/24/32 + 16/24/32 BE are
+ *            emitted — sub-byte/float edges are refused to keep the ARM
+ *            walker's transform surface exact vs rc_peek_value masking).
+ *   root deref: parent == RC_PHASEC_PARENT_NONE, operand = absolute address
+ *            (not shipped — roots stay in the flat watchlist). */
+#define RC_PHASEC_PARENT_NONE 0xFFFF
+#define RC_PHASEC_OP(n)       ((uint8_t)((n)->op & 0x1F))
+#define RC_PHASEC_WIDTH(n)    ((uint8_t)((((n)->op >> 5) & 3) + 1))
+#define RC_PHASEC_SHIPPED(n)  ((uint8_t)((n)->op >> 7))
+typedef struct rc_phasec_node_t {
+  uint32_t operand;   /* const offset/mask/addend/immediate, or root address */
+  uint16_t parent;    /* parent slot, or RC_PHASEC_PARENT_NONE */
+  uint8_t  op;        /* see above */
+  uint8_t  psize;     /* RC_MEMSIZE_* edge transform on the parent value */
+} rc_phasec_node_t;
+/* Emit the table for every eligible INDIRECT chain. keys = caller scratch
+ * (cap entries) for the dedup map, only needed during the call. Returns node
+ * count, or 0xFFFFFFFF on cap overflow. out_blob_bytes = per-frame value blob
+ * size; out_shipped = shipped deref count; out_refused = census-eligible
+ * chains the emitter still refused (stricter edge-size/immediate rules). */
+uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
+                                rc_phasec_node_t* nodes, const void** keys,
+                                uint32_t cap, uint32_t* out_blob_bytes,
+                                uint32_t* out_shipped, uint32_t* out_refused);
+
+/* Phase C authoritative hooks (memref.c; adapter-registered, NULL = legacy).
+ * mm_index = dense modified_memref position in list order (== the U1 cursor
+ * ordering == the counter in rc_memrefs_get_pending_addresses).
+ *   g_rc_phasec_read: 0 = not covered, 1 = *raw_out is the LE-packed leaf
+ *     bytes (apply rc_memref_mask), 2 = slot not ready (gate bumped; keep
+ *     stale value, frame defers). Used by rc_upd_resolve_one (rc_client.c).
+ *   g_rc_phasec_covered: collect walk skips covered chains entirely.
+ * NOTE: declared in BOTH rc_internal.h copies. */
+extern int (*g_rc_phasec_read)(uint32_t mm_index, uint32_t* raw_out);
+extern int (*g_rc_phasec_covered)(uint32_t mm_index);
+
 void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_parse_state_t* parse);
 int rc_trigger_state_active(int state);
 rc_memrefs_t* rc_trigger_get_memrefs(rc_trigger_t* self);

@@ -132,6 +132,16 @@ typedef enum {
      * nes-ra-adapter: WiiFlow triggers it from a Settings menu entry.
      */
     RA_CMD_RESET_CREDENTIALS = 0x0A,
+
+    /**
+     * Phase C: fetch one chunk of the chain descriptor table (after the
+     * watchlist fetch, once per game). Payload: ra_chain_chunk_req_t.
+     * Response: ra_chain_chunk_t + node_count × RA_CHAIN_NODE_SIZE nodes.
+     * Consoles that never send this (Nintendont, GameCube adapter) stay
+     * pure-legacy; an ESP with no table answers node_count=0/is_last=1,
+     * which disables Phase C for the game on the console side too.
+     */
+    RA_CMD_GET_CHAIN_CHUNK   = 0x0B,
 } ra_gc_command_t;
 
 /*
@@ -306,8 +316,22 @@ typedef struct __attribute__((packed)) {
                               * against the ESP's emitted seq every frame —
                               * behind → resend exactly the next mutation
                               * (idempotent); impossible → full RESYNC. */
-    /* Followed by addr_count bytes: values[0..addr_count-1] */
-    /* Each byte corresponds to the address at the same index in the watch list */
+    uint16_t chain_first;    /* Phase C: first SHIPPED-slot index of this
+                              * frame's rotating chain window (shipped order
+                              * == blob order; both sides derive it from the
+                              * table's shipped bits). Rotates so flat+chain
+                              * always fits the 8192B EXI transaction even
+                              * while the legacy flat list is at full size
+                              * (shadow phase); once the flat list shrinks the
+                              * window naturally covers the whole table. */
+    uint16_t chain_count;    /* shipped slots in the window (0 = no chain data) */
+    uint16_t chain_blob_len; /* bytes of chain leaf values in the window */
+    /* Followed by addr_count bytes: flat values[0..addr_count-1]
+     * (byte i corresponds to watch list index i),
+     * then ceil(chain_count/8) validity-bitmap bytes (bit i = window slot i
+     * walked to an in-range address; invalid slots ship zero-filled bytes),
+     * then chain_blob_len bytes of leaf values (window order, widths from
+     * the chain table). */
 } ra_snapshot_header_t;
 
 /*
@@ -422,6 +446,74 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint16_t addr_count;     /* Number of values (big-endian) */
 } ra_addr_response_t;
+
+/*
+ * ============================================================================
+ * Phase C — chain descriptor table (Wii d2x pair only)
+ * ============================================================================
+ * The ESP compiles every eligible AddAddress pointer chain into a flat,
+ * dependency-ordered, DAG-dedup'd node table (rc_phasec_node_t — semantics
+ * documented in rcheevos rc_internal.h). The console fetches it once per
+ * game via RA_CMD_GET_CHAIN_CHUNK, then WALKS the chains directly in game
+ * RAM every frame and ships always-fresh leaf values positionally in the
+ * SNAPSHOT (chain window). Pointer moves are thus resolved same-frame with
+ * ZERO ADDR_QUERY round-trips; the legacy path remains for delta/prior-
+ * rooted and exotic chains (and for Nintendont/GameCube, which never fetch
+ * a table).
+ */
+
+/** Wire node: {u32 operand, u16 parent, u8 op, u8 psize} — ints big-endian.
+ *  op bits 0-4 = RC_OPERATOR_* (INDIRECT_READ = deref, NONE = immediate),
+ *  bits 5-6 = deref width-1 (raw bytes, lowest address first), bit 7 =
+ *  shipped (leaf bytes present in the snapshot blob, table order).
+ *  parent = earlier node index, or 0xFFFF (root: operand = absolute addr). */
+#define RA_CHAIN_NODE_SIZE       8
+
+/* op codes (bits 0-4) — numeric values MUST match rcheevos RC_OPERATOR_*
+ * (the console walker has no rcheevos headers; keep this table in sync). */
+#define RA_CN_OP_NONE            6   /* integer immediate (operand = value) */
+#define RA_CN_OP_MULT            7
+#define RA_CN_OP_DIV             8   /* /0 yields 0 */
+#define RA_CN_OP_AND             9
+#define RA_CN_OP_XOR             10
+#define RA_CN_OP_MOD             11  /* %0 yields 0 */
+#define RA_CN_OP_ADD             12
+#define RA_CN_OP_SUB             13
+#define RA_CN_OP_SUB_PARENT      14  /* operand - parent */
+#define RA_CN_OP_ADD_ACC         15  /* parent + operand */
+#define RA_CN_OP_SUB_ACC         16  /* parent - operand */
+#define RA_CN_OP_DEREF           17  /* INDIRECT_READ */
+/* psize codes — numeric values MUST match rcheevos RC_MEMSIZE_*. Only these
+ * seven are ever emitted (the emitter refuses sub-byte/float edges). */
+#define RA_CN_SZ_8               0
+#define RA_CN_SZ_16              1
+#define RA_CN_SZ_24              2
+#define RA_CN_SZ_32              3
+#define RA_CN_SZ_16_BE           15
+#define RA_CN_SZ_24_BE           16
+#define RA_CN_SZ_32_BE           17
+
+/** Console-side static cap; the ESP refuses to emit past its own cap. */
+#define RA_MAX_CHAIN_NODES       2048
+
+/** Nodes per GET_CHAIN_CHUNK response:
+ *  6B esp hdr + 8B chunk hdr + N×8 <= EXI_MAX_TRANSACTION_SIZE (8192) */
+#define RA_CHAIN_CHUNK_NODES     512
+
+/** RA_CMD_GET_CHAIN_CHUNK request payload (sent by console) */
+typedef struct __attribute__((packed)) {
+    uint16_t chunk_index;    /* big-endian, 0-based */
+} ra_chain_chunk_req_t;
+
+/** RA_CMD_GET_CHAIN_CHUNK response header, followed by node_count nodes.
+ *  node_count == 0 on chunk 0 => no table for this game (Phase C off). */
+typedef struct __attribute__((packed)) {
+    uint16_t chunk_index;    /* echoes the requested index */
+    uint16_t node_count;     /* nodes in THIS chunk */
+    uint16_t total_nodes;    /* whole-table count (repeated in every chunk) */
+    uint8_t  is_last;        /* 1 if final chunk */
+    uint8_t  reserved;
+} ra_chain_chunk_t;
 
 /**
  * RA_EVT_ACHIEVEMENT data

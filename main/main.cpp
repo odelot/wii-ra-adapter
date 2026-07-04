@@ -69,6 +69,7 @@ Unlock LED:               WS2812 RGB GPIO48        yellow user LED GPIO21 (activ
 #include "gc_ra_protocol.h"
 #include "exi_spi_slave.h"
 #include "ra_http.h"
+#include "ra_web.h"
 #include "wii_game_hashes.h"
 #include "driver/gpio.h"
 #include "PsramStream.h"
@@ -138,7 +139,7 @@ extern "C" {
  * Raise to 2 only while investigating. Combined with the enlarged UART
  * TX buffer in setup(), level 1 keeps hot windows burst-free. */
 #ifndef RA_LOG_LEVEL
-#define RA_LOG_LEVEL 1
+#define RA_LOG_LEVEL 2
 #endif
 #include <stdarg.h>
 /* ============================================================================
@@ -930,6 +931,17 @@ static bool mut_deliver_next(void) {
 #define GC_PERIOD_FRAMES 600u   /* run the periodic GC every ~10s of game frames */
 #define GC_MIN_AGE       3600u  /* periodic GC evicts entries cold for ≥ ~1 min */
 
+/* Phase C freshness guard: with the chain window sharing the 8192B snapshot
+ * transaction, FULL per-frame slot coverage holds only while
+ *   flat <= 8192 - headers - bitmap - blob   (~3786 for SMG's table).
+ * Above that the window rotates and slots go 1-2 frames stale (graceful but
+ * silent). So in authoritative mode the pressure-eviction threshold is
+ * LOWERED to fire before that line (computed per game in on_game_loaded,
+ * with a 64B margin); the battle-tested half-dump reclaim then keeps the
+ * flat comfortably inside the always-fresh budget. Legacy games keep the
+ * compile-time WATCHLIST_HIGH_WATER. */
+static uint16_t g_watch_high_water = WATCHLIST_HIGH_WATER;
+
 /* Forward decl. evict_lru lives near watchlist_update_if_changed; the trigger
  * is at the SNAPSHOT handler (converged state, before resolution) since v0.31.
  * pressure=true → HIGH_WATER emergency; pressure=false → periodic GC. */
@@ -970,6 +982,27 @@ static volatile bool addr_query_pending = false;
 #define PEEK_MISS_MAX 256
 static uint32_t peek_miss_addrs[PEEK_MISS_MAX];
 static uint16_t peek_miss_count = 0;
+
+/* Phase C node table (built in on_game_loaded; served to the d2x via
+ * RA_CMD_GET_CHAIN_CHUNK). PSRAM; freed/rebuilt per game. count==0 =>
+ * Phase C inactive for this game (everything on the legacy path). */
+static rc_phasec_node_t* g_phasec_nodes = NULL;
+static uint32_t g_phasec_node_count = 0;
+static uint32_t g_phasec_blob_bytes = 0;
+/* Shadow-phase ingestion state (persistent across rotating windows):
+ * blob = raw leaf bytes per shipped slot (offsets = prefix sums of widths),
+ * valid/fresh = 1 bit per shipped slot. Compared against the legacy hash
+ * (authoritative) every RA_PHASEC_SHADOW_EVERY snapshots. */
+static uint8_t*  g_phasec_blob = NULL;       /* [g_phasec_blob_bytes] */
+static uint32_t* g_phasec_blob_off = NULL;   /* [shipped+1] prefix sums */
+static uint16_t* g_phasec_ship_node = NULL;  /* shipped idx -> node idx */
+static uint16_t* g_phasec_node_ship = NULL;  /* node idx -> shipped idx (0xFFFF) */
+static uint8_t*  g_phasec_valid = NULL;      /* bitmap, shipped idx */
+static uint8_t*  g_phasec_fresh = NULL;      /* bitmap: slot seen at least once */
+static uint32_t  g_phasec_shipped = 0;
+static uint32_t  g_phasec_win_rx = 0;        /* windows ingested (diag) */
+static uint32_t  g_phasec_cmp_ok = 0, g_phasec_cmp_bad = 0,
+                 g_phasec_cmp_miss = 0, g_phasec_cmp_inv = 0;
 
 /* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
  * g_update_miss_count is reset right before each rc_client_do_frame and bumped
@@ -1100,8 +1133,16 @@ static inline uint32_t hash_addr(uint32_t addr) {
  * reorganized as 2048 sets x 2 ways: two addresses that hash to the same set now
  * coexist instead of evicting each other. g_l1_mru = pseudo-LRU (evict the way
  * NOT used last). +2KB for g_l1_mru, otherwise identical SRAM footprint. */
-#define L1_SLOTS    4096u
-#define L1_SETS     (L1_SLOTS / 2u)        /* 2048 sets, 2 ways each */
+/* 2026-07-02 RESIZE 4096->2048 (the SRAM-reclaim backlog #1): Phase C collapsed
+ * the lookup working set from ~5460 byte-addrs (all chain leaves, byte-granular)
+ * to ~600-900 (static roots + ~90 legacy dp-chains) — covered chains read their
+ * slot blob and never touch the hash. 2048 slots (1024 sets x 2 ways) is still
+ * ~2x the working set; frees 13KB of internal .bss (addr 8K + widx 4K + mru 1K),
+ * funding the I-cache 32KB re-enable (hardcore-mode frame fidelity). Verify with
+ * the l1h/l1m FRAME counters: steady hit% should hold ~86%+; if it craters,
+ * bump back to 4096 and reclaim elsewhere. */
+#define L1_SLOTS    2048u
+#define L1_SETS     (L1_SLOTS / 2u)        /* sets of 2 ways each */
 #define L1_SET_MASK (L1_SETS - 1u)
 #define L1_EMPTY    0xFFFFFFFFu     /* no valid PPC addr is 0xFFFFFFFF */
 static uint32_t g_l1_addr[L1_SLOTS];   /* internal .bss; slot = set*2 + way */
@@ -1434,23 +1475,30 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
             static int net_shown = 0;
             int show = (event->type == RC_CLIENT_EVENT_ACHIEVEMENT_CHALLENGE_INDICATOR_SHOW);
             net_shown += show ? 1 : -1;
-            LOG_DBG("DEBUG=event: CHALLENGE_%s ach=%lu \"%s\" prog=%s net_shown=%d\r\n",
+            LOG_INFO("DEBUG=event: CHALLENGE_%s ach=%lu \"%s\" prog=%s net_shown=%d\r\n",
                     show ? "SHOW" : "HIDE",
                     a ? (unsigned long)a->id : 0UL, a ? a->title : "?",
                     (a && a->measured_progress[0]) ? a->measured_progress : "-", net_shown);
+#if RA_WEB_DASHBOARD
+            ra_web_push_challenge(show, a ? a->id : 0);
+#endif
             break;
         }
         case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_SHOW:
         case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_HIDE:
         case RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_UPDATE:
-            LOG_DBG("DEBUG=event: PROGRESS_%lu ach=%lu \"%s\" prog=%s pct=%d\r\n",
+            LOG_INFO("DEBUG=event: PROGRESS_%lu ach=%lu \"%s\" prog=%s pct=%d\r\n",
                     (unsigned long)event->type,
                     a ? (unsigned long)a->id : 0UL, a ? a->title : "?",
                     (a && a->measured_progress[0]) ? a->measured_progress : "-",
                     a ? (int)a->measured_percent : 0);
+#if RA_WEB_DASHBOARD
+            if (a && event->type != RC_CLIENT_EVENT_ACHIEVEMENT_PROGRESS_INDICATOR_HIDE)
+                ra_web_push_progress(a->id, (int)a->measured_percent, a->measured_progress);
+#endif
             break;
         default:
-            LOG_DBG("DEBUG=event: %d\r\n", event->type);
+            LOG_INFO("DEBUG=event: %d\r\n", event->type);
             break;
     }
     switch (event->type) {
@@ -1484,6 +1532,11 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
              * ledCelebrateTask, NEVER here on the Core 1 EXI critical path. */
             g_celebrate_req++;
             ralog_printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
+#if RA_WEB_DASHBOARD
+            /* Instant toast on the phone dashboard. badge_name → the browser
+             * builds the media.retroachievements.org URL. */
+            ra_web_push_unlock(ach->id, ach->title, ach->badge_name);
+#endif
             break;
         }
         default:
@@ -2880,7 +2933,15 @@ static volatile bool g_collect_cap_walks = false;  /* STEP 0 hard cap — OFF (w
  * be A/B'd at runtime. EXPECT: collect-spike half of the dip lifts (apc/cyc
  * spikes collapse, cwk caps at ~250 in the FRAME line); eval-spikes (apc=0)
  * are untouched (separate lever). A/B: 250 vs 0, SAME bunny chase. */
-static volatile int g_collect_walk_budget = 250;
+/* 2026-07-02 RETIRED (0 = uncapped): Phase C shrank the walk population from
+ * ~1373 chains (the 42ms rebuilds this cap existed for) to ~93 dp/exotic
+ * chains — uncapped worst is now ~93 walks x ~31us x rounds ≈ 3ms/round,
+ * inside the old K=250 ceiling anyway. The cap's only remaining effect was
+ * NEGATIVE for hardcore fidelity: dirty chains carried across frames (leaf
+ * values misaligned with their snapshot's do_frame) + self-inflicted gate
+ * defers (wii5.log: cwk=250 hit twice, dfr=3). Set back to 250 only if a
+ * future game shows big legacy populations (census elig% tells you at load). */
+static volatile int g_collect_walk_budget = 0;
 
 /* ====================================================================
  * opt: reverse-hash incremental collect (project_incremental_collect)
@@ -2991,6 +3052,184 @@ static void incr_mark_dirty(uint16_t count) {
      * Once on it stays on; a collect without a fresh snapshot has no new changes,
      * so the clean flags remain valid. */
     g_rc_incr_collect_enabled = 1;
+}
+
+/* ============================================================================
+ * Phase C shadow walker — ESP-side mirror of the d2x chain walker, used to
+ * cross-check the ingested slot blob against the legacy hash (authoritative
+ * during the shadow phase). Also the future ingestion core once slots become
+ * authoritative. Semantics mirror the wire spec in gc_ra_protocol.h.
+ * ============================================================================ */
+static bool g_phasec_shadow_enabled = false;  /* bring-up diag (validated 2026-07-01:
+                                               * 1.93M compares, bad=0.055% read-skew);
+                                               * OFF in authoritative mode */
+
+static inline uint32_t phasec_xform(uint32_t v, uint8_t psize) {
+    switch (psize) {
+        case RA_CN_SZ_8:     return v & 0xFFu;
+        case RA_CN_SZ_16:    return v & 0xFFFFu;
+        case RA_CN_SZ_24:    return v & 0xFFFFFFu;
+        case RA_CN_SZ_32:    return v;
+        case RA_CN_SZ_16_BE: return ((v & 0xFF00u) >> 8) | ((v & 0xFFu) << 8);
+        case RA_CN_SZ_24_BE: return ((v & 0xFF0000u) >> 16) | (v & 0xFF00u)
+                                  | ((v & 0xFFu) << 16);
+        case RA_CN_SZ_32_BE: return __builtin_bswap32(v);
+        default:             return v;
+    }
+}
+
+static inline uint32_t phasec_combine(uint32_t pv, uint32_t o, uint8_t op) {
+    switch (op) {
+        case RA_CN_OP_MULT:       return pv * o;
+        case RA_CN_OP_DIV:        return o ? pv / o : 0;
+        case RA_CN_OP_AND:        return pv & o;
+        case RA_CN_OP_XOR:        return pv ^ o;
+        case RA_CN_OP_MOD:        return o ? pv % o : 0;
+        case RA_CN_OP_ADD:        return pv + o;
+        case RA_CN_OP_SUB:        return pv - o;
+        case RA_CN_OP_SUB_PARENT: return o - pv;
+        case RA_CN_OP_ADD_ACC:    return pv + o;
+        case RA_CN_OP_SUB_ACC:    return pv - o;
+        default:                  return 0;
+    }
+}
+
+/* Raw (LE-pack) value of node idx. Shipped derefs read the ingested blob;
+ * roots read the legacy hash; combines/immediates compute. false = value
+ * unavailable (root byte not cached / slot never ingested / slot invalid). */
+static bool phasec_node_value(uint16_t idx, uint32_t* out) {
+    if (idx >= g_phasec_node_count) return false;
+    const rc_phasec_node_t* nd = &g_phasec_nodes[idx];
+    uint8_t op = RC_PHASEC_OP(nd);
+
+    if (op == (uint8_t)RA_CN_OP_NONE) { *out = nd->operand; return true; }
+
+    if (op == (uint8_t)RA_CN_OP_DEREF) {
+        uint8_t w = RC_PHASEC_WIDTH(nd);
+        if (RC_PHASEC_SHIPPED(nd)) {
+            uint16_t s = g_phasec_node_ship[idx];
+            if (s == 0xFFFF ||
+                !(g_phasec_fresh[s >> 3] & (1u << (s & 7))) ||
+                !(g_phasec_valid[s >> 3] & (1u << (s & 7))))
+                return false;
+            const uint8_t* b = g_phasec_blob + g_phasec_blob_off[s];
+            uint32_t v = 0;
+            for (uint8_t k = 0; k < w; k++) v |= (uint32_t)b[k] << (8u * k);
+            *out = v;
+            return true;
+        }
+        /* root: read through the legacy hash (authoritative) */
+        uint32_t v = 0;
+        for (uint8_t k = 0; k < w; k++) {
+            int32_t widx = hash_lookup(nd->operand + k);
+            if (widx < 0) return false;
+            v |= (uint32_t)memory_data[widx] << (8u * k);
+        }
+        *out = v;
+        return true;
+    }
+
+    /* combine: parent value -> edge transform -> ALU */
+    {
+        uint32_t pv;
+        if (nd->parent == RC_PHASEC_PARENT_NONE) return false;
+        if (!phasec_node_value(nd->parent, &pv)) return false;
+        *out = phasec_combine(phasec_xform(pv, nd->psize), nd->operand, op);
+        return true;
+    }
+}
+
+/* ============================================================================
+ * Phase C AUTHORITATIVE mode — covered chains read their leaf straight from
+ * the d2x-walked slot blob (rc_upd_resolve_one hook) and are skipped by the
+ * collect walk (their leaves never enter the flat watchlist). The legacy
+ * path remains for dp/exotic chains + static roots; the v0.32 do_frame gate
+ * stays as the correctness net. g_phasec_auth kills it at runtime (full
+ * legacy fallback — the d2x keeps shipping the window, we just ignore it).
+ * ============================================================================ */
+static bool      g_phasec_auth = false;      /* armed per-game in on_game_loaded */
+static uint16_t* g_phasec_mm_ship = NULL;    /* dense mm idx -> shipped slot (0xFFFF)
+                                              * INTERNAL SRAM — hot path O(1) */
+static uint32_t  g_phasec_mm_total = 0;
+static uint32_t  g_pc_reads = 0, g_pc_inv = 0, g_pc_defer = 0;   /* cumulative diag */
+
+/* upd leaf source (called from rc_upd_resolve_one via g_rc_phasec_read).
+ * Returns: 0 not covered; 1 *raw = LE-packed leaf bytes; 2 slot not ready
+ * (bumps the do_frame gate -> defer). Invalid slot (d2x range-check failed)
+ * mirrors legacy read_memory_ingame semantics for out-of-range addresses:
+ * 0-fill WITHOUT a gate bump (line ~1590: valid_ppc_addr guards the bump). */
+static int phasec_read_cb(uint32_t mm_idx, uint32_t* raw) {
+    uint16_t s;
+    if (!g_phasec_auth || mm_idx >= g_phasec_mm_total) return 0;
+    s = g_phasec_mm_ship[mm_idx];
+    if (s == 0xFFFF) return 0;
+    if (!(g_phasec_fresh[s >> 3] & (1u << (s & 7)))) {
+        g_update_miss_count++;      /* never eval on a hole — gate defers */
+        g_pc_defer++;
+        return 2;
+    }
+    if (!(g_phasec_valid[s >> 3] & (1u << (s & 7)))) {
+        *raw = 0;
+        g_pc_inv++;
+        return 1;
+    }
+    {
+        const uint8_t* b = g_phasec_blob + g_phasec_blob_off[s];
+        uint32_t w = g_phasec_blob_off[s + 1] - g_phasec_blob_off[s];
+        uint32_t v = 0;
+        for (uint32_t k = 0; k < w; k++) v |= (uint32_t)b[k] << (8u * k);
+        *raw = v;
+    }
+    g_pc_reads++;
+    return 1;
+}
+
+/* collect skip (g_rc_phasec_covered): covered chains never need EXI
+ * resolution — keeps their leaves OUT of the flat watchlist for good. */
+static int phasec_covered_cb(uint32_t mm_idx) {
+    return g_phasec_auth && mm_idx < g_phasec_mm_total &&
+           g_phasec_mm_ship[mm_idx] != 0xFFFF;
+}
+
+/* Cross-check a slice of the just-ingested window: recompute each slot's
+ * leaf address from the table (like the d2x did) and compare the blob bytes
+ * against the legacy hash. Slice-capped so the EXI task never stalls. Small
+ * steady 'bad' noise is expected (flat reads and the walk happen ms apart on
+ * the d2x; game writes in between) — watch the TREND, not zero.
+ * AUTHORITATIVE-phase caveat: covered leaves LEAVE the flat hash, so the
+ * compare can only cover slots whose leaf still happens to be hashed —
+ * bring-up diagnostic only, default OFF now. */
+#define RA_PHASEC_SHADOW_SLICE 64
+static void phasec_shadow_compare(uint16_t win_first, uint16_t win_count) {
+    if (!g_phasec_shadow_enabled || !memory_data) return;
+    static uint32_t rot = 0;
+    uint16_t n = win_count < RA_PHASEC_SHADOW_SLICE ? win_count
+                                                    : RA_PHASEC_SHADOW_SLICE;
+    for (uint16_t i = 0; i < n; i++) {
+        uint32_t s = win_first + (uint32_t)((rot + i) % win_count);
+        uint16_t node = g_phasec_ship_node[s];
+        const rc_phasec_node_t* nd = &g_phasec_nodes[node];
+        if (!(g_phasec_valid[s >> 3] & (1u << (s & 7)))) { g_phasec_cmp_inv++; continue; }
+        uint32_t pv, addr;
+        if (nd->parent == RC_PHASEC_PARENT_NONE) {
+            addr = nd->operand;                 /* shipped root (not emitted today) */
+        } else {
+            if (!phasec_node_value(nd->parent, &pv)) { g_phasec_cmp_miss++; continue; }
+            addr = phasec_xform(pv, nd->psize) + nd->operand;
+        }
+        uint8_t w = RC_PHASEC_WIDTH(nd);
+        const uint8_t* b = g_phasec_blob + g_phasec_blob_off[s];
+        bool bad = false, miss = false;
+        for (uint8_t k = 0; k < w; k++) {
+            int32_t widx = hash_lookup(addr + k);
+            if (widx < 0) { miss = true; break; }
+            if (memory_data[widx] != b[k]) { bad = true; break; }
+        }
+        if (miss)      g_phasec_cmp_miss++;
+        else if (bad)  g_phasec_cmp_bad++;
+        else           g_phasec_cmp_ok++;
+    }
+    rot += n;
 }
 
 static uint16_t collect_missing_addresses(void) {
@@ -3383,11 +3622,25 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 g_roots_built = false;   /* rebuild chain-root gate for this game's memrefs */
                 LOG_INFO("DEBUG=*** STATE 6 -> 7: first SNAPSHOT received from ra-module ***\r\n");
             }
-            if (rx_len < sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t)) break;
+            /* Dual-parse: legacy snapshot header is 8B (frame/count/seq); the
+             * Phase C v2 header is 14B (+chain_first/count/blob_len). The Wii
+             * writes EXACT lengths, so rx_len disambiguates: legacy rx_len is
+             * always 4+8+count < 4+14+count, the v2 minimum. A legacy d2x
+             * against this fw therefore parses cleanly with no chain data. */
+            #define RA_SNAP_HDR_LEGACY 8u
+            if (rx_len < sizeof(ra_gc_header_t) + RA_SNAP_HDR_LEGACY) break;
 
             const ra_snapshot_header_t *snap = (const ra_snapshot_header_t*)(rx_data + sizeof(ra_gc_header_t));
             uint16_t count = ra_be16_to_host(snap->addr_count);
             frame_counter = ra_be32_to_host(snap->frame_counter);
+            bool snap_v2 = (rx_len >= sizeof(ra_gc_header_t)
+                            + sizeof(ra_snapshot_header_t) + count);
+            uint16_t ch_first = 0, ch_count = 0, ch_blob = 0;
+            if (snap_v2) {
+                ch_first = ra_be16_to_host(snap->chain_first);
+                ch_count = ra_be16_to_host(snap->chain_count);
+                ch_blob  = ra_be16_to_host(snap->chain_blob_len);
+            }
 
             /* v0.28.8 — LRU clock = PPC VBI game-frame counter (was ++ per
              * SNAPSHOT ≈7.4Hz, which made the eviction age tiers worth ~8x
@@ -3422,8 +3675,23 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 LOG_DBG("DEBUG=SNAP frame=%lu snap_count=%u esp_watch=%u state=%d\r\n",
                          (unsigned long)frame_counter, (unsigned)count,
                          (unsigned)watch_count, (int)state);
+                if (g_phasec_shipped) {
+                    /* Authoritative health: rd/inv/dfr = CUMULATIVE slot reads /
+                     * invalid-slot 0-reads / gate defers from not-ready slots.
+                     * win=windows ingested; cf/cc=this frame's window (cc should
+                     * equal shipped once the flat list shrinks). Shadow counters
+                     * shown too when the diag toggle is on. */
+                    LOG_DBG("DEBUG=PhaseC%s: rd=%lu inv=%lu dfr=%lu win=%lu cf=%u cc=%u | shadow ok=%lu bad=%lu miss=%lu\r\n",
+                            g_phasec_auth ? " AUTH" : "",
+                            (unsigned long)g_pc_reads, (unsigned long)g_pc_inv,
+                            (unsigned long)g_pc_defer, (unsigned long)g_phasec_win_rx,
+                            (unsigned)ch_first, (unsigned)ch_count,
+                            (unsigned long)g_phasec_cmp_ok, (unsigned long)g_phasec_cmp_bad,
+                            (unsigned long)g_phasec_cmp_miss);
+                }
             }
-            const uint8_t *values = rx_data + sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t);
+            const uint8_t *values = rx_data + sizeof(ra_gc_header_t)
+                + (snap_v2 ? sizeof(ra_snapshot_header_t) : RA_SNAP_HDR_LEGACY);
             bool inputs_changed = false;   /* #1 gate: a chain-root (pointer base) byte changed this snapshot */
 
             /* ---- Phase D2 (v0.26.0): VERIFIED sync ----
@@ -3514,6 +3782,34 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                      * collect_missing rounds. */
                     incr_mark_dirty(count);
                     g_vblank_stats.data_ok = 1;  /* Phase D2 integrity check passed */
+
+                    /* Phase C shadow ingest: copy this frame's rotating chain
+                     * window into the persistent slot blob + validity/fresh
+                     * bitmaps, then cross-check a slice against the legacy
+                     * hash (which stays authoritative). Length/offset checks
+                     * make a malformed window a silent no-op. */
+                    if (snap_v2 && ch_count && g_phasec_blob && g_phasec_shipped) {
+                        uint32_t bm_bytes = ((uint32_t)ch_count + 7u) / 8u;
+                        const uint8_t *bm = values + count;
+                        const uint8_t *cb = bm + bm_bytes;
+                        if ((uint32_t)ch_first + ch_count <= g_phasec_shipped &&
+                            rx_len >= sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t)
+                                    + (uint32_t)count + bm_bytes + ch_blob &&
+                            g_phasec_blob_off[ch_first + ch_count]
+                              - g_phasec_blob_off[ch_first] == ch_blob) {
+                            memcpy(g_phasec_blob + g_phasec_blob_off[ch_first], cb, ch_blob);
+                            for (uint16_t i = 0; i < ch_count; i++) {
+                                uint32_t s = (uint32_t)ch_first + i;
+                                if (bm[i >> 3] & (1u << (i & 7)))
+                                    g_phasec_valid[s >> 3] |=  (uint8_t)(1u << (s & 7));
+                                else
+                                    g_phasec_valid[s >> 3] &= (uint8_t)~(1u << (s & 7));
+                                g_phasec_fresh[s >> 3] |= (uint8_t)(1u << (s & 7));
+                            }
+                            g_phasec_win_rx++;
+                            phasec_shadow_compare(ch_first, ch_count);
+                        }
+                    }
                 }
             }
 
@@ -3559,7 +3855,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                  * GC clock restarts after a pressure dump too. */
                 if (state == STATE_ACTIVE) {
                     static uint32_t last_gc_frame = 0;
-                    if (watch_count > WATCHLIST_HIGH_WATER) {
+                    if (watch_count > g_watch_high_water) {
                         evict_lru(true);            /* pressure: reclaim half */
                         last_gc_frame = frame_counter;
                     } else if ((uint32_t)(frame_counter - last_gc_frame) >= GC_PERIOD_FRAMES) {
@@ -3968,6 +4264,81 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             break;
         }
 
+        case RA_CMD_GET_CHAIN_CHUNK: {
+            /* Phase C: serve the chain descriptor table built at game load.
+             * No table (GC adapter semantics / emit failure) => node_count=0,
+             * is_last=1 on ANY index — the console disables Phase C. Wire
+             * node ints are BE (the 8B layout matches rc_phasec_node_t). */
+            if (rx_len < sizeof(ra_gc_header_t) + sizeof(ra_chain_chunk_req_t))
+                break;
+            const ra_chain_chunk_req_t *req =
+                (const ra_chain_chunk_req_t*)(rx_data + sizeof(ra_gc_header_t));
+            uint16_t chunk_idx = ra_be16_to_host(req->chunk_index);
+
+            uint32_t total = g_phasec_node_count;
+            if (total > RA_MAX_CHAIN_NODES) {
+                /* Console cap exceeded — disable Phase C rather than truncate
+                 * (a truncated DAG has dangling parents). */
+                LOG_ERR("ERROR=PhaseC: table %u > console cap %u — serving empty\r\n",
+                        (unsigned)total, (unsigned)RA_MAX_CHAIN_NODES);
+                total = 0;
+            }
+            uint32_t start = (uint32_t)chunk_idx * RA_CHAIN_CHUNK_NODES;
+            uint16_t n_in_chunk = (start < total)
+                ? (uint16_t)((total - start) < RA_CHAIN_CHUNK_NODES
+                             ? (total - start) : RA_CHAIN_CHUNK_NODES)
+                : 0;
+            uint8_t is_last = (start + n_in_chunk >= total) ? 1 : 0;
+
+            uint32_t resp_data_len = sizeof(ra_chain_chunk_t)
+                                   + (uint32_t)n_in_chunk * RA_CHAIN_NODE_SIZE;
+            const uint32_t GC_WRITE_PADDING = sizeof(ra_gc_header_t)
+                                            + sizeof(ra_chain_chunk_req_t); /* 6 */
+            uint32_t total_len = GC_WRITE_PADDING + sizeof(ra_esp_header_t)
+                                                  + resp_data_len;
+            uint8_t *buf = (uint8_t*)malloc(total_len);
+            if (!buf) {
+                LOG_ERR("ERROR=CHAIN_CHUNK: malloc(%u) FAILED\r\n", (unsigned)total_len);
+                break;
+            }
+            memset(buf, 0xFF, GC_WRITE_PADDING);
+
+            ra_esp_header_t hdr;
+            hdr.magic       = RA_MAGIC_ESP_TO_GC;
+            hdr.status      = (uint8_t)state;
+            hdr.event_type  = RA_EVT_NONE;
+            hdr.event_count = 0;
+            hdr.data_len    = ra_host_to_be16((uint16_t)resp_data_len);
+            memcpy(buf + GC_WRITE_PADDING, &hdr, sizeof(hdr));
+
+            ra_chain_chunk_t chdr;
+            chdr.chunk_index = ra_host_to_be16(chunk_idx);
+            chdr.node_count  = ra_host_to_be16(n_in_chunk);
+            chdr.total_nodes = ra_host_to_be16((uint16_t)total);
+            chdr.is_last     = is_last;
+            chdr.reserved    = 0;
+            memcpy(buf + GC_WRITE_PADDING + sizeof(ra_esp_header_t), &chdr, sizeof(chdr));
+
+            uint8_t *out = buf + GC_WRITE_PADDING + sizeof(ra_esp_header_t)
+                               + sizeof(ra_chain_chunk_t);
+            for (uint16_t i = 0; i < n_in_chunk; i++) {
+                const rc_phasec_node_t *nd = &g_phasec_nodes[start + i];
+                uint32_t ob = ra_host_to_be32(nd->operand);
+                uint16_t pb = ra_host_to_be16(nd->parent);
+                memcpy(out,     &ob, 4);
+                memcpy(out + 4, &pb, 2);
+                out[6] = nd->op;
+                out[7] = nd->psize;
+                out += RA_CHAIN_NODE_SIZE;
+            }
+
+            LOG_DBG("DEBUG=CHAIN_CHUNK req: idx=%u n=%u total=%u last=%u\r\n",
+                    chunk_idx, n_in_chunk, (unsigned)total, is_last);
+            exi_spi_prepare_response(buf, total_len);
+            free(buf);
+            break;
+        }
+
         case RA_CMD_STATUS: {
             ra_esp_header_t resp;
             resp.magic = RA_MAGIC_ESP_TO_GC;
@@ -4369,6 +4740,128 @@ static void evict_lru(bool pressure) {
             (unsigned)target, (unsigned)wl_seq);
 }
 
+#if RA_WEB_DASHBOARD
+/* Refresh the cross-core snapshot the Core-0 web dashboard serves. Reads the
+ * rc_client, so it must run ONLY on the rc_client/loop task (same task as
+ * do_frame) — never from the HTTP handler. Cheap: two struct reads + a spinlock
+ * copy. Called from on_game_loaded and throttled (~1 Hz) from loop(). */
+static void publish_web_state(void) {
+    ra_web_pub_t p;
+    memset(&p, 0, sizeof(p));
+    p.state = (uint8_t)state;
+    const rc_client_game_t *g = g_client ? rc_client_get_game_info(g_client) : NULL;
+    if (g) {
+        p.game_id = g->id;
+        strncpy(p.game_title, g->title ? g->title : "", sizeof(p.game_title) - 1);
+        rc_client_user_game_summary_t s;
+        rc_client_get_user_game_summary(g_client, &s);
+        p.total           = (uint16_t)s.num_core_achievements;
+        p.unlocked        = (uint16_t)s.num_unlocked_achievements;
+        p.points_total    = s.points_core;
+        p.points_unlocked = s.points_unlocked;
+    } else {
+        strncpy(p.game_title, gameName.c_str(), sizeof(p.game_title) - 1);
+    }
+    ra_web_publish(&p);
+}
+
+/* Full /api/state JSON (header + every achievement with LIVE state/progress).
+ * Built on the loop task — the SAME task as do_frame, so rc_client reads are
+ * never concurrent with it and the internal pthread mutex is uncontended (no
+ * cross-core stall). GROUPING_PROGRESS asks rcheevos to bucket each achievement
+ * as it stands THIS frame: ACTIVE_CHALLENGE (primed) / ALMOST_THERE (in
+ * progress) / LOCKED / UNLOCKED — so "currently in progress" is live, not a
+ * frozen snapshot. Gated by ra_web_client_active() in loop(), so it only runs
+ * while a phone is actually watching — zero cost otherwise. */
+static char  *g_web_json = NULL;      /* reused PSRAM render buffer */
+static size_t g_web_json_cap = 0;
+
+/* Category label the front-end filters/sorts on (derived from the bucket). */
+static const char *web_cat_name(uint8_t bucket_type) {
+    switch (bucket_type) {
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_UNLOCKED:
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_RECENTLY_UNLOCKED: return "unlocked";
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_ACTIVE_CHALLENGE:  return "challenge";
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_ALMOST_THERE:      return "progress";
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_UNSUPPORTED:       return "unsupported";
+        default:                                             return "locked";
+    }
+}
+
+/* Append s to buf[o..cap) as a JSON string body (quotes/backslashes/ctrl). */
+static size_t web_json_esc(char *buf, size_t cap, size_t o, const char *s) {
+    for (size_t i = 0; s && s[i] && o + 7 < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') { buf[o++] = '\\'; buf[o++] = (char)c; }
+        else if (c < 0x20)         { o += snprintf(buf + o, cap - o, "\\u%04x", c); }
+        else                       { buf[o++] = (char)c; }
+    }
+    return o;
+}
+
+static void build_and_publish_web_json(void) {
+    if (!g_client) return;
+    rc_client_achievement_list_t *list = rc_client_create_achievement_list(
+        g_client, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
+        RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_PROGRESS);
+    if (!list) return;
+
+    uint32_t total = 0;
+    for (uint32_t b = 0; b < list->num_buckets; b++)
+        total += list->buckets[b].num_achievements;
+
+    size_t need = (size_t)total * 320 + 1024;   /* generous per-entry budget */
+    if (need > g_web_json_cap) {
+        char *nb = (char *)heap_caps_realloc(g_web_json, need, MALLOC_CAP_SPIRAM);
+        if (!nb) { rc_client_destroy_achievement_list(list); return; }
+        g_web_json = nb; g_web_json_cap = need;
+    }
+    char  *buf = g_web_json;
+    size_t cap = g_web_json_cap;
+    size_t o   = 0;
+
+    rc_client_user_game_summary_t s;
+    rc_client_get_user_game_summary(g_client, &s);
+    const rc_client_game_t *g = rc_client_get_game_info(g_client);
+
+    o += snprintf(buf + o, cap - o, "{\"state\":%u,\"game_id\":%lu,\"title\":\"",
+                  (unsigned)state, (unsigned long)(g ? g->id : 0));
+    o = web_json_esc(buf, cap, o, g ? g->title : "");
+    o += snprintf(buf + o, cap - o,
+                  "\",\"total\":%lu,\"unlocked\":%lu,\"points_total\":%lu,"
+                  "\"points_unlocked\":%lu,\"achievements\":[",
+                  (unsigned long)s.num_core_achievements,
+                  (unsigned long)s.num_unlocked_achievements,
+                  (unsigned long)s.points_core, (unsigned long)s.points_unlocked);
+
+    int first = 1;
+    for (uint32_t b = 0; b < list->num_buckets; b++) {
+        const rc_client_achievement_bucket_t *bk = &list->buckets[b];
+        for (uint32_t i = 0; i < bk->num_achievements; i++) {
+            const rc_client_achievement_t *a = bk->achievements[i];
+            if (o + 400 > cap) break;                /* safety: never overrun */
+            if (!first) buf[o++] = ',';
+            first = 0;
+            o += snprintf(buf + o, cap - o, "{\"id\":%lu,\"t\":\"", (unsigned long)a->id);
+            o = web_json_esc(buf, cap, o, a->title);
+            o += snprintf(buf + o, cap - o, "\",\"d\":\"");
+            o = web_json_esc(buf, cap, o, a->description);
+            o += snprintf(buf + o, cap - o,
+                          "\",\"badge\":\"%s\",\"pts\":%lu,\"st\":%u,\"pct\":%d,\"m\":\"",
+                          a->badge_name, (unsigned long)a->points, (unsigned)a->state,
+                          (int)a->measured_percent);
+            o = web_json_esc(buf, cap, o, a->measured_progress);
+            o += snprintf(buf + o, cap - o, "\",\"cat\":\"%s\",\"rare\":%d}",
+                          web_cat_name(bk->bucket_type), (int)a->rarity);
+        }
+    }
+    o += snprintf(buf + o, cap - o, "]}");
+    rc_client_destroy_achievement_list(list);
+
+    ra_web_set_state_json(buf, (unsigned)o);
+}
+#endif
+
 // ============================================================================
 // Game loading - runs on Core 0 when state == STATE_LOADING_GAME
 // ============================================================================
@@ -4420,18 +4913,235 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         }
     }
 
+    /* (U1 alloc moved BELOW the Phase C block — its placement depends on
+     * whether the authoritative mode armed for this game.) */
+
+    /* Phase C step-0 census v2: how many AddAddress chains can the d2x walker
+     * resolve? Nodes: INDIRECT = read(mask(parent)+mod); combine =
+     * ALU_op(mask(parent), mod). v1 scored SMG 0% because Wii sets route every
+     * pointer through a `& 0x01FFFFFF` / `- 0x80000000` combine — v2 walks
+     * through combines and histograms the ALU ops + parent sizes the d2x must
+     * implement. Ineligible chains stay on legacy ADDR_QUERY (Nintendont/GC
+     * keep legacy). One-shot, read-only diagnostic. */
+    {
+        rc_phasec_census_t cs;
+        rc_memrefs_phasec_census(rc_client_get_memrefs(client), &cs);
+        uint32_t elig_all = cs.eligible + cs.eligible_mref_mod;
+        uint32_t pct = cs.mm_indirect ? (elig_all * 100u) / cs.mm_indirect : 0;
+        LOG_DBG("DEBUG=PhaseC census v3: mm=%u indirect=%u elig=%u eligMmod=%u (%u%%) combine=%u | "
+                "inel: dp=%u xform=%u nonmem=%u chain=%u mod=%u op=%u\r\n",
+                (unsigned)cs.mm_total, (unsigned)cs.mm_indirect, (unsigned)cs.eligible,
+                (unsigned)cs.eligible_mref_mod, (unsigned)pct,
+                (unsigned)(cs.mm_total - cs.mm_indirect),
+                (unsigned)cs.inel_parent_dp, (unsigned)cs.inel_parent_xform,
+                (unsigned)cs.inel_parent_nonmem, (unsigned)cs.inel_parent_chain,
+                (unsigned)cs.inel_modifier, (unsigned)cs.inel_op);
+        /* levels = mm->depth + 1 (depth 0 == single-deref chain) */
+        LOG_DBG("DEBUG=PhaseC levels: 1=%u 2=%u 3=%u 4=%u 5=%u 6+=%u | "
+                "leaf bytes: 1=%u 2=%u 3=%u 4=%u | wire=%uB\r\n",
+                (unsigned)cs.depth_hist[0], (unsigned)cs.depth_hist[1],
+                (unsigned)cs.depth_hist[2], (unsigned)cs.depth_hist[3],
+                (unsigned)cs.depth_hist[4],
+                (unsigned)(cs.depth_hist[5] + cs.depth_hist[6] + cs.depth_hist[7]),
+                (unsigned)cs.leaf_bytes_hist[1], (unsigned)cs.leaf_bytes_hist[2],
+                (unsigned)cs.leaf_bytes_hist[3], (unsigned)cs.leaf_bytes_hist[4],
+                (unsigned)cs.eligible_value_bytes);
+        {   /* which ALU ops + parent mask sizes the d2x walker must implement,
+             * and WHAT the non-memref parents are (recall => legacy forever). */
+            static const char* const kOp[18] = {
+                "eq","lt","le","gt","ge","ne","none","mul","div","and",
+                "xor","mod","add","sub","subp","adda","suba","ind" };
+            static const char* const kOpnd[10] = {
+                "addr","delta","const","fp","func","prior","bcd","inv","recall","?" };
+            char buf[192]; int o = 0;
+            for (unsigned s = 0; s < 18; s++)
+                if (cs.op_hist[s] && o < (int)sizeof(buf) - 20)
+                    o += snprintf(buf + o, sizeof(buf) - o, " %s=%u",
+                                  kOp[s], (unsigned)cs.op_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | nonmem:");
+            for (unsigned s = 0; s < 10; s++)
+                if (cs.nonmem_hist[s] && o < (int)sizeof(buf) - 20)
+                    o += snprintf(buf + o, sizeof(buf) - o, " %s=%u",
+                                  kOpnd[s], (unsigned)cs.nonmem_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | psz:");
+            for (unsigned s = 0; s < 32; s++)
+                if (cs.parent_size_hist[s] && o < (int)sizeof(buf) - 16)
+                    o += snprintf(buf + o, sizeof(buf) - o, " sz%u=%u",
+                                  s, (unsigned)cs.parent_size_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | rcl=%u cbase=%u",
+                          (unsigned)cs.recall_hops, (unsigned)cs.const_base);
+            LOG_DBG("DEBUG=PhaseC ops:%s\r\n", buf);
+        }
+    }
+
+    /* Phase C node-table emission — the dependency-ordered DAG the d2x walker
+     * will execute. Sizing gate: table bytes must fit the d2x module gap
+     * (~144KB total incl. code) and blob bytes ride every SNAPSHOT. refused
+     * counts ALL non-emitted INDIRECT chains (census-ineligible + the
+     * emitter's stricter edge-size/immediate rules) — expect ≈ indirect -
+     * (elig+eligMmod) + eligMmod; a big excess = edge shapes to look at. */
+    {
+        enum { PHASEC_NODE_CAP = 4096 };
+        /* Disarm the authoritative hooks FIRST (a do_frame may run between
+         * games), then free per-game state. */
+        g_phasec_auth = false;
+        g_rc_phasec_read = NULL;
+        g_rc_phasec_covered = NULL;
+        g_watch_high_water = WATCHLIST_HIGH_WATER;   /* legacy default until auth re-arms */
+        free(g_phasec_mm_ship);   g_phasec_mm_ship = NULL; g_phasec_mm_total = 0;
+        g_pc_reads = g_pc_inv = g_pc_defer = 0;
+        free(g_phasec_nodes);     g_phasec_nodes = NULL;
+        free(g_phasec_blob);      g_phasec_blob = NULL;
+        free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
+        free(g_phasec_ship_node); g_phasec_ship_node = NULL;
+        free(g_phasec_node_ship); g_phasec_node_ship = NULL;
+        free(g_phasec_valid);     g_phasec_valid = NULL;
+        free(g_phasec_fresh);     g_phasec_fresh = NULL;
+        g_phasec_node_count = 0; g_phasec_blob_bytes = 0; g_phasec_shipped = 0;
+        g_phasec_win_rx = 0;
+        g_phasec_cmp_ok = g_phasec_cmp_bad = g_phasec_cmp_miss = g_phasec_cmp_inv = 0;
+        rc_phasec_node_t* nodes =
+            (rc_phasec_node_t*)ps_malloc(PHASEC_NODE_CAP * sizeof(rc_phasec_node_t));
+        const void** keys =
+            (const void**)ps_malloc(PHASEC_NODE_CAP * sizeof(void*));
+        if (nodes && keys) {
+            uint32_t blob = 0, shipped = 0, refused = 0;
+            uint32_t n = rc_memrefs_phasec_emit(rc_client_get_memrefs(client),
+                                                nodes, keys, PHASEC_NODE_CAP,
+                                                &blob, &shipped, &refused);
+            if (n == 0xFFFFFFFFu) {
+                LOG_ERR("ERROR=PhaseC emit: node cap %u overflow — Phase C OFF this game\r\n",
+                        (unsigned)PHASEC_NODE_CAP);
+                free(nodes);
+            } else {
+                g_phasec_nodes = nodes;
+                g_phasec_node_count = n;
+                g_phasec_blob_bytes = blob;
+                LOG_DBG("DEBUG=PhaseC table: nodes=%u (%uB) shipped=%u blob=%uB refused=%u\r\n",
+                        (unsigned)n, (unsigned)(n * sizeof(rc_phasec_node_t)),
+                        (unsigned)shipped, (unsigned)blob, (unsigned)refused);
+                /* Shadow-ingestion side arrays: shipped<->node maps, blob
+                 * prefix offsets, validity/fresh bitmaps, slot blob. Any
+                 * alloc failure disables ingestion (blob NULL gates it). */
+                if (n > 0 && shipped > 0 && blob > 0) {
+                    uint32_t bm = (shipped + 7u) / 8u;
+                    g_phasec_blob      = (uint8_t*) ps_malloc(blob);
+                    g_phasec_blob_off  = (uint32_t*)ps_malloc((shipped + 1) * 4);
+                    g_phasec_ship_node = (uint16_t*)ps_malloc(shipped * 2);
+                    g_phasec_node_ship = (uint16_t*)ps_malloc(n * 2);
+                    g_phasec_valid     = (uint8_t*) ps_malloc(bm);
+                    g_phasec_fresh     = (uint8_t*) ps_malloc(bm);
+                    if (g_phasec_blob && g_phasec_blob_off && g_phasec_ship_node &&
+                        g_phasec_node_ship && g_phasec_valid && g_phasec_fresh) {
+                        uint32_t s = 0, off = 0;
+                        memset(g_phasec_valid, 0, bm);
+                        memset(g_phasec_fresh, 0, bm);
+                        memset(g_phasec_blob, 0, blob);
+                        for (uint32_t i = 0; i < n; i++) {
+                            g_phasec_node_ship[i] = 0xFFFF;
+                            if (RC_PHASEC_SHIPPED(&nodes[i])) {
+                                g_phasec_ship_node[s] = (uint16_t)i;
+                                g_phasec_node_ship[i] = (uint16_t)s;
+                                g_phasec_blob_off[s]  = off;
+                                off += RC_PHASEC_WIDTH(&nodes[i]);
+                                s++;
+                            }
+                        }
+                        g_phasec_blob_off[s] = off;   /* == blob */
+                        g_phasec_shipped = s;
+                    } else {
+                        free(g_phasec_blob);      g_phasec_blob = NULL;
+                        free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
+                        free(g_phasec_ship_node); g_phasec_ship_node = NULL;
+                        free(g_phasec_node_ship); g_phasec_node_ship = NULL;
+                        free(g_phasec_valid);     g_phasec_valid = NULL;
+                        free(g_phasec_fresh);     g_phasec_fresh = NULL;
+                        LOG_ERR("ERROR=PhaseC shadow arrays alloc failed — ingest OFF\r\n");
+                    }
+                }
+
+                /* AUTHORITATIVE map: dense mm index (U1-cursor / list order) ->
+                 * shipped slot, from the emitter's dedup keys (keys[node] =
+                 * memref ptr; the mm ptr equals its embedded memref ptr) —
+                 * built BEFORE keys are freed. INTERNAL SRAM: this is the hot
+                 * upd path (one O(1) read per chain per frame). Hooks armed
+                 * only when everything (blob arrays + map) is in place. */
+                if (g_phasec_blob && g_phasec_shipped > 0) {
+                    const rc_memrefs_t* mrs = rc_client_get_memrefs(client);
+                    const rc_modified_memref_list_t* l;
+                    uint32_t total = 0;
+                    for (l = &mrs->modified_memrefs; l; l = l->next)
+                        total += l->count;
+                    g_phasec_mm_ship = (uint16_t*)heap_caps_malloc(
+                        (size_t)total * sizeof(uint16_t),
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                    if (g_phasec_mm_ship) {
+                        uint32_t g = 0, covered = 0;
+                        for (l = &mrs->modified_memrefs; l; l = l->next) {
+                            const rc_modified_memref_t* mm = l->items;
+                            for (uint16_t k = 0; k < l->count; k++, mm++, g++) {
+                                uint16_t ship = 0xFFFF;
+                                if (mm->modifier_type == RC_OPERATOR_INDIRECT_READ) {
+                                    for (uint32_t i2 = 0; i2 < n; i2++) {
+                                        if (keys[i2] == (const void*)mm) {
+                                            ship = g_phasec_node_ship[i2];
+                                            break;
+                                        }
+                                    }
+                                }
+                                g_phasec_mm_ship[g] = ship;
+                                if (ship != 0xFFFF) covered++;
+                            }
+                        }
+                        g_phasec_mm_total  = g;
+                        g_rc_phasec_read    = phasec_read_cb;
+                        g_rc_phasec_covered = phasec_covered_cb;
+                        g_phasec_auth = true;
+                        /* Freshness guard: pressure-evict BEFORE the flat list
+                         * pushes the chain window into rotation (see the
+                         * g_watch_high_water comment). 64B margin. */
+                        {
+                            uint32_t bm = (g_phasec_shipped + 7u) / 8u;
+                            uint32_t budget = 8192u - sizeof(ra_gc_header_t)
+                                            - sizeof(ra_snapshot_header_t)
+                                            - bm - g_phasec_blob_bytes;
+                            budget = (budget > 64u) ? budget - 64u : 0u;
+                            if (budget < g_watch_high_water)
+                                g_watch_high_water = (uint16_t)budget;
+                        }
+                        LOG_DBG("DEBUG=PhaseC AUTH armed: mm=%u covered=%u map=%uB SRAM hw=%u\r\n",
+                                (unsigned)g, (unsigned)covered,
+                                (unsigned)(total * sizeof(uint16_t)),
+                                (unsigned)g_watch_high_water);
+                    } else {
+                        LOG_ERR("ERROR=PhaseC mm_ship alloc failed — staying legacy\r\n");
+                    }
+                }
+            }
+        } else {
+            LOG_ERR("ERROR=PhaseC emit: alloc failed — Phase C OFF this game\r\n");
+            free(nodes);
+        }
+        free(keys);   /* dedup map only lives through the build */
+    }
+
     /* U1 leaf-widx cache: size it to the exact modified_memref count (the chains
-     * rc_modified_memref_can_skip walks). INTERNAL SRAM so the fast-path read is a
-     * cheap SRAM hit (PSRAM would defeat the purpose). Register the hooks only on a
-     * successful alloc; otherwise leave them NULL so memref.c keeps the original B2
-     * path (g_rc_leaf_unchanged). Re-allocated each game; freed first. */
+     * rc_modified_memref_can_skip walks). Placement is the Phase C SRAM dividend:
+     * with the authoritative mode armed, U1 only serves the ~90 legacy (dp/exotic)
+     * chains per frame, so it lives in PSRAM and returns its 18KB of internal
+     * SRAM to the WiFi/TLS budget (the 2026-07-01 heap=304B network outage was
+     * exactly this budget crossing zero). Without Phase C (no table / emit fail)
+     * U1 is the hot per-chain path again -> INTERNAL SRAM as before. Register
+     * the hooks only on a successful alloc; otherwise leave them NULL so
+     * memref.c keeps the original B2 path (g_rc_leaf_unchanged). */
     {
         free(g_u1); g_u1 = NULL; g_u1_cap = 0;
         g_rc_u1_cached = NULL; g_rc_u1_populate = NULL; g_rc_u1_invalidate = NULL;
         uint32_t mmc = rc_client_modified_memref_count(client);
+        uint32_t caps = g_phasec_auth ? MALLOC_CAP_SPIRAM
+                                      : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (mmc > 0) {
-            g_u1 = (u1_entry_t*)heap_caps_malloc((size_t)mmc * sizeof(u1_entry_t),
-                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            g_u1 = (u1_entry_t*)heap_caps_malloc((size_t)mmc * sizeof(u1_entry_t), caps);
         }
         if (g_u1) {
             g_u1_cap = mmc;
@@ -4439,8 +5149,9 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
             g_rc_u1_cached     = rc_u1_cached;
             g_rc_u1_populate   = rc_u1_populate;
             g_rc_u1_invalidate = rc_u1_invalidate;
-            LOG_DBG("DEBUG=U1 cache: %u chains, %u KB internal SRAM\r\n",
-                     (unsigned)mmc, (unsigned)((size_t)mmc * sizeof(u1_entry_t) / 1024));
+            LOG_DBG("DEBUG=U1 cache: %u chains, %u KB %s\r\n",
+                     (unsigned)mmc, (unsigned)((size_t)mmc * sizeof(u1_entry_t) / 1024),
+                     g_phasec_auth ? "PSRAM (Phase C dividend)" : "internal SRAM");
         } else {
             LOG_ERR("ERROR=U1 cache: alloc(%u chains) failed — U1 OFF, original B2 path\r\n",
                     (unsigned)mmc);
@@ -4508,6 +5219,13 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
      * STATE_ACTIVE (0x07) is set on the first SNAPSHOT received from ra-module. */
     state = STATE_GAME_LOADED;
     LOG_INFO("DEBUG=Game loaded, watching %u addresses — waiting for first SNAPSHOT\r\n", watch_count);
+
+#if RA_WEB_DASHBOARD
+    /* First snapshot for the LAN dashboard now that the game + summary exist,
+     * and tell any already-connected phone to re-fetch the full list. */
+    publish_web_state();
+    ra_web_push_reload();
+#endif
 }
 
 /* Login→load chaining (v0.24.0). server_call is async now, so the old
@@ -5253,6 +5971,13 @@ void setup() {
      * RMT-backed neopixelWrite() never stalls the Core 1 EXI realtime path.
      * Prio 0, tiny stack (no rc_client here). */
     xTaskCreatePinnedToCore(ledCelebrateTask, "LED_Task", 2048, nullptr, 0, nullptr, 0);
+
+#if RA_WEB_DASHBOARD
+    /* LAN dashboard: mDNS (http://wii-ra.local/) + esp_http_server, pinned to
+     * Core 0 beside the WiFi/lwIP + httpTask stack. WiFi is already connected
+     * above. The Core 1 EXI/do_frame path is never touched by any HTTP work. */
+    ra_web_init();
+#endif
 }
 
 /* Core-0 deadlock watchdog (project_exi_robust_handshake). Runs on Core 0 so it
@@ -5331,6 +6056,34 @@ void loop() {
     /* Deliver finished HTTP responses to rc_client (callbacks run HERE,
      * on the same task as do_frame — rc_client is not thread-safe). */
     http_drain_done();
+
+#if RA_WEB_DASHBOARD
+    /* Refresh the web dashboard snapshot ~1 Hz. Runs on THIS task (the rc_client
+     * task) so reading rc_client is safe; the Core-0 HTTP handler only ever sees
+     * the published copy. */
+    {
+        static uint32_t last_web_pub = 0;
+        if (state >= STATE_GAME_LOADED && (millis() - last_web_pub) > 1000) {
+            last_web_pub = millis();
+            publish_web_state();                     /* tiny header — always cheap */
+            /* Full achievement list only while a phone is actually watching, so
+             * normal gameplay pays nothing for it. */
+            if (ra_web_client_active(15000)) {
+                build_and_publish_web_json();
+                /* Rich-presence line — push only when it changes. */
+                if (g_client) {
+                    static char last_rp[128] = {0};
+                    char rp[128];
+                    if (rc_client_get_rich_presence_message(g_client, rp, sizeof(rp)) > 0
+                        && strcmp(rp, last_rp) != 0) {
+                        strncpy(last_rp, rp, sizeof(last_rp) - 1);
+                        ra_web_push_rp(rp);
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     // State machine. loadGame is async now (login → load → on_game_loaded
     // all via callbacks), so guard against re-entering it every iteration

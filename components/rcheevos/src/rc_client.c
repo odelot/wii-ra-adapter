@@ -6140,6 +6140,27 @@ static void rc_client_eval_achievement_range(rc_client_t* client,
  * collect walk), so concurrent calls on DISJOINT chains are race-free. */
 static void rc_upd_resolve_one(rc_client_t* client, rc_modified_memref_t* mm, int incr) {
 #ifdef RC_INCREMENTAL_UPD
+  /* Phase C authoritative: covered INDIRECT chains take their leaf value
+   * straight from the d2x-walked slot blob — no B2/U1 machinery, no operand
+   * evals, no per-byte hash lookups. CURSOR DISCIPLINE: can_skip won't run
+   * on this path, so we must consume this mm's dense-cursor slot ourselves
+   * (r != 0) or leave it for can_skip (r == 0) — every mm advances the U1
+   * cursor EXACTLY once or the widx cache misindexes the remaining chains. */
+  if (g_rc_phasec_read && g_rc_u1_active &&
+      mm->modifier_type == RC_OPERATOR_INDIRECT_READ) {
+    uint32_t raw;
+    int r = g_rc_phasec_read(g_rc_u1_cursor, &raw);
+    if (r != 0) {
+      g_rc_u1_cursor++;
+      if (r == 1)
+        rc_update_memref_value(&mm->memref.value,
+                               raw & rc_memref_mask(mm->memref.value.size));
+      /* r == 2: slot not ready — adapter bumped the do_frame gate; keep the
+       * stale value, the gate defers + rolls this frame back. */
+      return;
+    }
+    /* r == 0: not covered — legacy path below (can_skip advances the cursor) */
+  }
   if (rc_modified_memref_can_skip(mm, incr))
     return;
   ++g_rc_upd_resolves;

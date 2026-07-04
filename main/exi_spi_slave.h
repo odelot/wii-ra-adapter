@@ -23,19 +23,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* EXI_PIN_* (per-board pin map) come from here. */
+#include "board_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /** Maximum transaction size in bytes */
 #define EXI_MAX_TRANSACTION_SIZE  8192  /* must hold snapshot: 12 hdr + 4096 values */
-
-/** SPI Slave pin configuration (ESP32-S3 DevKit) */
-#define EXI_PIN_MOSI    11   // GameCube DI -> ESP32 MOSI (GC writes to us)
-#define EXI_PIN_MISO    13   // ESP32 MISO -> GameCube DO (we write to GC)
-#define EXI_PIN_CLK     12   // GameCube CLK
-#define EXI_PIN_CS      10   // GameCube CS (active low)
-#define EXI_PIN_INT     14   // Optional: interrupt line ESP32 -> GC
 
 /** Status of an EXI transaction */
 typedef enum {

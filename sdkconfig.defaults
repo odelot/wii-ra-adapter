@@ -12,31 +12,28 @@
 # =============================================================================
 CONFIG_IDF_TARGET="esp32s3"
 
-# --- Flash: 16MB, QIO. STAGE 3: 80->120MHz. NOT a perf goal — it's a HARD
-#     co-requirement of PSRAM 120MHz: octal PSRAM @120M runs DTR, which forces
-#     the shared MSPI core clock to 240MHz; flash & PSRAM share that core clock,
-#     and IDF only ships a flash timing-tuning table for the 240M-core/120M-flash
-#     combo (none for 240M-core/80M-flash) -> build error without this. Flash 120M
-#     is also experimental (gated behind IDF_EXPERIMENTAL_FEATURES, set below). ---
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# --- Flash: 8MB, QIO @ 80MHz. ---
+# 2026-06-29: this S3-MINI module has only 8MB flash (boot log: "detected chip: gd",
+# "Detected size(8192k)"). Building for 16MB made init_flash assert ("Detected size
+# smaller than the size in the binary image header") -> boot loop. Partition table
+# reworked to single-app (factory 3MB) + ffat ~4.9MB to fit 8MB.
+# 80M lock: that module's flash chip does NOT support HPM (boot log: "High performance
+# mode of this flash model hasn't been supported"), so 120M flash is physically
+# impossible — IDF was silently downgrading FLASHFREQ to "80m" anyway. Since octal
+# flash and octal PSRAM share the MSPI core clock, this also forces PSRAM down to 80M.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-# 2026-06-18: TEMPORARILY back to 120M as a DETERMINISTIC-REPRO tool for the galaxy
-# deadlock investigation (80M makes it intermittent; 120M "always froze"). The
-# WDOG-FREEZE forensics validate it's the SAME deadlock (bad-magic=0 + srv=+0) and
-# not 120M wire corruption (bad-magic flood). Co-req of PSRAM 120M (see note above).
-# Revert to _80M when done unless the deadlock fix makes 120M stable (perf bonus).
-CONFIG_ESPTOOLPY_FLASHFREQ_120M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
-# --- PSRAM: N16R8 = Octal (OPI) 8MB. STAGE 3: 80->120MHz (1.5x bandwidth, the
-#     lever for the eval's 763KB condition-struct streaming). EXPERIMENTAL on
-#     octal — the 120M choice is gated behind IDF_EXPERIMENTAL_FEATURES; timing
-#     margins are tight, so watch for instability (revert to SPEED_80M if flaky). ---
-CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+# --- PSRAM: N16R8 = Octal (OPI) 8MB @ 80MHz. ---
+# 2026-06-28: 80M for the S3-MINI target. The AP gen3 (APS6408) chip itself rates
+# >120M, but octal PSRAM shares the MSPI core clock with flash, and flash is capped
+# at 80M on this module (no HPM) — so 120M PSRAM is not reachable here regardless.
+# 80M octal DDR is still ~160 MB/s and needs no experimental gating.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_TYPE_AUTO=y
-# 2026-06-18: 120M re-enabled for deterministic deadlock repro (see flash note).
-CONFIG_SPIRAM_SPEED_120M=y
+CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # CRITICAL mem-balance — the .ino's SRAM/PSRAM tuning (and the mbedTLS handshake
@@ -53,7 +50,7 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
-# --- Partition table: 3MB APP / 9.9MB FATFS ---
+# --- Partition table: single-app 3MB factory / ~4.9MB FATFS (8MB flash) ---
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 

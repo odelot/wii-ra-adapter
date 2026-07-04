@@ -144,6 +144,9 @@ int rc_parse_operand(rc_operand_t* self, const char** memaddr, rc_parse_state_t*
   int allow_decimal = 0;
 
   self->is_combining = 0;
+#ifdef RC_SHADOW_VALUES
+  self->shadow_slot = 0xFFFF;   /* unshadowed until rc_shadow_build_trigger assigns it */
+#endif
 
   switch (*aux) {
     case 'h': case 'H': /* hex constant */

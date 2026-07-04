@@ -5815,6 +5815,9 @@ static void rc_client_update_memref_values(rc_client_t* client) {
 
       if (client->state.processing_memref) {
         rc_update_memref_value(&memref->value, value);
+#ifdef RC_SHADOW_VALUES
+        rc_shadow_mirror(memref);
+#endif
       }
       else {
         /* if the peek function cleared the processing_memref, the memref was invalidated */
@@ -5847,6 +5850,9 @@ static void rc_client_update_memref_values(rc_client_t* client) {
         ++g_rc_upd_resolves;
 #endif
         rc_update_memref_value(&modified_memref->memref.value, rc_get_modified_memref_value(modified_memref, client->state.legacy_peek, client));
+#ifdef RC_SHADOW_VALUES
+        rc_shadow_mirror(&modified_memref->memref);
+#endif
       }
 
       modified_memref_list = modified_memref_list->next;
@@ -5910,6 +5916,11 @@ typedef struct {
 volatile int g_rc_dirty_eval_enabled = 1;       /* re-enabled: bisect EXONERATED dirty-eval (froze with it OFF too); freeze was PSRAM 120MHz under the convergence storm */
 volatile uint32_t g_rc_de_skipped = 0;
 volatile uint32_t g_rc_de_evaled = 0;
+#ifdef RC_CLEAN_REPLAY
+/* warm+clean triggers handled via cached-truth replay (subset of g_rc_de_evaled) */
+volatile uint32_t g_rc_de_replayed = 0;
+extern char g_rc_replay_sentinel;   /* defined in trigger.c; passed as unused_L to request replay */
+#endif
 
 #define RC_DE_MAX_DEPS 512   /* per-ach distinct-memref cap; overflow => never-skip */
 
@@ -5976,8 +5987,14 @@ static void rc_de_build_game(rc_client_game_info_t* game) {
   for (subset = game->subsets; subset != NULL; subset = subset->next) {
     rc_client_achievement_info_t* ach = subset->achievements;
     rc_client_achievement_info_t* stop = ach + subset->public_.num_achievements;
-    for (; ach < stop; ++ach)
+    for (; ach < stop; ++ach) {
       rc_de_build_achievement(game, ach);
+#ifdef RC_SHADOW_VALUES
+      /* assign shadow slots for this trigger's operands (arena + count were set/reset
+       * by main's rc_shadow_set_arena at game load). One-time, single-threaded. */
+      rc_shadow_build_trigger(ach->trigger);
+#endif
+    }
   }
   game->dirty_eval_built = 1;
 }
@@ -5998,13 +6015,28 @@ static int rc_de_should_skip(rc_client_achievement_info_t* ach) {
     }
   }
 
-  if (dep_changed_now || ach->eval_next || trig->has_hits ||
+  /* dirty (changed this frame), settling (changed last frame -> Delta shift), or
+   * WAITING (watching the true->false edge) need a full eval with fresh reads */
+  if (dep_changed_now || ach->eval_next ||
       trig->state == RC_TRIGGER_STATE_WAITING) {
     ach->eval_next = dep_changed_now;   /* settle Delta next frame */
     return 0;
   }
 
+  /* proven CLEAN (no dep memref changed this frame or last) and not WAITING */
   ach->eval_next = 0;
+
+#ifdef RC_CLEAN_REPLAY
+  /* WARM: hit counts exist so accrual must run, but the raw truth is unchanged ->
+   * replay with cached truth (behavior-identical, skips the scattered operand reads) */
+  if (trig->has_hits)
+    return 2;
+#else
+  if (trig->has_hits)
+    return 0;   /* replay not compiled in -> full eval, as before */
+#endif
+
+  /* COLD + CLEAN: evaluating is a guaranteed no-op -> skip entirely */
   return 1;
 }
 #endif /* RC_DIRTY_EVAL */
@@ -6016,23 +6048,31 @@ static void rc_client_eval_achievement_range(rc_client_t* client,
     rc_trigger_t* trigger = achievement->trigger;
     int old_state, new_state;
     uint32_t old_measured_value;
+    void* rc_replay_L = NULL;   /* non-NULL -> rc_evaluate_trigger uses cached-truth replay */
 
     if (!trigger || achievement->public_.state != RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
       continue;
 
 #ifdef RC_DIRTY_EVAL
     if (g_rc_dirty_eval_enabled) {
-      if (rc_de_should_skip(achievement)) {
+      int de_act = rc_de_should_skip(achievement);
+      if (de_act == 1) {
         __atomic_fetch_add(&g_rc_de_skipped, 1, __ATOMIC_RELAXED);
         continue;
       }
+#ifdef RC_CLEAN_REPLAY
+      if (de_act == 2) {
+        __atomic_fetch_add(&g_rc_de_replayed, 1, __ATOMIC_RELAXED);
+        rc_replay_L = &g_rc_replay_sentinel;   /* WARM+CLEAN -> replay (per-call signal, race-free) */
+      }
+#endif
       __atomic_fetch_add(&g_rc_de_evaled, 1, __ATOMIC_RELAXED);
     }
 #endif
 
     old_measured_value = trigger->measured_value;
     old_state = trigger->state;
-    new_state = rc_evaluate_trigger(trigger, client->state.legacy_peek, client, NULL);
+    new_state = rc_evaluate_trigger(trigger, client->state.legacy_peek, client, rc_replay_L);
 
     /* trigger->state doesn't actually change to RESET - RESET just serves as a notification.
      * we don't care about that particular notification, so look at the actual state. */

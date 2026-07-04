@@ -8,6 +8,23 @@
 volatile int g_rc_short_circuit_enabled = 1;
 #endif
 
+#ifdef RC_CLEAN_REPLAY
+/* Clean-replay runtime A/B toggle (default ON). The rc_client dirty-eval gate passes
+ * a non-NULL unused_L to rc_evaluate_trigger when a trigger is WARM+CLEAN; the eval
+ * then runs the full condset machinery (accrual/pause/measured/state) but
+ * rc_test_condition returns the cached truth instead of re-reading operands from
+ * PSRAM. Behavior-identical on a clean frame; skips the scattered reads (the eval's
+ * PSRAM-bandwidth bottleneck, +43% at 80MHz). The signal rides the param (per-call,
+ * race-free across the 2 work-stealing cores) — NOT a global. */
+volatile int g_rc_clean_replay_enabled = 1;
+volatile uint32_t g_rc_replay_count = 0;
+/* dedicated sentinel: the dirty-eval gate passes &g_rc_replay_sentinel as unused_L to
+ * request replay. Using a unique address (not "any non-NULL") keeps replay from ever
+ * being triggered by another caller forwarding a real pointer (e.g. a future Lua state)
+ * — replay on a non-gated/dirty frame would read stale cached truth = wrong eval. */
+char g_rc_replay_sentinel;
+#endif
+
 void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_parse_state_t* parse) {
   rc_condset_t** next;
   const char* aux;
@@ -201,6 +218,14 @@ int rc_evaluate_trigger(rc_trigger_t* self, rc_peek_t peek, void* ud, void* unus
    * eval: a false trigger whose only hits were cosmetic "other" tallies now reports
    * has_hits=0 (cold) -> dirty-eval skips it -> less eval. Runtime-gated for A/B. */
   eval_state.can_short_curcuit = g_rc_short_circuit_enabled;
+#endif
+#ifdef RC_CLEAN_REPLAY
+  /* WARM+CLEAN replay signalled by a non-NULL unused_L from the dirty-eval gate
+   * (per-call -> race-free across the 2 work-stealing eval cores). */
+  if (g_rc_clean_replay_enabled && unused_L == (void*)&g_rc_replay_sentinel) {
+    eval_state.use_cached_truth = 1;
+    __atomic_fetch_add(&g_rc_replay_count, 1, __ATOMIC_RELAXED);
+  }
 #endif
 
   measured_value.type = RC_VALUE_TYPE_NONE;

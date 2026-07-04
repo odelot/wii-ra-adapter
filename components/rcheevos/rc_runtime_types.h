@@ -85,6 +85,15 @@ struct rc_memref_t {
 
   /* The memory address of this variable. */
   uint32_t address;
+
+#ifdef RC_SHADOW_VALUES
+  /* write-side slot into the compact shadow value arrays (UPD already touches this
+   * struct). 0xFFFF = unassigned. Padded so sizeof(rc_memref_t) stays a multiple of 8
+   * (16->24): the preparse memref allocator force-aligns the array end to 8, and a
+   * non-8 element size diverges the size-calc from the real parse -> buffer overflow. */
+  uint16_t shadow_slot;
+  uint16_t shadow_pad_[3];
+#endif
 };
 
 /*****************************************************************************\
@@ -104,6 +113,18 @@ enum {
   RC_OPERAND_RECALL          /* The value captured by the last RC_CONDITION_REMEMBER condition */
 };
 
+/* FP-constant storage type. RC_COMPACT_OPERAND shrinks it double->float so the union
+ * (rc_operand_t 16->8B, rc_condition_t 48->32B = -33% eval streaming, rc_modified_memref_t
+ * 56->36B = -36% upd streaming). EVAL-SAFE: the eval already converts every FP const to
+ * f32 (rc_evaluate_operand) and rcheevos has no f64 in eval (rc_typed_value only has f32),
+ * so float storage is value-identical at eval; only parse-storage precision changes (the 5
+ * test_parse_operand_fp asserts diverge — benign, like the short-circuit cosmetic diffs). */
+#ifdef RC_COMPACT_OPERAND
+typedef float rc_fp_t;
+#else
+typedef double rc_fp_t;
+#endif
+
 typedef struct rc_operand_t {
   union {
     /* A value read from memory. */
@@ -113,7 +134,7 @@ typedef struct rc_operand_t {
     uint32_t num;
 
     /* A floating point value. */
-    double dbl;
+    rc_fp_t dbl;
   } value;
 
   /* specifies which member of the value union is being used (RC_OPERAND_*) */
@@ -127,6 +148,13 @@ typedef struct rc_operand_t {
 
   /* if set, this operand is combining the current condition with the previous one */
   uint8_t is_combining;
+
+#ifdef RC_SHADOW_VALUES
+  /* read-side slot (cache-hot: operand is part of the streamed rc_condition_t), copied
+   * from value.memref->shadow_slot at build. 0xFFFF = not shadowed -> read falls back to
+   * struct. Fits the existing tail padding -> sizeof(rc_operand_t) UNCHANGED. */
+  uint16_t shadow_slot;
+#endif
 }
 rc_operand_t;
 
@@ -212,6 +240,14 @@ struct rc_condition_t {
 
   /* Unique identifier of optimized comparator to use. (RC_PROCESSING_COMPARE_*) */
   uint8_t optimized_comparator;
+
+#ifdef RC_COND_BLOAT
+  /* DIAGNOSTIC ONLY (project_compiled_eval): inert padding that ~doubles sizeof to
+   * double the eval's condition-struct streaming. Build with -DRC_COND_BLOAT and
+   * compare evl_us vs normal: evl rises => eval is memory-bound on condition
+   * streaming (plan/state compaction will pay); evl flat => CPU-bound (don't bother). */
+  uint8_t _bloat_diag[48];
+#endif
 };
 
 /*****************************************************************************\

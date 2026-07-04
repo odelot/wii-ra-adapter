@@ -58,6 +58,27 @@ typedef struct rc_memrefs_t {
   rc_modified_memref_list_t modified_memrefs;
 } rc_memrefs_t;
 
+#ifdef RC_SHADOW_VALUES
+/* compact shadow value cache (see memref.c / project_shadow_array). Eval reads a
+ * memref operand's value/prior/changed from the compact arrays when shadowed
+ * (op->shadow_slot != 0xFFFF), else falls back to the struct (the safe path).
+ * Macros (not inline fns) to stay c89-clean + avoid call overhead in the hot path. */
+extern volatile int g_rc_shadow_enabled;
+extern uint32_t* g_rc_sv_value;
+extern uint32_t* g_rc_sv_prior;
+extern uint8_t*  g_rc_sv_changed;
+#define RC_SV_VALUE(op)   ((g_rc_shadow_enabled && (op)->shadow_slot != 0xFFFF) ? g_rc_sv_value[(op)->shadow_slot]   : (op)->value.memref->value.value)
+#define RC_SV_PRIOR(op)   ((g_rc_shadow_enabled && (op)->shadow_slot != 0xFFFF) ? g_rc_sv_prior[(op)->shadow_slot]   : (op)->value.memref->value.prior)
+#define RC_SV_CHANGED(op) ((g_rc_shadow_enabled && (op)->shadow_slot != 0xFFFF) ? g_rc_sv_changed[(op)->shadow_slot] : (op)->value.memref->value.changed)
+void rc_shadow_build_trigger(rc_trigger_t* trigger);
+void rc_shadow_set_arena(uint32_t* value, uint32_t* prior, uint8_t* changed, uint32_t cap);
+void rc_shadow_mirror(rc_memref_t* m);
+#else
+#define RC_SV_VALUE(op)   ((op)->value.memref->value.value)
+#define RC_SV_PRIOR(op)   ((op)->value.memref->value.prior)
+#define RC_SV_CHANGED(op) ((op)->value.memref->value.changed)
+#endif
+
 typedef struct rc_trigger_with_memrefs_t {
   rc_trigger_t trigger;
   rc_memrefs_t memrefs;
@@ -248,6 +269,17 @@ typedef struct {
 
   /* control settings */
   uint8_t can_short_curcuit;           /* allows logic processing to stop as soon as a false condition is encountered */
+#ifdef RC_CLEAN_REPLAY
+  uint8_t use_cached_truth;            /* clean-replay: rc_test_condition returns the cached condition->is_true
+                                        * instead of re-reading operands. Valid ONLY on a frame proven CLEAN by
+                                        * the dirty-eval gate (no dep memref changed this frame or last) — then
+                                        * the raw truth equals the previous eval, so the full condset machinery
+                                        * (hit accrual / pause / measured / state) runs unchanged and produces a
+                                        * behavior-identical result while skipping the scattered PSRAM reads.
+                                        * Set per-call via rc_evaluate_trigger's unused_L param (race-free across
+                                        * the 2 work-stealing eval cores; NOT a global). Host-validated 2313/2314
+                                        * incl. stress (replay every clean trigger). */
+#endif
 }
 rc_eval_state_t;
 

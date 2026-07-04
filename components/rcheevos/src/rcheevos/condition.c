@@ -548,36 +548,34 @@ int rc_condition_is_combining(const rc_condition_t* self) {
 }
 
 static int rc_test_condition_compare_memref_to_const(rc_condition_t* self) {
-  const uint32_t value1 = self->operand1.value.memref->value.value;
+  const uint32_t value1 = RC_SV_VALUE(&self->operand1);
   const uint32_t value2 = self->operand2.value.num;
   assert(self->operand1.size == self->operand1.value.memref->value.size);
   return rc_test_condition_compare(value1, value2, self->oper);
 }
 
 static int rc_test_condition_compare_delta_to_const(rc_condition_t* self) {
-  const rc_memref_value_t* memref1 = &self->operand1.value.memref->value;
-  const uint32_t value1 = (memref1->changed) ? memref1->prior : memref1->value;
+  const uint32_t value1 = (RC_SV_CHANGED(&self->operand1)) ? RC_SV_PRIOR(&self->operand1) : RC_SV_VALUE(&self->operand1);
   const uint32_t value2 = self->operand2.value.num;
   assert(self->operand1.size == self->operand1.value.memref->value.size);
   return rc_test_condition_compare(value1, value2, self->oper);
 }
 
 static int rc_test_condition_compare_memref_to_memref(rc_condition_t* self) {
-  const uint32_t value1 = self->operand1.value.memref->value.value;
-  const uint32_t value2 = self->operand2.value.memref->value.value;
+  const uint32_t value1 = RC_SV_VALUE(&self->operand1);
+  const uint32_t value2 = RC_SV_VALUE(&self->operand2);
   assert(self->operand1.size == self->operand1.value.memref->value.size);
   assert(self->operand2.size == self->operand2.value.memref->value.size);
   return rc_test_condition_compare(value1, value2, self->oper);
 }
 
 static int rc_test_condition_compare_memref_to_delta(rc_condition_t* self) {
-  const rc_memref_value_t* memref = &self->operand1.value.memref->value;
   assert(self->operand1.value.memref == self->operand2.value.memref);
   assert(self->operand1.size == self->operand1.value.memref->value.size);
   assert(self->operand2.size == self->operand2.value.memref->value.size);
 
-  if (memref->changed)
-    return rc_test_condition_compare(memref->value, memref->prior, self->oper);
+  if (RC_SV_CHANGED(&self->operand1))
+    return rc_test_condition_compare(RC_SV_VALUE(&self->operand1), RC_SV_PRIOR(&self->operand1), self->oper);
 
   switch (self->oper) {
     case RC_OPERATOR_EQ:
@@ -591,13 +589,12 @@ static int rc_test_condition_compare_memref_to_delta(rc_condition_t* self) {
 }
 
 static int rc_test_condition_compare_delta_to_memref(rc_condition_t* self) {
-  const rc_memref_value_t* memref = &self->operand1.value.memref->value;
   assert(self->operand1.value.memref == self->operand2.value.memref);
   assert(self->operand1.size == self->operand1.value.memref->value.size);
   assert(self->operand2.size == self->operand2.value.memref->value.size);
 
-  if (memref->changed)
-    return rc_test_condition_compare(memref->prior, memref->value, self->oper);
+  if (RC_SV_CHANGED(&self->operand1))
+    return rc_test_condition_compare(RC_SV_PRIOR(&self->operand1), RC_SV_VALUE(&self->operand1), self->oper);
 
   switch (self->oper) {
     case RC_OPERATOR_EQ:
@@ -707,6 +704,14 @@ static int rc_test_condition_compare_delta_to_memref_transformed(rc_condition_t*
 
 int rc_test_condition(rc_condition_t* self, rc_eval_state_t* eval_state) {
   rc_typed_value_t value1, value2;
+
+#ifdef RC_CLEAN_REPLAY
+  /* clean-replay: on a proven-clean frame the raw truth is identical to the last
+   * eval, so return the cached value (bit0; bit1 is the ResetIf-responsible flag)
+   * and skip the operand reads. The caller's accrual/state logic runs unchanged. */
+  if (eval_state->use_cached_truth)
+    return (self->is_true & 0x01);
+#endif
 
   /* use an optimized comparator whenever possible */
   switch (self->optimized_comparator) {

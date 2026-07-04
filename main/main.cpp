@@ -5567,7 +5567,7 @@ void loadGame(const char *hash) {
      * test. RA_HARDCORE_MODE 0 restores softcore. Must be set BEFORE
      * begin_load_game (lb activation happens at load). */
     #ifndef RA_HARDCORE_MODE
-    #define RA_HARDCORE_MODE 1
+    #define RA_HARDCORE_MODE 0
     #endif
     rc_client_set_hardcore_enabled(g_client, RA_HARDCORE_MODE);
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);

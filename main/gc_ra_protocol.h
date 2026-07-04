@@ -137,9 +137,6 @@ typedef enum {
      * Phase C: fetch one chunk of the chain descriptor table (after the
      * watchlist fetch, once per game). Payload: ra_chain_chunk_req_t.
      * Response: ra_chain_chunk_t + node_count × RA_CHAIN_NODE_SIZE nodes.
-     * Consoles that never send this (Nintendont, GameCube adapter) stay
-     * pure-legacy; an ESP with no table answers node_count=0/is_last=1,
-     * which disables Phase C for the game on the console side too.
      */
     RA_CMD_GET_CHAIN_CHUNK   = 0x0B,
 } ra_gc_command_t;

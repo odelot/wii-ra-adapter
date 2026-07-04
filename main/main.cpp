@@ -6292,7 +6292,7 @@ void setup() {
     WiFi.setSleep(false);
 
     state = STATE_WAIT_GAME_ID;
-    LOG_INFO("DEBUG=Ready, waiting for GameCube...\r\n");
+    LOG_INFO("DEBUG=Ready, waiting for Wii...\r\n");
 
     /* EXI task priority 19 (v0.24.2; was 1). Arduino-ESP32 leaves the
      * lwIP tcpip task UNPINNED (NO_AFFINITY, prio ~18) — during HTTP

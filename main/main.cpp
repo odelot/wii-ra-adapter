@@ -1004,6 +1004,65 @@ static uint32_t  g_phasec_win_rx = 0;        /* windows ingested (diag) */
 static uint32_t  g_phasec_cmp_ok = 0, g_phasec_cmp_bad = 0,
                  g_phasec_cmp_miss = 0, g_phasec_cmp_inv = 0;
 
+/* ============================================================================
+ * SNAPSHOT QUEUE (zero-frame-loss, 2026-07-02) — hardcore-mode fidelity.
+ *
+ * The old handoff was ONE boolean (new_snapshot): while a >16.67ms do_frame
+ * ran on the loop task (the de_ev=160 eval storms), the next snapshot's
+ * set_new_snapshot() collapsed into the same boolean and that gameplay frame
+ * was never individually evaluated (~8-12 lost/session, 0.03%). Now: when the
+ * loop task is busy (or already owes work), the worker task ENQUEUES the raw
+ * snapshot payload; the loop task DRAINS the ring after each do_frame,
+ * applying each entry (snapshot_apply_payload) and evaluating EVERY frame
+ * with ITS OWN exact data — a lagging emulator, not stale values.
+ *
+ * RULES (see project_snapshot_queue_design):
+ *  - Phase D2 seq verification stays at ARRIVAL (worker) — only in-sync
+ *    snapshots are enqueued; mutation delivery is value-independent.
+ *  - Collect/ADDR_QUERY/evict/GC run ONLY on the fast path (queue empty,
+ *    loop idle): the dp resolver must not run against stale do_frame state,
+ *    and an ADDR_QUERY under lag would feed FUTURE MEM1 values into a PAST
+ *    frame's eval. dp-chains wait 1-2 frames (peek_miss net catches up).
+ *  - Single producer (worker task, tail) / single consumer (loop task,
+ *    head), both on Core 1 → volatile indexes suffice. Head advances only
+ *    AFTER the slot is applied, so the producer never reuses a live slot.
+ *  - Ring full (sustained overload — shouldn't happen at steady 6-10ms):
+ *    drop the NEW frame + count it (== today's behavior, visible as q_drop).
+ */
+#define SNAPQ_N 8                       /* 8 x 8KB PSRAM; storms are 1-2 deep */
+static uint8_t* g_snapq_buf[SNAPQ_N] = {0};   /* ps_malloc'd in setup() */
+static volatile uint16_t g_snapq_len[SNAPQ_N] = {0};
+static volatile uint8_t  g_snapq_head = 0;    /* consumer: loop task */
+static volatile uint8_t  g_snapq_tail = 0;    /* producer: worker task */
+static volatile bool     g_df_busy = false;   /* loop task inside do_frame/drain */
+static uint32_t g_q_enq = 0, g_q_drop = 0, g_q_hwm = 0;   /* per-CATCHUP diag */
+static inline bool    snapq_empty(void) { return g_snapq_head == g_snapq_tail; }
+static inline uint8_t snapq_depth(void) {
+    return (uint8_t)((g_snapq_tail - g_snapq_head + SNAPQ_N) % SNAPQ_N);
+}
+#define RA_SNAP_HDR_LEGACY 8u   /* pre-Phase-C snapshot header size (dual parse) */
+
+/* ============================================================================
+ * Phase D — dp verification (the desync detector). The walker resolves
+ * DELTA/PRIOR edges from its own frame history (sound because the snapshot
+ * queue guarantees walks == do_frames) and SHIPS the parent prev/prior values
+ * it used. After the memref UPDATE (the gate's primed callback position) the
+ * ESP compares them against its own delta/prior for the same parents:
+ * mismatch = the two "previous frame" clocks diverged (a dropped/deferred
+ * frame) → DEFER this frame (never evaluate a mixed view). DELTA self-heals
+ * after one cleanly evaluated frame; PRIOR on the value's next change.
+ * The (parent,kind) list is derived by scanning the node table in order —
+ * identical on both sides by construction. dpmm = the mismatch counter IS
+ * the instrumentation (each event logged with both values).
+ * ============================================================================ */
+static uint16_t g_phasec_dp_n = 0;
+static uint16_t g_phasec_dp_node[RC_PHASEC_MAX_DP];    /* parent node index */
+static uint8_t  g_phasec_dp_kind_a[RC_PHASEC_MAX_DP];  /* 1=delta 2=prior */
+static void*    g_phasec_dp_memref[RC_PHASEC_MAX_DP];  /* rc_memref_t* (from keys) */
+static uint32_t g_phasec_dp_ship[RC_PHASEC_MAX_DP];    /* values shipped this frame */
+static volatile bool g_phasec_dp_have = false;         /* section present for pending frame */
+static uint32_t g_pc_dpmm = 0;                         /* mismatches (cumulative diag) */
+
 /* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
  * g_update_miss_count is reset right before each rc_client_do_frame and bumped
  * by read_memory_ingame on a NO-TOMBSTONE valid miss (a read that would return
@@ -1026,7 +1085,39 @@ static rc_memref_value_t *g_memref_save = NULL;
  * extern "C" so its type matches the C-linkage g_rc_doframe_primed_cb pointer
  * (GCC rejects assigning a C++-linkage function to a C-linkage pointer). */
 extern "C" int doframe_primed_cb(void) {
-    return g_update_miss_count == 0 ? 1 : 0;
+    if (g_update_miss_count != 0) return 0;
+    /* Phase D dp verification — runs AFTER the memref UPDATE (this callback's
+     * position inside the gated do_frame), so the ESP-side delta/prior carry
+     * THIS frame's semantics: DELTA = changed ? prior : value (mirrors
+     * rc_get_memref_value_value), PRIOR = prior. Any mismatch vs what the
+     * walker used ⇒ the two "previous frame" clocks diverged ⇒ defer (the
+     * gate rolls the frame back; realignment is automatic). */
+    /* Skip the dp compare during warmup: spectator mode makes unlocks
+     * impossible, and boot inevitably desyncs the two prev-clocks (the d2x
+     * walks frames before the ESP's first do_frame) — comparing there only
+     * produced defer noise (9 of wii6.log's 10 dpmm were boot transients).
+     * Alignment self-establishes on the first cleanly-evaluated live frame. */
+    if (g_phasec_dp_have && !g_warmup_active) {
+        for (uint16_t i = 0; i < g_phasec_dp_n; i++) {
+            const rc_memref_t* m = (const rc_memref_t*)g_phasec_dp_memref[i];
+            uint32_t expect = (g_phasec_dp_kind_a[i] == RC_PHASEC_DP_PRIOR)
+                ? m->value.prior
+                : (m->value.changed ? m->value.prior : m->value.value);
+            if (expect != g_phasec_dp_ship[i]) {
+                g_pc_dpmm++;
+                static uint32_t last_dp_log = 0;
+                uint32_t now_dp = millis();
+                if (now_dp - last_dp_log >= 2000) {
+                    last_dp_log = now_dp;
+                    LOG_DBG("DEBUG=PhaseD dpmm: i=%u kind=%u ship=%08lX expect=%08lX (defer)\r\n",
+                            (unsigned)i, (unsigned)g_phasec_dp_kind_a[i],
+                            (unsigned long)g_phasec_dp_ship[i], (unsigned long)expect);
+                }
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 // Dedicated watchlist buffer for chunked delivery
@@ -1497,6 +1588,39 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
                 ra_web_push_progress(a->id, (int)a->measured_percent, a->measured_progress);
 #endif
             break;
+        /* Leaderboards (hardcore experiment 2026-07-03). STARTED/FAILED/
+         * SUBMITTED and tracker SHOW/HIDE are rare — log normally. TRACKER_
+         * UPDATE fires EVERY FRAME the tracked value changes (a speedrun
+         * timer = 60/s) — hard-throttled so the log ring / Core 1 never
+         * feel it and the perf measurement stays clean. */
+        case RC_CLIENT_EVENT_LEADERBOARD_STARTED:
+        case RC_CLIENT_EVENT_LEADERBOARD_FAILED:
+        case RC_CLIENT_EVENT_LEADERBOARD_SUBMITTED:
+            LOG_INFO("DEBUG=event: LBOARD_%s id=%lu \"%s\"\r\n",
+                    event->type == RC_CLIENT_EVENT_LEADERBOARD_STARTED ? "START"
+                    : event->type == RC_CLIENT_EVENT_LEADERBOARD_FAILED ? "FAIL"
+                    : "SUBMIT",
+                    event->leaderboard ? (unsigned long)event->leaderboard->id : 0UL,
+                    event->leaderboard ? event->leaderboard->title : "?");
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_SHOW:
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_HIDE:
+            LOG_INFO("DEBUG=event: LBTRK_%s id=%lu %s\r\n",
+                    event->type == RC_CLIENT_EVENT_LEADERBOARD_TRACKER_SHOW ? "SHOW" : "HIDE",
+                    event->leaderboard_tracker ? (unsigned long)event->leaderboard_tracker->id : 0UL,
+                    event->leaderboard_tracker ? event->leaderboard_tracker->display : "?");
+            break;
+        case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_UPDATE: {
+            static uint32_t last_trk_log = 0;
+            uint32_t now_trk = millis();
+            if (now_trk - last_trk_log >= 2000) {
+                last_trk_log = now_trk;
+                LOG_DBG("DEBUG=event: LBTRK_UPD id=%lu %s (2s throttle)\r\n",
+                        event->leaderboard_tracker ? (unsigned long)event->leaderboard_tracker->id : 0UL,
+                        event->leaderboard_tracker ? event->leaderboard_tracker->display : "?");
+            }
+            break;
+        }
         default:
             LOG_INFO("DEBUG=event: %d\r\n", event->type);
             break;
@@ -2561,8 +2685,21 @@ static void server_call_blocking(const http_job_t *job) {
         #if KEEP_ONLY_FIRST_SET
         vTaskDelay(1); json_keep_first_set(ps);
         #endif
+        /* 2026-07-03 EXPERIMENT (user request): keep Leaderboards + RichPresence
+         * in the payload to measure the eval/upd/Phase-C cost of their extra
+         * conditions (post queue+Phase D the system has headroom to try).
+         * RA_KEEP_LB_RP 0 restores the historical strip. Watch on boot: the
+         * "Set ..." line (should show 48 leaderboards on SMG), census/table
+         * growth vs the d2x cap (RA_MAX_CHAIN_NODES, bumped 2048->3072), and
+         * cc= in the PhaseC line — cc < shipped means the bigger blob pushed
+         * the window into rotation (the freshness guard only protects flat). */
+        #ifndef RA_KEEP_LB_RP
+        #define RA_KEEP_LB_RP 1
+        #endif
+        #if !RA_KEEP_LB_RP
         vTaskDelay(1); json_clean_field_str(ps,   "RichPresencePatch");
         vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
+        #endif
         vTaskDelay(1); json_remove_field(ps,      "Warning");
         vTaskDelay(1); json_remove_field(ps,      "BadgeLockedURL");
         vTaskDelay(1); json_remove_field(ps,      "BadgeURL");
@@ -3232,6 +3369,112 @@ static void phasec_shadow_compare(uint16_t win_first, uint16_t win_count) {
     rot += n;
 }
 
+/* Apply ONE verified snapshot payload: parse (dual: legacy 8B / v2 14B header),
+ * advance frame_counter + lru_clock, chain-root input check, snap_changed diff,
+ * memory_data memcpy, incremental-collect dirtying, Phase C window ingest.
+ * THE single accept path — called from the arrival fast path (worker task) AND
+ * the snapshot-queue drain (loop task). Caller guarantees the payload passed
+ * Phase D2 seq+count verification at arrival. Returns inputs_changed (the
+ * chain-root gate; drain callers ignore it — collect never runs under lag). */
+static bool snapshot_apply_payload(const uint8_t* rx_data, uint32_t rx_len) {
+    const ra_snapshot_header_t *snap =
+        (const ra_snapshot_header_t*)(rx_data + sizeof(ra_gc_header_t));
+    uint16_t count = ra_be16_to_host(snap->addr_count);
+    bool snap_v2 = (rx_len >= sizeof(ra_gc_header_t)
+                    + sizeof(ra_snapshot_header_t) + count);
+    uint16_t ch_first = 0, ch_count = 0, ch_blob = 0;
+    bool inputs_changed = false;
+
+    if (snap_v2) {
+        ch_first = ra_be16_to_host(snap->chain_first);
+        ch_count = ra_be16_to_host(snap->chain_count);
+        ch_blob  = ra_be16_to_host(snap->chain_blob_len);
+    }
+    frame_counter = ra_be32_to_host(snap->frame_counter);
+    lru_clock = frame_counter;
+
+    const uint8_t *values = rx_data + sizeof(ra_gc_header_t)
+        + (snap_v2 ? sizeof(ra_snapshot_header_t) : RA_SNAP_HDR_LEGACY);
+
+    if (!memory_data) return false;
+
+    /* #1 chain-input gate (toggle, default OFF): BEFORE overwriting
+     * memory_data, check whether any pointer-base byte changed. */
+    if (g_chain_gate_enabled) {
+        if (!g_roots_built) build_chain_roots();
+        if (!g_roots_built) {
+            inputs_changed = true;   /* memrefs not ready -> don't suppress collect */
+        } else if (g_root_baddr_count && watch_addresses) {
+            uint16_t lim = (count < watch_count) ? count : watch_count;
+            for (uint16_t i = 0; i < lim; i++) {
+                if (values[i] != memory_data[i] && is_chain_root(watch_addresses[i])) {
+                    inputs_changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    /* opt B2 + incremental collect: snapshot diff BEFORE overwriting
+     * memory_data — snap_changed[i] marks entries whose value moved. */
+    if ((g_b2_enabled || g_incr_collect_active) && snap_changed) {
+        uint16_t lim = (count < watch_count) ? count : watch_count;
+        for (uint16_t i = 0; i < lim; i++)
+            snap_changed[i] = (values[i] != memory_data[i]) ? 1 : 0;
+    }
+    memcpy(memory_data, values, count);
+    /* incremental collect: dirty only chains whose inputs moved (uses the
+     * fresh snap_changed[]; must precede this vblank's collect rounds). */
+    incr_mark_dirty(count);
+    g_vblank_stats.data_ok = 1;  /* Phase D2 integrity check passed */
+
+    /* Phase C ingest: copy this frame's chain window into the persistent slot
+     * blob + validity/fresh bitmaps. Length/offset checks make a malformed
+     * window a silent no-op. Shadow compare only if the diag toggle is on. */
+    if (snap_v2 && ch_count && g_phasec_blob && g_phasec_shipped) {
+        uint32_t bm_bytes = ((uint32_t)ch_count + 7u) / 8u;
+        const uint8_t *bm = values + count;
+        const uint8_t *cb = bm + bm_bytes;
+        if ((uint32_t)ch_first + ch_count <= g_phasec_shipped &&
+            rx_len >= sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t)
+                    + (uint32_t)count + bm_bytes + ch_blob &&
+            g_phasec_blob_off[ch_first + ch_count]
+              - g_phasec_blob_off[ch_first] == ch_blob) {
+            memcpy(g_phasec_blob + g_phasec_blob_off[ch_first], cb, ch_blob);
+            for (uint16_t i = 0; i < ch_count; i++) {
+                uint32_t s = (uint32_t)ch_first + i;
+                if (bm[i >> 3] & (1u << (i & 7)))
+                    g_phasec_valid[s >> 3] |=  (uint8_t)(1u << (s & 7));
+                else
+                    g_phasec_valid[s >> 3] &= (uint8_t)~(1u << (s & 7));
+                g_phasec_fresh[s >> 3] |= (uint8_t)(1u << (s & 7));
+            }
+            g_phasec_win_rx++;
+            phasec_shadow_compare(ch_first, ch_count);
+        }
+    }
+
+    /* Phase D: dp verification section (after the window blob). Only accepted
+     * when the count matches OUR derived list (else ignored — e.g. a table/fw
+     * mismatch); the compare itself runs post-upd in doframe_primed_cb. */
+    g_phasec_dp_have = false;
+    if (snap_v2 && g_phasec_dp_n) {
+        uint16_t dpc = ra_be16_to_host(snap->dp_count);
+        uint32_t bm_bytes = ((uint32_t)ch_count + 7u) / 8u;
+        if (dpc == g_phasec_dp_n &&
+            rx_len >= (uint32_t)(values - rx_data) + (uint32_t)count
+                    + bm_bytes + ch_blob + 4u * dpc) {
+            const uint8_t* dp = values + count + bm_bytes + ch_blob;
+            for (uint16_t i = 0; i < dpc; i++) {
+                uint32_t v;
+                memcpy(&v, dp + 4u * i, 4);
+                g_phasec_dp_ship[i] = ra_be32_to_host(v);
+            }
+            g_phasec_dp_have = true;
+        }
+    }
+    return inputs_changed;
+}
+
 static uint16_t collect_missing_addresses(void) {
     const rc_memrefs_t *memrefs = (state == STATE_ACTIVE && g_client)
                                   ? rc_client_get_memrefs(g_client) : NULL;
@@ -3626,8 +3869,8 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
              * Phase C v2 header is 14B (+chain_first/count/blob_len). The Wii
              * writes EXACT lengths, so rx_len disambiguates: legacy rx_len is
              * always 4+8+count < 4+14+count, the v2 minimum. A legacy d2x
-             * against this fw therefore parses cleanly with no chain data. */
-            #define RA_SNAP_HDR_LEGACY 8u
+             * against this fw therefore parses cleanly with no chain data.
+             * (RA_SNAP_HDR_LEGACY is file-scope, by the snapshot queue.) */
             if (rx_len < sizeof(ra_gc_header_t) + RA_SNAP_HDR_LEGACY) break;
 
             const ra_snapshot_header_t *snap = (const ra_snapshot_header_t*)(rx_data + sizeof(ra_gc_header_t));
@@ -3681,11 +3924,12 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                      * win=windows ingested; cf/cc=this frame's window (cc should
                      * equal shipped once the flat list shrinks). Shadow counters
                      * shown too when the diag toggle is on. */
-                    LOG_DBG("DEBUG=PhaseC%s: rd=%lu inv=%lu dfr=%lu win=%lu cf=%u cc=%u | shadow ok=%lu bad=%lu miss=%lu\r\n",
+                    LOG_DBG("DEBUG=PhaseC%s: rd=%lu inv=%lu dfr=%lu win=%lu cf=%u cc=%u dp=%u dpmm=%lu | shadow ok=%lu bad=%lu miss=%lu\r\n",
                             g_phasec_auth ? " AUTH" : "",
                             (unsigned long)g_pc_reads, (unsigned long)g_pc_inv,
                             (unsigned long)g_pc_defer, (unsigned long)g_phasec_win_rx,
                             (unsigned)ch_first, (unsigned)ch_count,
+                            (unsigned)g_phasec_dp_n, (unsigned long)g_pc_dpmm,
                             (unsigned long)g_phasec_cmp_ok, (unsigned long)g_phasec_cmp_bad,
                             (unsigned long)g_phasec_cmp_miss);
                 }
@@ -3746,71 +3990,39 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     break;
                 }
 
-                /* Verified in sync — accept the values. */
-                if (memory_data) {
-                    /* #1 chain-input gate (toggle, default OFF): BEFORE overwriting
-                     * memory_data, check whether any pointer-base byte changed. Only
-                     * computed when the toggle is ON — the original gate doesn't need
-                     * it, and the freeze showed the 60-force is load-bearing. */
-                    if (g_chain_gate_enabled) {
-                        if (!g_roots_built) build_chain_roots();
-                        if (!g_roots_built) {
-                            inputs_changed = true;   /* memrefs not ready -> don't suppress collect */
-                        } else if (g_root_baddr_count && watch_addresses) {
-                            uint16_t lim = (count < watch_count) ? count : watch_count;
-                            for (uint16_t i = 0; i < lim; i++) {
-                                if (values[i] != memory_data[i] && is_chain_root(watch_addresses[i])) {
-                                    inputs_changed = true;
-                                    break;
-                                }
-                            }
-                        }
+                /* SNAPSHOT QUEUE (zero-frame-loss): the loop task still owes
+                 * work (do_frame in flight, an unstarted fast-path frame, or
+                 * a non-empty ring) — enqueue this verified payload RAW and
+                 * ACK. Apply happens at drain time, serialized with ITS OWN
+                 * do_frame. No collect/evict/convergence while lagging (the
+                 * dp resolver must not run on stale do_frame state; an
+                 * ADDR_QUERY here would feed future MEM1 values into a past
+                 * frame). See the ring's comment block. */
+                if (g_snapq_buf[0] && (g_df_busy || new_snapshot || !snapq_empty())) {
+                    uint8_t nt = (uint8_t)((g_snapq_tail + 1) % SNAPQ_N);
+                    if (nt == g_snapq_head) {
+                        g_q_drop++;   /* ring full (pathological) — counted, frame lost */
+                    } else {
+                        memcpy(g_snapq_buf[g_snapq_tail], rx_data, rx_len);
+                        g_snapq_len[g_snapq_tail] = (uint16_t)rx_len;
+                        g_snapq_tail = nt;
+                        g_q_enq++;
+                        uint8_t d = snapq_depth();
+                        if (d > g_q_hwm) g_q_hwm = d;
                     }
-                    /* opt B2 + incremental collect: snapshot diff BEFORE
-                     * overwriting memory_data — snap_changed[i] marks entries
-                     * whose value moved this snapshot. Read by the B2 hook
-                     * (rc_leaf_unchanged_impl) AND incr_mark_dirty() below. */
-                    if ((g_b2_enabled || g_incr_collect_active) && snap_changed) {
-                        uint16_t lim = (count < watch_count) ? count : watch_count;
-                        for (uint16_t i = 0; i < lim; i++)
-                            snap_changed[i] = (values[i] != memory_data[i]) ? 1 : 0;
-                    }
-                    memcpy(memory_data, values, count);
-                    /* incremental collect: dirty only chains whose inputs moved
-                     * (or full-rebuild on watchlist mutation / cadence). Uses the
-                     * fresh snap_changed[] above; must run before this vblank's
-                     * collect_missing rounds. */
-                    incr_mark_dirty(count);
-                    g_vblank_stats.data_ok = 1;  /* Phase D2 integrity check passed */
-
-                    /* Phase C shadow ingest: copy this frame's rotating chain
-                     * window into the persistent slot blob + validity/fresh
-                     * bitmaps, then cross-check a slice against the legacy
-                     * hash (which stays authoritative). Length/offset checks
-                     * make a malformed window a silent no-op. */
-                    if (snap_v2 && ch_count && g_phasec_blob && g_phasec_shipped) {
-                        uint32_t bm_bytes = ((uint32_t)ch_count + 7u) / 8u;
-                        const uint8_t *bm = values + count;
-                        const uint8_t *cb = bm + bm_bytes;
-                        if ((uint32_t)ch_first + ch_count <= g_phasec_shipped &&
-                            rx_len >= sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t)
-                                    + (uint32_t)count + bm_bytes + ch_blob &&
-                            g_phasec_blob_off[ch_first + ch_count]
-                              - g_phasec_blob_off[ch_first] == ch_blob) {
-                            memcpy(g_phasec_blob + g_phasec_blob_off[ch_first], cb, ch_blob);
-                            for (uint16_t i = 0; i < ch_count; i++) {
-                                uint32_t s = (uint32_t)ch_first + i;
-                                if (bm[i >> 3] & (1u << (i & 7)))
-                                    g_phasec_valid[s >> 3] |=  (uint8_t)(1u << (s & 7));
-                                else
-                                    g_phasec_valid[s >> 3] &= (uint8_t)~(1u << (s & 7));
-                                g_phasec_fresh[s >> 3] |= (uint8_t)(1u << (s & 7));
-                            }
-                            g_phasec_win_rx++;
-                            phasec_shadow_compare(ch_first, ch_count);
-                        }
-                    }
+                    ra_esp_header_t ack;
+                    ack.magic       = RA_MAGIC_ESP_TO_GC;
+                    ack.status      = (uint8_t)state;
+                    ack.event_type  = RA_EVT_NONE;
+                    ack.event_count = 0;
+                    ack.data_len    = 0;
+                    send_response((uint8_t*)&ack, sizeof(ack));
+                    break;
                 }
+
+                /* Verified in sync — accept the values (shared apply, ALSO the
+                 * queue drain's applier — all accept logic lives in there). */
+                inputs_changed = snapshot_apply_payload(rx_data, rx_len);
             }
 
             /* CRITICAL: only reset multi-pass state when no ADDR_QUERY is in
@@ -4336,6 +4548,27 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     chunk_idx, n_in_chunk, (unsigned)total, is_last);
             exi_spi_prepare_response(buf, total_len);
             free(buf);
+
+            /* CAPABILITY NEGOTIATION: the console just fetched the whole
+             * table — it WILL walk chains and ship windows. Arm the
+             * authoritative mode now (hooks were registered at game load but
+             * no-op'd). Also lower the pressure-eviction threshold so the
+             * flat list can never push the chain window into rotation
+             * (freshness guard; dp verification section reserved too). */
+            if (is_last && total > 0 && g_phasec_mm_ship && g_phasec_blob &&
+                !g_phasec_auth) {
+                uint32_t bm = (g_phasec_shipped + 7u) / 8u;
+                uint32_t budget = 8192u - sizeof(ra_gc_header_t)
+                                - sizeof(ra_snapshot_header_t)
+                                - bm - g_phasec_blob_bytes
+                                - 4u * g_phasec_dp_n;
+                budget = (budget > 64u) ? budget - 64u : 0u;
+                if (budget < g_watch_high_water)
+                    g_watch_high_water = (uint16_t)budget;
+                g_phasec_auth = true;
+                LOG_DBG("DEBUG=PhaseC AUTH armed by console fetch: hw=%u dp=%u\r\n",
+                        (unsigned)g_watch_high_water, (unsigned)g_phasec_dp_n);
+            }
             break;
         }
 
@@ -4990,6 +5223,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         g_watch_high_water = WATCHLIST_HIGH_WATER;   /* legacy default until auth re-arms */
         free(g_phasec_mm_ship);   g_phasec_mm_ship = NULL; g_phasec_mm_total = 0;
         g_pc_reads = g_pc_inv = g_pc_defer = 0;
+        g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0;   /* Phase D */
         free(g_phasec_nodes);     g_phasec_nodes = NULL;
         free(g_phasec_blob);      g_phasec_blob = NULL;
         free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
@@ -5094,25 +5328,43 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
                             }
                         }
                         g_phasec_mm_total  = g;
+                        /* Phase D: derive the dp verification list — the SAME
+                         * table scan the d2x does (order = node order, dedup
+                         * on (parent,kind)) — and resolve each parent node to
+                         * its ESP memref via the emitter keys (keys[node] =
+                         * memref ptr; dp parents are never immediate nodes). */
+                        g_phasec_dp_n = 0;
+                        for (uint32_t i2 = 0; i2 < n; i2++) {
+                            uint8_t dpk = (uint8_t)(nodes[i2].psize >> RC_PHASEC_PSZ_DP_SHIFT);
+                            uint16_t pn = nodes[i2].parent;
+                            uint16_t j2;
+                            if (!dpk || pn == RC_PHASEC_PARENT_NONE) continue;
+                            for (j2 = 0; j2 < g_phasec_dp_n; j2++)
+                                if (g_phasec_dp_node[j2] == pn &&
+                                    g_phasec_dp_kind_a[j2] == dpk) break;
+                            if (j2 < g_phasec_dp_n) continue;
+                            if (g_phasec_dp_n >= RC_PHASEC_MAX_DP) break; /* emitter caps; belt+suspenders */
+                            g_phasec_dp_node[g_phasec_dp_n]   = pn;
+                            g_phasec_dp_kind_a[g_phasec_dp_n] = dpk;
+                            g_phasec_dp_memref[g_phasec_dp_n] = (void*)keys[pn];
+                            g_phasec_dp_n++;
+                        }
                         g_rc_phasec_read    = phasec_read_cb;
                         g_rc_phasec_covered = phasec_covered_cb;
-                        g_phasec_auth = true;
-                        /* Freshness guard: pressure-evict BEFORE the flat list
-                         * pushes the chain window into rotation (see the
-                         * g_watch_high_water comment). 64B margin. */
-                        {
-                            uint32_t bm = (g_phasec_shipped + 7u) / 8u;
-                            uint32_t budget = 8192u - sizeof(ra_gc_header_t)
-                                            - sizeof(ra_snapshot_header_t)
-                                            - bm - g_phasec_blob_bytes;
-                            budget = (budget > 64u) ? budget - 64u : 0u;
-                            if (budget < g_watch_high_water)
-                                g_watch_high_water = (uint16_t)budget;
-                        }
-                        LOG_DBG("DEBUG=PhaseC AUTH armed: mm=%u covered=%u map=%uB SRAM hw=%u\r\n",
+                        /* CAPABILITY NEGOTIATION (Nintendont/legacy-console
+                         * compat, 2026-07-02): auth does NOT arm here. The
+                         * hooks are registered but no-op while g_phasec_auth
+                         * is false — the console proves Phase C support by
+                         * FETCHING the chain table (RA_CMD_GET_CHAIN_CHUNK
+                         * handler arms on the last chunk). A console that
+                         * never fetches (Nintendont, GC) runs pure legacy:
+                         * collect resolves everything, slots stay ignored.
+                         * (Pre-fix, arming at load left covered chains
+                         * permanently unresolvable on Nintendont.) */
+                        LOG_DBG("DEBUG=PhaseC READY: mm=%u covered=%u map=%uB SRAM dp=%u (auth arms on console fetch)\r\n",
                                 (unsigned)g, (unsigned)covered,
                                 (unsigned)(total * sizeof(uint16_t)),
-                                (unsigned)g_watch_high_water);
+                                (unsigned)g_phasec_dp_n);
                     } else {
                         LOG_ERR("ERROR=PhaseC mm_ship alloc failed — staying legacy\r\n");
                     }
@@ -5138,8 +5390,16 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         free(g_u1); g_u1 = NULL; g_u1_cap = 0;
         g_rc_u1_cached = NULL; g_rc_u1_populate = NULL; g_rc_u1_invalidate = NULL;
         uint32_t mmc = rc_client_modified_memref_count(client);
-        uint32_t caps = g_phasec_auth ? MALLOC_CAP_SPIRAM
-                                      : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        /* Placement keys on TABLE-READY, not g_phasec_auth (which only arms
+         * when the console fetches — AFTER this point; keying on auth put U1
+         * back in internal SRAM and sank the heap floor to 17.5KB, wii6.log).
+         * Table ready + Wii console → U1 serves ~5 exotic chains → PSRAM is
+         * free SRAM. Table ready + legacy console (Nintendont never fetches)
+         * → U1 serves ALL chains from PSRAM: ~0.3µs/entry on GC-sized sets
+         * (~0.15ms/frame) — acceptable, still far better than no U1. */
+        bool u1_psram = (g_phasec_nodes != NULL && g_phasec_shipped > 0);
+        uint32_t caps = u1_psram ? MALLOC_CAP_SPIRAM
+                                 : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (mmc > 0) {
             g_u1 = (u1_entry_t*)heap_caps_malloc((size_t)mmc * sizeof(u1_entry_t), caps);
         }
@@ -5151,7 +5411,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
             g_rc_u1_invalidate = rc_u1_invalidate;
             LOG_DBG("DEBUG=U1 cache: %u chains, %u KB %s\r\n",
                      (unsigned)mmc, (unsigned)((size_t)mmc * sizeof(u1_entry_t) / 1024),
-                     g_phasec_auth ? "PSRAM (Phase C dividend)" : "internal SRAM");
+                     u1_psram ? "PSRAM (Phase C dividend)" : "internal SRAM");
         } else {
             LOG_ERR("ERROR=U1 cache: alloc(%u chains) failed — U1 OFF, original B2 path\r\n",
                     (unsigned)mmc);
@@ -5275,7 +5535,16 @@ void loadGame(const char *hash) {
 #endif
     rc_client_enable_logging(g_client, RC_CLIENT_LOG_LEVEL_VERBOSE, log_message);
     rc_client_set_event_handler(g_client, event_handler);
-    rc_client_set_hardcore_enabled(g_client, 0);
+    /* 2026-07-03 EXPERIMENT: HARDCORE ON — rc_client only ACTIVATES
+     * leaderboards in hardcore (wii7.log: 48 lb loaded, 0 lb events in
+     * softcore → their eval load was never exercised). Submissions may not
+     * validate server-side (unvalidated client) — irrelevant for the load
+     * test. RA_HARDCORE_MODE 0 restores softcore. Must be set BEFORE
+     * begin_load_game (lb activation happens at load). */
+    #ifndef RA_HARDCORE_MODE
+    #define RA_HARDCORE_MODE 1
+    #endif
+    rc_client_set_hardcore_enabled(g_client, RA_HARDCORE_MODE);
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);
 
     /* v0.27.1: warm-up spectator is enabled in on_game_loaded, NOT here.
@@ -5366,10 +5635,35 @@ String try_login_RA(String user, String pass) {
 // ============================================================================
 // Core tasks
 // ============================================================================
-void processSnapshot() {
-    if (!new_snapshot || state != STATE_ACTIVE || !g_client) return;
-    new_snapshot = false;
+static void process_one_frame(void);
 
+/* SNAPSHOT QUEUE wrapper (zero-frame-loss): run the fast-path frame if one is
+ * pending, then DRAIN the lag ring — each queued entry is applied
+ * (snapshot_apply_payload) and evaluated with its own exact data, in order.
+ * g_df_busy tells the worker task to enqueue instead of touching live state;
+ * a race at the busy=false boundary self-resolves on the next loop() tick
+ * (this function also triggers on a non-empty ring, not just new_snapshot). */
+void processSnapshot() {
+    if (state != STATE_ACTIVE || !g_client) return;
+    if (!new_snapshot && snapq_empty()) return;
+    g_df_busy = true;
+    if (new_snapshot) {
+        new_snapshot = false;
+        process_one_frame();
+    }
+    while (!snapq_empty()) {
+        uint8_t h = g_snapq_head;
+        snapshot_apply_payload(g_snapq_buf[h], g_snapq_len[h]);
+        g_snapq_head = (uint8_t)((h + 1) % SNAPQ_N);   /* release slot AFTER apply */
+        process_one_frame();
+    }
+    g_df_busy = false;
+}
+
+/* One frame's evaluation: warmup window, frame-debt bookkeeping, the v0.32
+ * gated do_frame, FRAME/CATCHUP telemetry. Reads the globals the applier set
+ * (frame_counter, memory_data, blob...). Formerly the body of processSnapshot. */
+static void process_one_frame() {
     /* Snapshot the frozen converged-frame stats up front: do_frame below runs
      * ~25ms during which later snapshots rewrite g_frame_log, so capture now to
      * keep the LOG_FRAME consistent with THIS frame (not a later convergence). */
@@ -5637,7 +5931,7 @@ void processSnapshot() {
 #else
             unsigned long sv_slots = 0, sv_on = 0;
 #endif
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu sv=%lu/%lu\r\n",
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu sv=%lu/%lu q=%lu/%lu/%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -5647,13 +5941,16 @@ void processSnapshot() {
                      (unsigned long)(g_cm_n ? g_cm_us / g_cm_n : 0),
                      (unsigned long)g_cm_n,
                      (unsigned long)g_cm_skipped,
-                     sv_slots, sv_on);
+                     sv_slots, sv_on,
+                     (unsigned long)g_q_enq, (unsigned long)g_q_hwm,
+                     (unsigned long)g_q_drop);   /* q=enqueued/high-water/dropped */
             }
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
             g_df_prev_gameframe = frame_counter;
             g_df_us = g_df_n = g_cm_us = g_cm_n = g_cm_skipped = 0;
+            g_q_enq = 0; g_q_hwm = 0;   /* q_drop cumulative (should stay 0) */
             last_df_log = df_now;
         }
     }
@@ -5849,6 +6146,18 @@ void setup() {
      * lands in PSRAM via heap_caps_malloc_extmem_enable(256) set above).
      * calloc zero-inits resp_len=0 so every slot starts empty. */
     mut_ring         = (mut_entry_t*)calloc(MUT_RING, sizeof(mut_entry_t));
+    /* SNAPSHOT QUEUE ring: SNAPQ_N × 8KB PSRAM (raw verified payloads). Any
+     * alloc failure leaves g_snapq_buf[0] NULL → the lag branch never takes
+     * (full legacy collapse behavior) — graceful. */
+    for (int qi = 0; qi < SNAPQ_N; qi++) {
+        g_snapq_buf[qi] = (uint8_t*)ps_malloc(EXI_MAX_TRANSACTION_SIZE);
+        if (!g_snapq_buf[qi]) {
+            for (int qj = 0; qj < qi; qj++) { free(g_snapq_buf[qj]); g_snapq_buf[qj] = NULL; }
+            g_snapq_buf[0] = NULL;
+            LOG_ERR("ERROR=setup: snapq alloc failed — queue OFF (legacy collapse)\r\n");
+            break;
+        }
+    }
     if (!prefetch_addrs || !prefetch_sizes || !g_watchlist_addrs || !addr_hash || !tomb || !mut_ring) {
         LOG_ERR("ERROR=setup: PSRAM buffer alloc failed\r\n");
     }

@@ -1553,11 +1553,12 @@ static int rc_phasec_follow(const rc_operand_t* op, int guard, uint8_t* reason,
     if (record) ++out->recall_hops;
   }
 
-  if (access == RC_OPERAND_DELTA || access == RC_OPERAND_PRIOR) {
-    if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_DP;
-    return 0;
-  }
-  if (access != RC_OPERAND_ADDRESS) {
+  /* Phase D (2026-07-02): DELTA/PRIOR edges are now WALKABLE — the d2x keeps
+   * per-node values_prev/prior (sound because the snapshot queue guarantees
+   * walks == do_frames) and the shipped dp-verification values let the ESP
+   * detect any desync (defer + self-heal). Only BCD/INVERTED remain refused. */
+  if (access != RC_OPERAND_ADDRESS &&
+      access != RC_OPERAND_DELTA && access != RC_OPERAND_PRIOR) {
     if (*reason == RC_PHASEC_R_NONE) *reason = RC_PHASEC_R_XFORM;
     return 0;
   }
@@ -1719,7 +1720,26 @@ typedef struct rc_phasec_emit_ctx_t {
   uint32_t blob;          /* per-frame value blob bytes (shipped derefs) */
   uint32_t shipped;
   int overflow;
+  /* Phase D: distinct (parent,kind) dp entries — enforce the wire cap
+   * (RC_PHASEC_MAX_DP == RA_MAX_DP_PARENTS); chains past it are refused. */
+  uint16_t dp_node[RC_PHASEC_MAX_DP];
+  uint8_t  dp_kind[RC_PHASEC_MAX_DP];
+  uint16_t dp_n;
 } rc_phasec_emit_ctx_t;
+
+/* find-or-add a dp verification entry; 0 = cap exceeded (caller refuses). */
+static int rc_phasec_dp_register(rc_phasec_emit_ctx_t* c, uint16_t parent, uint8_t kind) {
+  uint16_t j;
+  for (j = 0; j < c->dp_n; j++)
+    if (c->dp_node[j] == parent && c->dp_kind[j] == kind)
+      return 1;
+  if (c->dp_n >= RC_PHASEC_MAX_DP)
+    return 0;
+  c->dp_node[c->dp_n] = parent;
+  c->dp_kind[c->dp_n] = kind;
+  c->dp_n++;
+  return 1;
+}
 
 static int32_t rc_phasec_emit_push(const void* key, uint32_t operand,
                                    uint16_t parent, uint8_t op, uint8_t psize,
@@ -1779,6 +1799,7 @@ static int32_t rc_phasec_emit_memref(const rc_memref_t* m, int guard,
     psize = RC_MEMSIZE_32_BITS;
   }
   else {
+    uint8_t dpk = 0;
     if (p->type == RC_OPERAND_RECALL) {
       access = p->memref_access_type;
       if (!rc_operand_type_is_memref(access)) {
@@ -1791,10 +1812,19 @@ static int32_t rc_phasec_emit_memref(const rc_memref_t* m, int guard,
         goto have_parent;
       }
     }
-    if (access != RC_OPERAND_ADDRESS) return -1;   /* delta/prior/bcd/inv */
+    /* Phase D: DELTA/PRIOR parents emit the dp-kind in the psize high bits —
+     * the walker reads the parent's values_prev/prior; the (parent,kind)
+     * pair enters the shipped verification list (registered below, once the
+     * parent slot is known). BCD/INVERTED stay refused. */
+    if (access == RC_OPERAND_DELTA)      dpk = RC_PHASEC_DP_DELTA;
+    else if (access == RC_OPERAND_PRIOR) dpk = RC_PHASEC_DP_PRIOR;
+    else if (access != RC_OPERAND_ADDRESS) return -1;   /* bcd/inv */
     if (!rc_phasec_edge_size_ok(p->size)) return -1;
-    psize = p->size;
+    psize = (uint8_t)((p->size & 0x3F) | (dpk << RC_PHASEC_PSZ_DP_SHIFT));
     parent_slot = rc_phasec_emit_memref(p->value.memref, guard - 1, c);
+    if (parent_slot >= 0 && dpk &&
+        !rc_phasec_dp_register(c, (uint16_t)parent_slot, dpk))
+      return -1;   /* dp verification list full — chain stays legacy */
   }
 have_parent:
   if (parent_slot < 0) return -1;

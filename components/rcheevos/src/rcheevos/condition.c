@@ -702,15 +702,76 @@ static int rc_test_condition_compare_delta_to_memref_transformed(rc_condition_t*
   }
 }
 
-int rc_test_condition(rc_condition_t* self, rc_eval_state_t* eval_state) {
+int rc_test_condition(rc_condition_t* self, rc_eval_state_t* eval_state RC_HOTP) {
   rc_typed_value_t value1, value2;
 
 #ifdef RC_CLEAN_REPLAY
   /* clean-replay: on a proven-clean frame the raw truth is identical to the last
    * eval, so return the cached value (bit0; bit1 is the ResetIf-responsible flag)
    * and skip the operand reads. The caller's accrual/state logic runs unchanged. */
-  if (eval_state->use_cached_truth)
+  if (eval_state->use_cached_truth) {
+#ifdef RC_EVAL_PLAN
+    /* is_true is canonical in hot[] (the cold rc_condition_t is NOT synced per-frame on
+     * no-HOST_SYNC builds), so read the cached truth from the hot record — reading the
+     * stale cold is_true here makes every clean frame report false and the truth flicker. */
+    if (hot)
+      return (hot->flags & 0x01);
+#endif
     return (self->is_true & 0x01);
+  }
+#endif
+
+#ifdef RC_EVAL_PLAN
+  /* HOT fast-path: read the operand VALUES straight from the compact 16B record
+   * (op1/op2 hold the memref pointer as u32, or a const num) instead of streaming
+   * the 32B rc_condition_t. Mirrors the per-comparator helpers below EXACTLY; only
+   * the TRANSFORMED + DEFAULT cases (which need the cold operand size/metadata) fall
+   * through to the stock cold path. */
+  if (hot) {
+    const rc_memref_t* m1;
+    switch (hot->cmp) {
+      case RC_PROCESSING_COMPARE_MEMREF_TO_CONST:
+        m1 = (const rc_memref_t*)(uintptr_t)hot->op1;
+        return rc_test_condition_compare(m1->value.value, hot->op2, hot->oper);
+
+      case RC_PROCESSING_COMPARE_DELTA_TO_CONST:
+        m1 = (const rc_memref_t*)(uintptr_t)hot->op1;
+        return rc_test_condition_compare(m1->value.changed ? m1->value.prior : m1->value.value,
+                                         hot->op2, hot->oper);
+
+      case RC_PROCESSING_COMPARE_MEMREF_TO_MEMREF:
+        m1 = (const rc_memref_t*)(uintptr_t)hot->op1;
+        return rc_test_condition_compare(m1->value.value,
+                                         ((const rc_memref_t*)(uintptr_t)hot->op2)->value.value,
+                                         hot->oper);
+
+      case RC_PROCESSING_COMPARE_MEMREF_TO_DELTA:
+        m1 = (const rc_memref_t*)(uintptr_t)hot->op1;
+        if (m1->value.changed)
+          return rc_test_condition_compare(m1->value.value, m1->value.prior, hot->oper);
+        switch (hot->oper) {
+          case RC_OPERATOR_EQ: case RC_OPERATOR_GE: case RC_OPERATOR_LE: return 1;
+          default: return 0;
+        }
+
+      case RC_PROCESSING_COMPARE_DELTA_TO_MEMREF:
+        m1 = (const rc_memref_t*)(uintptr_t)hot->op1;
+        if (m1->value.changed)
+          return rc_test_condition_compare(m1->value.prior, m1->value.value, hot->oper);
+        switch (hot->oper) {
+          case RC_OPERATOR_EQ: case RC_OPERATOR_GE: case RC_OPERATOR_LE: return 1;
+          default: return 0;
+        }
+
+      case RC_PROCESSING_COMPARE_ALWAYS_TRUE:
+        return 1;
+      case RC_PROCESSING_COMPARE_ALWAYS_FALSE:
+        return 0;
+
+      default:
+        break; /* TRANSFORMED + DEFAULT: fall through to the cold path (needs operand size) */
+    }
+  }
 #endif
 
   /* use an optimized comparator whenever possible */

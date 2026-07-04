@@ -338,7 +338,49 @@ rc_condset_t* rc_parse_condset(const char** memaddr, rc_parse_state_t* parse);
 int rc_test_condset(rc_condset_t* self, rc_eval_state_t* eval_state);
 void rc_reset_condset(rc_condset_t* self);
 rc_condition_t* rc_condset_get_conditions(rc_condset_t* self);
-void rc_test_condset_internal(rc_condition_t* condition, uint32_t num_conditions, rc_eval_state_t* eval_state, int can_short_circuit);
+#ifdef RC_EVAL_PLAN
+/* Compact HOT per-condition eval record (see project_compiled_eval). 16B, 4 per cache
+ * line, parallel to the condset's trailing conditions[]. The eval streams this in the
+ * common (optimized_comparator) path instead of the 32B rc_condition_t; the COLD fields
+ * (operand metadata, required_hits, next) stay in rc_condition_t, read only for the rare
+ * paths (hit-target / non-optimized operand / reset / serialization). op1/op2 hold the
+ * operand union as u32 (the memref POINTER — stable, built once — or const num / f32
+ * bits; the comparator says which). current_hits is the only rw field. */
+typedef struct rc_eval_hot_t {
+  uint32_t op1;            /* operand1 union as u32 (memref ptr or const) */
+  uint32_t op2;            /* operand2 union */
+  uint32_t current_hits;   /* rw accrual (canonical for eval; synced to rc_condition_t for cold readers) */
+  uint8_t  type;           /* RC_CONDITION_* (evaluator dispatch) */
+  uint8_t  oper;           /* RC_OPERATOR_* */
+  uint8_t  cmp;            /* optimized_comparator (RC_PROCESSING_COMPARE_*) */
+  uint8_t  flags;          /* bit0=is_true(truth) bit1=is_true(reset-responsible) bit2=has_target */
+} rc_eval_hot_t;
+/* build the HOT array for a condset from its conditions[] (idempotent; sets self->hot). */
+void rc_build_eval_hot(rc_condset_t* self);
+/* optional device override for the hot-array allocation (NULL => libc malloc). Set it to
+ * a PSRAM allocator on platforms where the hot arrays must avoid internal RAM. */
+extern void* (*g_rc_eval_hot_alloc)(size_t);
+/* Plumb the parallel hot record through the eval call-chain. Under RC_EVAL_PLAN the
+ * functions carry an extra trailing `rc_eval_hot_t* hot` arg; without it they expand to
+ * nothing so the stock signatures (and the off-build) are unchanged. RC_HOTP = the param
+ * in a declaration/definition; RC_HOTA(x) = the matching trailing arg at a call site. */
+#define RC_HOTP , rc_eval_hot_t* hot
+#define RC_HOTA(x) , (x)
+/* Canonical current_hits lvalue: the eval keeps current_hits in the hot record when it
+ * exists (built once, the only rw field), else in the cold rc_condition_t. All eval-path
+ * accesses go through this so the read and write side never diverge. */
+#define RC_CUR_HITS(cond, hot) (*((hot) ? &(hot)->current_hits : &(cond)->current_hits))
+/* "does this condition have a hit target?" from the hot flag (bit2), avoiding the cold
+ * rc_condition_t read on the common no-target tally path. The required_hits VALUE itself
+ * (only needed when this is true) is still read from the cold struct. */
+#define RC_HAS_TARGET(cond, hot) ((hot) ? ((hot)->flags & 0x04) : ((cond)->required_hits != 0))
+#else
+#define RC_HOTP
+#define RC_HOTA(x)
+#define RC_CUR_HITS(cond, hot) ((cond)->current_hits)
+#define RC_HAS_TARGET(cond, hot) ((cond)->required_hits != 0)
+#endif
+void rc_test_condset_internal(rc_condition_t* condition, uint32_t num_conditions, rc_eval_state_t* eval_state, int can_short_circuit RC_HOTP);
 
 enum {
   RC_PROCESSING_COMPARE_DEFAULT = 0,
@@ -359,7 +401,7 @@ enum {
 rc_condition_t* rc_parse_condition(const char** memaddr, rc_parse_state_t* parse);
 void rc_parse_condition_internal(rc_condition_t* self, const char** memaddr, rc_parse_state_t* parse);
 void rc_condition_update_parse_state(rc_condition_t* condition, rc_parse_state_t* parse);
-int rc_test_condition(rc_condition_t* self, rc_eval_state_t* eval_state);
+int rc_test_condition(rc_condition_t* self, rc_eval_state_t* eval_state RC_HOTP);
 void rc_evaluate_condition_value(rc_typed_value_t* value, rc_condition_t* self, rc_eval_state_t* eval_state);
 int rc_condition_is_combining(const rc_condition_t* self);
 void rc_condition_convert_to_operand(const rc_condition_t* condition, rc_operand_t* operand, rc_parse_state_t* parse);

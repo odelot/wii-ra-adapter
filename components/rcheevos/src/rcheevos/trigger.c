@@ -130,6 +130,24 @@ int rc_trigger_state_active(int state)
 static int rc_condset_is_measured_from_hitcount(const rc_condset_t* condset, uint32_t measured_value)
 {
   const rc_condition_t* condition;
+#ifdef RC_EVAL_PLAN
+  /* current_hits is canonical in hot[] (the cold rc_condition_t is not synced per-frame
+   * on no-HOST_SYNC builds). Measured conditions live in the measured category, so they
+   * ARE in hot; scan it instead of the stale cold linked list. flags bit2 = has-target. */
+  if (condset->hot) {
+    const uint32_t n = (uint32_t)condset->num_pause_conditions + condset->num_reset_conditions +
+                       condset->num_hittarget_conditions + condset->num_measured_conditions +
+                       condset->num_other_conditions;
+    uint32_t i;
+    for (i = 0; i < n; ++i) {
+      if (condset->hot[i].type == RC_CONDITION_MEASURED && (condset->hot[i].flags & 0x04) &&
+          condset->hot[i].current_hits == measured_value) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+#endif
   for (condition = condset->conditions; condition; condition = condition->next) {
     if (condition->type == RC_CONDITION_MEASURED && condition->required_hits &&
         condition->current_hits == measured_value) {

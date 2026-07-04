@@ -180,6 +180,25 @@ typedef struct rc_client_leaderboard_info_t {
   uint8_t pending_events;
   uint8_t bucket;
   uint8_t hidden;
+
+#ifdef RC_DIRTY_EVAL
+  /* lb dirty-eval (2026-07-03, the hardcore +3ms fix). SCOPED BY STATE
+   * (v2 refinement — rc_evaluate_lboard tests the 3 TRIGGERS every frame in
+   * every state, but the VALUE only runs while STARTED and is reset at the
+   * start transition): deps are collected TRIGGERS-FIRST so [0,dep_trig_count)
+   * covers start+submit+cancel and [0,dep_count) adds the value's.
+   *   ACTIVE skip  = no_hits_trig  && trigger-deps clean
+   *   STARTED skip = no_hits_trig && no_hits_value && all deps clean
+   * A time-measuring VALUE (hits) therefore blocks skips only while STARTED —
+   * the wii9 finding: 33/48 lb were unskippable in ACTIVE purely because of
+   * their (reset-at-start, not-yet-running) timer values. */
+  rc_memref_value_t** dep_memrefs;
+  uint16_t dep_count;       /* triggers + value deps */
+  uint16_t dep_trig_count;  /* triggers-only prefix */
+  uint8_t eval_next;        /* 1 => force one more eval next frame (Delta settle) */
+  uint8_t no_hits_trig;     /* 1 => start/submit/cancel carry no hit accrual */
+  uint8_t no_hits_value;    /* 1 => value condsets carry no hit accrual */
+#endif
 } rc_client_leaderboard_info_t;
 
 struct rc_client_leaderboard_list_info_t;
@@ -281,6 +300,8 @@ typedef struct rc_client_game_info_t {
   uint8_t pending_events;
 #ifdef RC_DIRTY_EVAL
   uint8_t dirty_eval_built;   /* 0 until the per-achievement dep lists are built */
+  uint8_t rp_has_hits;        /* 1 = an RP value/display accrues hits -> RP must
+                               * evaluate every frame (no 1Hz throttle) */
 #endif
 
   rc_buffer_t buffer;

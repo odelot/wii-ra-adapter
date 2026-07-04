@@ -5992,12 +5992,19 @@ static void rc_de_build_achievement(rc_client_game_info_t* game, rc_client_achie
   }
 }
 
-/* One-time build for all achievements; single-threaded (do_frame head). */
+/* fwd decls (defined below rc_de_should_skip) */
+static void rc_de_build_lboard(rc_client_game_info_t* game, rc_client_leaderboard_info_t* lb);
+static void rc_de_scan_richpresence(rc_client_game_info_t* game);
+
+/* One-time build for all achievements + leaderboards + the RP hit scan;
+ * single-threaded (do_frame head). */
 static void rc_de_build_game(rc_client_game_info_t* game) {
   rc_client_subset_info_t* subset;
   for (subset = game->subsets; subset != NULL; subset = subset->next) {
     rc_client_achievement_info_t* ach = subset->achievements;
     rc_client_achievement_info_t* stop = ach + subset->public_.num_achievements;
+    rc_client_leaderboard_info_t* lb = subset->leaderboards;
+    rc_client_leaderboard_info_t* lb_stop = lb + subset->public_.num_leaderboards;
     for (; ach < stop; ++ach) {
       rc_de_build_achievement(game, ach);
 #ifdef RC_SHADOW_VALUES
@@ -6006,7 +6013,10 @@ static void rc_de_build_game(rc_client_game_info_t* game) {
       rc_shadow_build_trigger(ach->trigger);
 #endif
     }
+    for (; lb < lb_stop; ++lb)
+      rc_de_build_lboard(game, lb);
   }
+  rc_de_scan_richpresence(game);
   game->dirty_eval_built = 1;
 }
 
@@ -6049,6 +6059,116 @@ static int rc_de_should_skip(rc_client_achievement_info_t* ach) {
 
   /* COLD + CLEAN: evaluating is a guaranteed no-op -> skip entirely */
   return 1;
+}
+
+/* ---- lb dirty-eval + RP throttle (2026-07-03) — the hardcore regression fix.
+ * wii8.log: enabling hardcore activated 48 leaderboards whose condsets (and the
+ * tracker value) evaluate UNCONDITIONALLY every frame = +~3ms sustained -> the
+ * bunny chase went over the 16.67ms budget -> queue overload -> 665 drops.
+ * Same cold+clean principle as the achievement dirty-eval, with one EXTRA
+ * hard rule: a leaderboard whose start/submit/cancel/value carries ANY
+ * hit-count accrual is NEVER skipped — lb VALUES commonly measure TIME by
+ * counting frames (the wii8 tracker "0:00.01"), and skipping would freeze the
+ * timer and submit a wrong score. Skips are limited to the ACTIVE (armed,
+ * start not yet true) and STARTED states; WAITING/CANCELED settle via full
+ * evals (mirrors the achievement WAITING conservatism). */
+volatile int g_rc_lb_dirty_enabled = 1;        /* runtime A/B toggle */
+volatile uint32_t g_rc_lb_skipped = 0;         /* per-frame tallies (adapter resets) */
+volatile uint32_t g_rc_lb_evaled = 0;
+
+/* hit-accrual scan: any hit target or AddHits/SubHits in the condset */
+static int rc_de_condset_has_hits(const rc_condset_t* cs) {
+  const rc_condition_t* c;
+  if (!cs)
+    return 0;
+  for (c = cs->conditions; c != NULL; c = c->next) {
+    if (c->required_hits != 0 ||
+        c->type == RC_CONDITION_ADD_HITS || c->type == RC_CONDITION_SUB_HITS)
+      return 1;
+  }
+  return 0;
+}
+
+/* boot diagnostic: how many lb are skippable-in-ACTIVE / fully-skippable */
+volatile uint32_t g_rc_lb_stat_active_ok = 0, g_rc_lb_stat_total = 0;
+
+static void rc_de_build_lboard(rc_client_game_info_t* game, rc_client_leaderboard_info_t* lb) {
+  rc_memref_value_t* tmp[RC_DE_MAX_DEPS];
+  uint16_t n = 0, n_trig;
+  rc_lboard_t* l = lb->lboard;
+  const rc_condset_t* cs;
+  int hits;
+
+  lb->dep_memrefs = NULL;
+  lb->dep_count = 0;
+  lb->dep_trig_count = 0;
+  lb->eval_next = 0;
+  lb->no_hits_trig = 0;
+  lb->no_hits_value = 0;
+
+  if (!l)
+    return;
+
+  /* TRIGGERS FIRST (the [0,n_trig) prefix used by the ACTIVE-state skip) */
+  rc_de_collect_condset(l->start.requirement, tmp, &n);
+  for (cs = l->start.alternative; cs != NULL; cs = cs->next)
+    rc_de_collect_condset(cs, tmp, &n);
+  rc_de_collect_condset(l->submit.requirement, tmp, &n);
+  for (cs = l->submit.alternative; cs != NULL; cs = cs->next)
+    rc_de_collect_condset(cs, tmp, &n);
+  rc_de_collect_condset(l->cancel.requirement, tmp, &n);
+  for (cs = l->cancel.alternative; cs != NULL; cs = cs->next)
+    rc_de_collect_condset(cs, tmp, &n);
+  n_trig = n;
+  for (cs = l->value.conditions; cs != NULL; cs = cs->next)
+    rc_de_collect_condset(cs, tmp, &n);
+
+  lb->no_hits_trig = (l->start.has_hits || l->submit.has_hits || l->cancel.has_hits) ? 0 : 1;
+  hits = 0;
+  for (cs = l->value.conditions; !hits && cs != NULL; cs = cs->next)
+    hits = rc_de_condset_has_hits(cs);
+  lb->no_hits_value = hits ? 0 : 1;
+
+  ++g_rc_lb_stat_total;
+  if (lb->no_hits_trig)
+    ++g_rc_lb_stat_active_ok;
+
+  if (n == 0 || n >= RC_DE_MAX_DEPS)   /* all-const, or hit the cap -> never skip */
+    return;
+
+  lb->dep_memrefs = (rc_memref_value_t**)rc_buffer_alloc(&game->buffer, n * sizeof(rc_memref_value_t*));
+  if (lb->dep_memrefs) {
+    memcpy(lb->dep_memrefs, tmp, n * sizeof(rc_memref_value_t*));
+    lb->dep_count = n;
+    lb->dep_trig_count = n_trig;
+  }
+}
+
+/* RP throttle: rich presence only feeds the 2-minute ping + the dashboard
+ * message — per-frame evaluation is ~1ms of waste on SMG. Evaluated once per
+ * RC_RP_EVAL_PERIOD frames UNLESS any RP value/display carries hit accrual
+ * (frame-counting timers must tick every frame) — scanned once at build. */
+volatile int g_rc_rp_throttle_enabled = 1;
+#define RC_RP_EVAL_PERIOD 60u    /* 1 Hz at 60fps */
+
+static void rc_de_scan_richpresence(rc_client_game_info_t* game) {
+  const rc_richpresence_t* rp;
+  const rc_value_t* v;
+  const rc_richpresence_display_t* d;
+  const rc_condset_t* cs;
+
+  game->rp_has_hits = 0;
+  if (!game->runtime.richpresence || !game->runtime.richpresence->richpresence)
+    return;
+  rp = game->runtime.richpresence->richpresence;
+
+  for (v = rp->values; v != NULL; v = v->next) {
+    for (cs = v->conditions; cs != NULL; cs = cs->next)
+      if (rc_de_condset_has_hits(cs)) { game->rp_has_hits = 1; return; }
+  }
+  for (d = rp->first_display; d != NULL; d = d->next) {
+    if (d->trigger.has_hits) { game->rp_has_hits = 1; return; }
+  }
 }
 #endif /* RC_DIRTY_EVAL */
 
@@ -6619,6 +6739,38 @@ static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_clie
         break;
     }
 
+#ifdef RC_DIRTY_EVAL
+    /* lb dirty-eval v2 (state-scoped): rc_evaluate_lboard tests the 3
+     * TRIGGERS every frame in every state (their hits block skips always),
+     * but the VALUE only runs while STARTED and is reset at start — so in
+     * ACTIVE (the 47-lb bulk) only the trigger deps/hits matter. Hard
+     * exclusions: hit accrual in scope (time-measuring values tick per
+     * frame while STARTED) and the Delta-settle frame after a dep change. */
+    if (g_rc_dirty_eval_enabled && g_rc_lb_dirty_enabled &&
+        leaderboard->dep_memrefs && leaderboard->no_hits_trig &&
+        (lboard->state == RC_LBOARD_STATE_ACTIVE ||
+         (lboard->state == RC_LBOARD_STATE_STARTED && leaderboard->no_hits_value))) {
+      uint16_t di;
+      uint16_t dn = (lboard->state == RC_LBOARD_STATE_ACTIVE)
+                    ? leaderboard->dep_trig_count : leaderboard->dep_count;
+      if (dn > 0) {   /* dn==0 = all-const triggers (e.g. "1=1" dev start):
+                       * truth doesn't hinge on memory — NEVER skip, the
+                       * state transition must be allowed to fire. */
+        uint8_t dep_changed_now = 0;
+        for (di = 0; di < dn; ++di) {
+          if (leaderboard->dep_memrefs[di]->changed) { dep_changed_now = 1; break; }
+        }
+        if (dep_changed_now || leaderboard->eval_next) {
+          leaderboard->eval_next = dep_changed_now;   /* settle next frame too */
+        } else {
+          ++g_rc_lb_skipped;
+          continue;
+        }
+      }
+    }
+    ++g_rc_lb_evaled;
+#endif
+
     old_state = lboard->state;
     new_state = rc_evaluate_lboard(lboard, &leaderboard->value, client->state.legacy_peek, client, NULL);
 
@@ -6994,8 +7146,16 @@ void rc_client_do_frame(rc_client_t* client)
     }
 
     richpresence = client->game->runtime.richpresence;
-    if (richpresence && richpresence->richpresence)
-      rc_update_richpresence_internal(richpresence->richpresence, client->state.legacy_peek, client);
+    if (richpresence && richpresence->richpresence) {
+#ifdef RC_DIRTY_EVAL
+      /* RP throttle: display-only consumer (2-min ping + dashboard) — 1 Hz is
+       * plenty UNLESS an RP value/display accrues hits (must tick per frame;
+       * scanned once in rc_de_build_game). ~1ms/frame back on SMG. */
+      if (!g_rc_rp_throttle_enabled || client->game->rp_has_hits ||
+          (client->state.frames_processed % RC_RP_EVAL_PERIOD) == 0)
+#endif
+        rc_update_richpresence_internal(richpresence->richpresence, client->state.legacy_peek, client);
+    }
 
     /* everything after the memref update is condition evaluation (achievement
      * loop + tracker + leaderboards + RP). leaderboards/RP are stripped, so

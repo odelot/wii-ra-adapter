@@ -113,6 +113,12 @@ extern "C" {
   extern volatile int g_rc_dirty_eval_enabled;
   extern volatile uint32_t g_rc_de_skipped;
   extern volatile uint32_t g_rc_de_evaled;
+  /* lb dirty-eval + RP throttle (2026-07-03, the hardcore +3ms fix) */
+  extern volatile int g_rc_lb_dirty_enabled;
+  extern volatile uint32_t g_rc_lb_skipped;
+  extern volatile uint32_t g_rc_lb_evaled;
+  extern volatile int g_rc_rp_throttle_enabled;
+  extern volatile uint32_t g_rc_lb_stat_active_ok, g_rc_lb_stat_total;  /* boot diag */
 #ifdef RC_CLEAN_REPLAY
   extern volatile uint32_t g_rc_de_replayed;   /* warm+clean cached-truth replays (subset of de_ev) */
   extern volatile int g_rc_clean_replay_enabled;
@@ -1060,8 +1066,14 @@ static uint16_t g_phasec_dp_node[RC_PHASEC_MAX_DP];    /* parent node index */
 static uint8_t  g_phasec_dp_kind_a[RC_PHASEC_MAX_DP];  /* 1=delta 2=prior */
 static void*    g_phasec_dp_memref[RC_PHASEC_MAX_DP];  /* rc_memref_t* (from keys) */
 static uint32_t g_phasec_dp_ship[RC_PHASEC_MAX_DP];    /* values shipped this frame */
+static uint8_t  g_phasec_dp_shipvalid[(RC_PHASEC_MAX_DP + 7) / 8]; /* bit i = the
+                                       * parent RESOLVED at walk N-1 — compare
+                                       * skipped on 0 (unloaded pointer: its
+                                       * subtree evaluates as legacy zeros, a
+                                       * desync there cannot mis-evaluate) */
 static volatile bool g_phasec_dp_have = false;         /* section present for pending frame */
 static uint32_t g_pc_dpmm = 0;                         /* mismatches (cumulative diag) */
+static uint32_t g_pc_dpskip = 0;                       /* compares skipped (parent unresolved) */
 
 /* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
  * g_update_miss_count is reset right before each rc_client_do_frame and bumped
@@ -1099,6 +1111,13 @@ extern "C" int doframe_primed_cb(void) {
      * Alignment self-establishes on the first cleanly-evaluated live frame. */
     if (g_phasec_dp_have && !g_warmup_active) {
         for (uint16_t i = 0; i < g_phasec_dp_n; i++) {
+            /* validity bit 0 = the parent didn't resolve at walk N-1 (unloaded
+             * pointer) — the shipped prev is meaningless and the subtree
+             * evaluates as legacy zeros anyway. Skip, don't defer. */
+            if (!(g_phasec_dp_shipvalid[i >> 3] & (1u << (i & 7)))) {
+                g_pc_dpskip++;
+                continue;
+            }
             const rc_memref_t* m = (const rc_memref_t*)g_phasec_dp_memref[i];
             uint32_t expect = (g_phasec_dp_kind_a[i] == RC_PHASEC_DP_PRIOR)
                 ? m->value.prior
@@ -3460,15 +3479,18 @@ static bool snapshot_apply_payload(const uint8_t* rx_data, uint32_t rx_len) {
     if (snap_v2 && g_phasec_dp_n) {
         uint16_t dpc = ra_be16_to_host(snap->dp_count);
         uint32_t bm_bytes = ((uint32_t)ch_count + 7u) / 8u;
+        uint32_t dpv_bytes = ((uint32_t)dpc + 7u) / 8u;
         if (dpc == g_phasec_dp_n &&
             rx_len >= (uint32_t)(values - rx_data) + (uint32_t)count
-                    + bm_bytes + ch_blob + 4u * dpc) {
-            const uint8_t* dp = values + count + bm_bytes + ch_blob;
+                    + bm_bytes + ch_blob + 4u * dpc + dpv_bytes) {
+            const uint8_t* dp  = values + count + bm_bytes + ch_blob;
+            const uint8_t* dpv = dp + 4u * dpc;   /* validity bitmap */
             for (uint16_t i = 0; i < dpc; i++) {
                 uint32_t v;
                 memcpy(&v, dp + 4u * i, 4);
                 g_phasec_dp_ship[i] = ra_be32_to_host(v);
             }
+            memcpy(g_phasec_dp_shipvalid, dpv, dpv_bytes);
             g_phasec_dp_have = true;
         }
     }
@@ -3924,12 +3946,14 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                      * win=windows ingested; cf/cc=this frame's window (cc should
                      * equal shipped once the flat list shrinks). Shadow counters
                      * shown too when the diag toggle is on. */
-                    LOG_DBG("DEBUG=PhaseC%s: rd=%lu inv=%lu dfr=%lu win=%lu cf=%u cc=%u dp=%u dpmm=%lu | shadow ok=%lu bad=%lu miss=%lu\r\n",
+                    LOG_DBG("DEBUG=PhaseC%s: rd=%lu inv=%lu dfr=%lu win=%lu cf=%u cc=%u dp=%u dpmm=%lu dpskip=%lu lbA=%lu/%lu | shadow ok=%lu bad=%lu miss=%lu\r\n",
                             g_phasec_auth ? " AUTH" : "",
                             (unsigned long)g_pc_reads, (unsigned long)g_pc_inv,
                             (unsigned long)g_pc_defer, (unsigned long)g_phasec_win_rx,
                             (unsigned)ch_first, (unsigned)ch_count,
                             (unsigned)g_phasec_dp_n, (unsigned long)g_pc_dpmm,
+                            (unsigned long)g_pc_dpskip,
+                            (unsigned long)g_rc_lb_stat_active_ok, (unsigned long)g_rc_lb_stat_total,
                             (unsigned long)g_phasec_cmp_ok, (unsigned long)g_phasec_cmp_bad,
                             (unsigned long)g_phasec_cmp_miss);
                 }
@@ -5223,7 +5247,8 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         g_watch_high_water = WATCHLIST_HIGH_WATER;   /* legacy default until auth re-arms */
         free(g_phasec_mm_ship);   g_phasec_mm_ship = NULL; g_phasec_mm_total = 0;
         g_pc_reads = g_pc_inv = g_pc_defer = 0;
-        g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0;   /* Phase D */
+        g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0; g_pc_dpskip = 0;   /* Phase D */
+        g_rc_lb_stat_active_ok = 0; g_rc_lb_stat_total = 0;   /* lb dirty-eval boot diag */
         free(g_phasec_nodes);     g_phasec_nodes = NULL;
         free(g_phasec_blob);      g_phasec_blob = NULL;
         free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
@@ -5652,6 +5677,19 @@ void processSnapshot() {
         process_one_frame();
     }
     while (!snapq_empty()) {
+        /* OVERLOAD collapse (wii8 lesson): a (near-)full ring means SUSTAINED
+         * over-budget do_frames — draining 7 old entries one by one keeps us
+         * permanently ~8 frames behind while the producer drops the NEWEST
+         * (worst of both). Skip to the newest queued entry instead: the
+         * skipped frames are lost either way (counted in g_q_drop, same
+         * semantic), but lag stays bounded at ~1 frame == the legacy-collapse
+         * behavior, gracefully. Consumer owns head — safe. */
+        if (snapq_depth() >= SNAPQ_N - 1) {
+            while (snapq_depth() > 1) {
+                g_snapq_head = (uint8_t)((g_snapq_head + 1) % SNAPQ_N);
+                g_q_drop++;
+            }
+        }
         uint8_t h = g_snapq_head;
         snapshot_apply_payload(g_snapq_buf[h], g_snapq_len[h]);
         g_snapq_head = (uint8_t)((h + 1) % SNAPQ_N);   /* release slot AFTER apply */
@@ -5776,6 +5814,7 @@ static void process_one_frame() {
             g_u1_fast = 0; g_u1_pop = 0;             /* U1: per-frame fast skips / cache-miss populates */
 #ifdef RC_DIRTY_EVAL
             g_rc_de_skipped = 0; g_rc_de_evaled = 0;  /* per-frame skip% */
+            g_rc_lb_skipped = 0; g_rc_lb_evaled = 0;  /* per-frame lb skip% */
 #ifdef RC_CLEAN_REPLAY
             g_rc_de_replayed = 0;  /* per-frame replay count */
 #endif
@@ -5848,7 +5887,7 @@ static void process_one_frame() {
          *                     skips/cache/parallel/EXI, l1h/l1m/urs/u1f/u1p).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu lbs=%lu lbe=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -5873,6 +5912,7 @@ static void process_one_frame() {
                   (unsigned long)g_par_b_us,
                   (unsigned long)g_par_runs,
                   de_sk, de_ev, de_rp,
+                  (unsigned long)g_rc_lb_skipped, (unsigned long)g_rc_lb_evaled,
                   (unsigned long)g_rc_b1_skips, (unsigned long)g_rc_b2_skips,
                   (unsigned long)g_rc_upd_resolves,
                   (unsigned long)g_rc_collect_skips, (unsigned long)g_rc_collect_walks,

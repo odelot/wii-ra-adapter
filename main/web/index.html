@@ -20,13 +20,15 @@
     .game { display:flex; align-items:center; gap:18px; }
     .game .title { font-size:22px; font-weight:700; }
     .game .sub { opacity:.6; font-size:13px; margin-top:4px; }
-    .ring { --pct:0; width:96px; height:96px; border-radius:50%; flex:0 0 auto;
-      background:conic-gradient(var(--gold) calc(var(--pct)*1%), #2a3346 0);
-      display:grid; place-items:center; position:relative; }
-    .ring::before { content:""; position:absolute; inset:9px; border-radius:50%; background:var(--panel); }
-    .ring span { position:relative; font-size:18px; font-weight:700; }
-    .bar { height:10px; background:#2a3346; border-radius:6px; overflow:hidden; margin-top:14px; }
+    /* Game box-art (2026-07-03): replaces the % donut — the browser loads it
+     * straight from media.retroachievements.org (zero ESP bandwidth); the %
+     * moved to the bar row below. Empty/failed image keeps the dark tile. */
+    .gameimg { width:96px; height:96px; border-radius:12px; flex:0 0 auto;
+      object-fit:cover; background:#0a0e15 center/40% no-repeat; border:1px solid #2a3346; }
+    .barrow { display:flex; align-items:center; gap:10px; margin-top:14px; }
+    .bar { height:10px; background:#2a3346; border-radius:6px; overflow:hidden; flex:1; }
     .bar > i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--gold),#ffb020); transition:width .4s; }
+    .barpct { font-size:14px; font-weight:700; color:var(--gold); min-width:38px; text-align:right; }
     .stats { display:flex; gap:22px; margin-top:12px; font-size:13px; opacity:.85; flex-wrap:wrap; }
     .stats b { color:var(--gold); font-size:16px; display:block; }
     .soon { opacity:.5; font-size:13px; text-align:center; padding:20px; }
@@ -87,9 +89,8 @@
       .card { padding:12px; border-radius:12px; }
       .game { gap:12px; }
       .game .title { font-size:17px; }
-      .ring { width:72px; height:72px; }
-      .ring::before { inset:7px; }
-      .ring span { font-size:14px; }
+      .gameimg { width:72px; height:72px; }
+      .barpct { font-size:12px; min-width:32px; }
       .stats { gap:14px; font-size:12px; }
       .stats b { font-size:14px; }
       .tab { padding:6px 11px; font-size:12px; }
@@ -108,12 +109,12 @@
   </header>
   <main>
     <div class="card game">
-      <div class="ring" id="ring"><span id="ringpct">0%</span></div>
+      <img class="gameimg" id="gimg" alt="" onerror="this.removeAttribute('src')">
       <div style="flex:1;min-width:0">
         <div class="title" id="title">—</div>
         <div class="sub" id="sub">waiting for a game…</div>
         <div id="rp"></div>
-        <div class="bar"><i id="barfill"></i></div>
+        <div class="barrow"><div class="bar"><i id="barfill"></i></div><span class="barpct" id="barpct">0%</span></div>
         <div class="stats">
           <div><b id="s-unlocked">0/0</b>achievements</div>
           <div><b id="s-points">0/0</b>points</div>
@@ -165,9 +166,9 @@
       const pct = total ? Math.round(unlocked*100/total) : 0;
       $('title').textContent = d.title && d.title.length ? d.title : 'No game loaded';
       $('sub').textContent = d.game_id ? ('Game ID '+d.game_id) : 'waiting for a game…';
-      $('ring').style.setProperty('--pct', pct);
-      $('ringpct').textContent = pct+'%';
+      if (d.img && $('gimg').getAttribute('src') !== d.img) $('gimg').src = d.img;
       $('barfill').style.width = pct+'%';
+      $('barpct').textContent = pct+'%';
       $('s-unlocked').textContent = unlocked+'/'+total;
       $('s-points').textContent = (d.points_unlocked||0)+'/'+(d.points_total||0);
       $('s-state').textContent = STATE[d.state] || d.state;

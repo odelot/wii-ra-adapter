@@ -404,16 +404,25 @@ static void fr_trigger(void) {
 // WiiFlow can read resp.status and know exactly what the adapter is doing.
 // ============================================================================
 enum AdapterState {
-    STATE_INIT         = RA_STATUS_INITIALIZING,   // 0x00 — booting up
-    STATE_WAIT_GAME_ID = RA_STATUS_LOGGED_IN,      // 0x04 — WiFi+login OK, ready for game ID
-    STATE_LOADING_GAME = RA_STATUS_LOADING_GAME,   // 0x05 — fetching game data from RA servers
-    STATE_GAME_LOADED  = RA_STATUS_GAME_LOADED,    // 0x06 — data ready, WiiFlow may proceed to boot
-    STATE_ACTIVE       = RA_STATUS_ACTIVE,          // 0x07 — in-game, processing snapshots
-    STATE_ERROR        = RA_STATUS_ERROR_GAME,      // 0xE2 — generic error
-    STATE_IDLE         = 0x80,                      // internal only, not exposed via EXI
+    STATE_INIT          = RA_STATUS_INITIALIZING,    // 0x00 — booting up
+    STATE_WIFI_CONNECTING = RA_STATUS_WIFI_CONNECTING, // 0x01 — joining the stored WiFi network
+    STATE_LOGGING_IN    = RA_STATUS_LOGGING_IN,      // 0x03 — boot-time RA login check
+    STATE_WAIT_GAME_ID  = RA_STATUS_LOGGED_IN,       // 0x04 — WiFi+login OK, ready for game ID
+    STATE_LOADING_GAME  = RA_STATUS_LOADING_GAME,    // 0x05 — fetching game data from RA servers
+    STATE_GAME_LOADED   = RA_STATUS_GAME_LOADED,     // 0x06 — data ready, WiiFlow may proceed to boot
+    STATE_ACTIVE        = RA_STATUS_ACTIVE,          // 0x07 — in-game, processing snapshots
+    STATE_PORTAL        = RA_STATUS_PORTAL,          // 0x08 — captive config portal (no credentials)
+    STATE_ERROR_WIFI    = RA_STATUS_ERROR_WIFI,      // 0xE0 — no WiFi link / no internet
+    STATE_ERROR_LOGIN   = RA_STATUS_ERROR_LOGIN,     // 0xE1 — RA rejected the credentials
+    STATE_ERROR         = RA_STATUS_ERROR_GAME,      // 0xE2 — generic game-load error
+    STATE_ERROR_UNKNOWN_GAME = RA_STATUS_ERROR_UNKNOWN_GAME, // 0xE4 — hash not in RA DB (bad dump)
+    STATE_IDLE          = 0x80,                      // internal only, not exposed via EXI
 };
 
 volatile AdapterState state = STATE_INIT;
+
+/* Any terminal-failure state (0xE0..). WiiFlow aborts the boot on these. */
+static inline bool state_is_error() { return RA_STATUS_IS_ERROR((uint8_t)state); }
 
 static void tomb_put(uint32_t addr, uint8_t value);
 static bool tomb_get(uint32_t addr, uint8_t *out);
@@ -1498,37 +1507,12 @@ static inline void snd_request(uint8_t id) {
     if (id > g_snd_pending) g_snd_pending = id;
 }
 
-#if BUZZER_ACTIVE
-/* ACTIVE buzzer: internal oscillator, fixed pitch — the freq argument is
- * ignored and the GPIO only gates it on/off (through the driver transistor,
- * active-high). The jingles keep their exact timing but degrade to rhythm.
- * Consecutive notes would fuse into one long beep, so snd_tone re-articulates:
- * if the buzzer is already on, insert a short off-gap before the "new note".
- * Only ever called from soundTask, so the static state needs no locking. */
-static bool s_snd_on = false;
-static void snd_tone(uint32_t freq) {
-    (void)freq;
-    if (s_snd_on) {
-        digitalWrite(PIN_BUZZER, LOW);
-        vTaskDelay(pdMS_TO_TICKS(12));
-    }
-    digitalWrite(PIN_BUZZER, HIGH);
-    s_snd_on = true;
-}
-static void snd_off(void) {
-    digitalWrite(PIN_BUZZER, LOW);
-    s_snd_on = false;
-}
-/* Active buzzer has no volume control — decay steps are a no-op. */
-static inline void snd_duty(uint32_t d) { (void)d; }
-#else
 /* PASSIVE buzzer/piezo: LEDC PWM generates each note's frequency. */
 static inline void snd_tone(uint32_t freq) { ledcWriteTone(PIN_BUZZER, freq); }
 static inline void snd_off(void)           { ledcWriteTone(PIN_BUZZER, 0); }
 /* Crude volume: shrink the pulse width below the 50% (511/1023) that
  * ledcWriteTone sets. Stepping it down fakes a note's decay envelope. */
 static inline void snd_duty(uint32_t d)    { ledcWrite(PIN_BUZZER, d); }
-#endif
 #define SND_MS(ms) vTaskDelay(pdMS_TO_TICKS(ms))
 
 // play a sound to get the user attention (portal open)
@@ -1629,12 +1613,8 @@ static void snd_play_victory(void) {
 
 static void soundTask(void *arg) {
     (void)arg;
-#if BUZZER_ACTIVE
-    pinMode(PIN_BUZZER, OUTPUT);
-#else
     /* 10-bit resolution like Tone.cpp; ledcWriteTone retunes freq per note. */
     ledcAttach(PIN_BUZZER, 2000, 10);
-#endif
     snd_off();
     for (;;) {
         uint8_t id = g_snd_pending;
@@ -3494,6 +3474,43 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             // RA knows, exactly like Dolphin. The game-ID table remains the
             // fallback for physical discs / unsupported image formats.
             if (rx_len < sizeof(ra_gc_header_t) + RA_GAME_ID_LEN) break;
+
+            /* Not ready yet (still connecting/logging in/portal): don't start a
+             * load that loop() can't run — just echo the current status so the
+             * frontend can tell the user what the adapter is waiting for.
+             * (WiiFlow waits for status >= LOGGED_IN before sending LOAD_GAME,
+             * so this is a belt-and-suspenders guard for other frontends.) */
+            if ((uint8_t)state < RA_STATUS_LOGGED_IN || state == STATE_PORTAL) {
+                LOG_ERR("ERROR=EXI: LOAD_GAME rejected — adapter not ready (state=%02X)\r\n",
+                        (uint8_t)state);
+                ra_esp_header_t resp;
+                resp.magic = RA_MAGIC_ESP_TO_GC;
+                resp.status = (uint8_t)state;
+                resp.event_type = RA_EVT_NONE;
+                resp.event_count = 0;
+                resp.data_len = 0;
+                exi_spi_prepare_response((uint8_t*)&resp, sizeof(resp));
+                break;
+            }
+
+            /* No WiFi at load time (router died after boot): fail fast with a
+             * specific code instead of letting the login HTTP time out. loop()'s
+             * reconnect loop keeps retrying in the background; a later
+             * LOAD_GAME retry is accepted (error states pass the guard above). */
+            if (WiFi.status() != WL_CONNECTED) {
+                LOG_ERR("ERROR=EXI: LOAD_GAME with WiFi down — reporting ERROR_WIFI\r\n");
+                state = STATE_ERROR_WIFI;
+                snd_request(SND_ERROR);
+                ra_esp_header_t resp;
+                resp.magic = RA_MAGIC_ESP_TO_GC;
+                resp.status = (uint8_t)state;
+                resp.event_type = RA_EVT_NONE;
+                resp.event_count = 0;
+                resp.data_len = 0;
+                exi_spi_prepare_response((uint8_t*)&resp, sizeof(resp));
+                break;
+            }
+
             const uint8_t *p = rx_data + sizeof(ra_gc_header_t);
             char gid[RA_GAME_ID_LEN + 1];
             memcpy(gid, p, RA_GAME_ID_LEN);
@@ -3532,7 +3549,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 } else {
                     LOG_ERR("ERROR=No hash for Wii game ID %s (no console hash either)\r\n", gid);
                     gameId = String(gid);
-                    state = STATE_ERROR;
+                    state = STATE_ERROR_UNKNOWN_GAME;  // unidentifiable — RA can't know this game
                     snd_request(SND_ERROR);   // game won't record achievements
                 }
             }
@@ -3553,7 +3570,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             // can be delivered while the watchlist is being built.
             // STATE_GAME_LOADED transitions to STATE_ACTIVE on the first snapshot
             // received from ra-module (i.e. after WiiFlow has booted the game).
-            if (state == STATE_INIT || state == STATE_ERROR) break;
+            if (state == STATE_INIT || state_is_error()) break;
             if (state == STATE_GAME_LOADED) {
                 state = STATE_ACTIVE;
                 g_roots_built = false;   /* rebuild chain-root gate for this game's memrefs */
@@ -4807,8 +4824,19 @@ extern "C" void rc_client_diag_cond_census(const rc_client_t*,
 
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
-        LOG_ERR("ERROR=rc_client: game load failed: %s\r\n", error_message ? error_message : "?");
-        state = STATE_ERROR;
+        LOG_ERR("ERROR=rc_client: game load failed (%d): %s\r\n", result,
+                error_message ? error_message : "?");
+        /* Map the rcheevos result to a distinct EXI status so WiiFlow can show
+         * the user WHY the load failed instead of a generic error:
+         *   RC_NO_GAME_LOADED — the hash isn't in the RA database (bad dump /
+         *                       unsupported version);
+         *   RC_NO_RESPONSE    — HTTP never got an answer (no internet). */
+        if (result == RC_NO_GAME_LOADED)
+            state = STATE_ERROR_UNKNOWN_GAME;
+        else if (result == RC_NO_RESPONSE)
+            state = STATE_ERROR_WIFI;
+        else
+            state = STATE_ERROR;
         snd_request(SND_ERROR);
         return;
     }
@@ -5281,7 +5309,12 @@ static void login_then_load_cb(int result, const char *error_message, rc_client_
     if (result != RC_OK) {
         LOG_ERR("ERROR=RA login failed (%d): %s\r\n", result,
                 error_message ? error_message : "?");
-        state = STATE_ERROR;
+        /* RC_NO_RESPONSE = the HTTP layer never reached the RA server (WiFi up
+         * but no internet, or server unreachable) — that's a connectivity
+         * problem, not a credentials problem. Everything else from the login
+         * API (invalid credentials, expired token, access denied) is a login
+         * failure the user must fix via the config portal. */
+        state = (result == RC_NO_RESPONSE) ? STATE_ERROR_WIFI : STATE_ERROR_LOGIN;
         snd_request(SND_ERROR);
         return;
     }
@@ -5932,9 +5965,9 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    ralog_printf("WII-RA-ADAPTER v0.34.4-recovered-%s-%s (build %s %s)\n",
+    ralog_printf("WII-RA-ADAPTER v0.35.0-bootstatus-%s (build %s %s)\n",
                  (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
-                 BUZZER_ACTIVE ? "active" : "passive", __DATE__, __TIME__);
+                 __DATE__, __TIME__);
     /* lever B: arm the per-vblank collect walk budget from boot (also refreshed
      * each vblank). 0 = baseline; >0 = capped. Logged so the A/B run is labelled. */
     g_rc_collect_walk_budget = g_collect_walk_budget;
@@ -5947,6 +5980,18 @@ void setup() {
     }
     LOG_DBG("DEBUG=SPI slave initialized\r\n");
 
+    /* Start the EXI servicer BEFORE the WiFi/portal/login phase. Until v0.34
+     * it was created after WiFi connected, so a Wii probing an adapter that
+     * was stuck in the config portal (or waiting for a dead router) saw a
+     * dead device — indistinguishable from "not plugged in". Started here,
+     * IDENTIFY/POLL always answer and the status byte exposes the boot
+     * progress (PORTAL / WIFI_CONNECTING / LOGGING_IN) so WiiFlow can tell
+     * the user exactly what the adapter is waiting for. Pre-ready commands
+     * that need rc_client are rejected by the state guards in processEXI.
+     * (Prio 19 with a vTaskDelay(1) per iteration — the setup flow below
+     * keeps running on the prio-1 loop task.) */
+    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 19, &taskCore1Handle, 1);
+
 #if RA_BUZZER
     /* Buzzer jingles run on Core 0 (multi-second vTaskDelay chains must never
      * touch the Core 1 EXI path). Started BEFORE the WiFi block so the portal/
@@ -5956,6 +6001,7 @@ void setup() {
 
     // WiFi + RA login (same flow as fpga-ra-adapter)
     if (!isConfigured()) {
+        state = STATE_PORTAL;   // visible to the Wii: "configure me first"
         // Heap (not stack: the captive portal's web server is stack-hungry on the
         // 8KB loop task) and constructed HERE, with Serial up — not at static-init.
         WiFiManager* wm = new WiFiManager();
@@ -5981,10 +6027,12 @@ void setup() {
             }
         }
     } else {
+        state = STATE_WIFI_CONNECTING;
         WiFi.mode(WIFI_STA);
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
         LOG_DBG("DEBUG=WiFi OK\r\n");
+        state = STATE_LOGGING_IN;
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
             LOG_DBG("DEBUG=RA login OK\r\n");
@@ -6011,8 +6059,8 @@ void setup() {
      * prio 1, preempted the EXI task mid-frame (the residual fire-rate
      * dips that survived the v0.24.0 core split). 19 sits above tcpip
      * and below the WiFi driver (23). Safe: taskCore1 blocks on the SPI
-     * result queue / vTaskDelay every iteration, never busy-spins. */
-    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 19, &taskCore1Handle, 1);
+     * result queue / vTaskDelay every iteration, never busy-spins.
+     * (Created right after exi_spi_init above, BEFORE the WiFi phase.) */
 
     /* HTTP worker on Core 0, beside the WiFi/lwIP tasks. 12KB stack —
      * TLS+HTTPClient ran for months on loopTask's default 8KB, so 12KB

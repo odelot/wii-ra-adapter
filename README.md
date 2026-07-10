@@ -1,5 +1,7 @@
 # wii-ra-adapter
 
+[![Sponsor on Patreon](https://img.shields.io/badge/Patreon-support-orange?logo=patreon)](http://patreon.com/RetroAchievementsHardwareLab)
+
 **RetroAchievements on original Wii hardware — for both Wii and GameCube games — with no PC, no emulator and no game patching.**
 
 The wii-ra-adapter is an ESP32-S3 firmware. The board plugs into the Wii's GameCube **memory card Slot B**, pretending to be an EXI device. It connects to your Wi-Fi, logs into [RetroAchievements](https://retroachievements.org), and runs the official [rcheevos](https://github.com/RetroAchievements/rcheevos) client — while the Wii, ~60 times per second, streams snapshots of the running game's RAM to it over the EXI bus. Achievements pop on real hardware, on real discs/backups, in real time.
@@ -58,6 +60,10 @@ Any ESP32-S3 board with PSRAM works; two board variants are wired in [`board_con
 
 - **BOARD_DEV** — ESP32-S3 DevKit (WS2812 RGB status LED)
 - **BOARD_XIAO** — Seeed XIAO ESP32S3 (tiny — fits inside a memory card shell)
+
+### Official PCB
+
+[Wii_RA](https://github.com/sage2050/Wii_RA), designed by community member **sage2050**, is a prototype memory card-shaped board for this adapter and is on track to become the project's official PCB. It's compatible with the Seeed XIAO ESP32-S3 and hasn't been tested yet. Thank you for the contribution!
 
 Wiring to the GameCube memory card connector (Slot B):
 

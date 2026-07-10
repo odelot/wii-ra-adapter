@@ -6771,6 +6771,38 @@ static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_clie
     ++g_rc_lb_evaled;
 #endif
 
+#ifdef RC_DIRTY_EVAL
+    /* lb dirty-eval v2 (state-scoped): rc_evaluate_lboard tests the 3
+     * TRIGGERS every frame in every state (their hits block skips always),
+     * but the VALUE only runs while STARTED and is reset at start — so in
+     * ACTIVE (the 47-lb bulk) only the trigger deps/hits matter. Hard
+     * exclusions: hit accrual in scope (time-measuring values tick per
+     * frame while STARTED) and the Delta-settle frame after a dep change. */
+    if (g_rc_dirty_eval_enabled && g_rc_lb_dirty_enabled &&
+        leaderboard->dep_memrefs && leaderboard->no_hits_trig &&
+        (lboard->state == RC_LBOARD_STATE_ACTIVE ||
+         (lboard->state == RC_LBOARD_STATE_STARTED && leaderboard->no_hits_value))) {
+      uint16_t di;
+      uint16_t dn = (lboard->state == RC_LBOARD_STATE_ACTIVE)
+                    ? leaderboard->dep_trig_count : leaderboard->dep_count;
+      if (dn > 0) {   /* dn==0 = all-const triggers (e.g. "1=1" dev start):
+                       * truth doesn't hinge on memory — NEVER skip, the
+                       * state transition must be allowed to fire. */
+        uint8_t dep_changed_now = 0;
+        for (di = 0; di < dn; ++di) {
+          if (leaderboard->dep_memrefs[di]->changed) { dep_changed_now = 1; break; }
+        }
+        if (dep_changed_now || leaderboard->eval_next) {
+          leaderboard->eval_next = dep_changed_now;   /* settle next frame too */
+        } else {
+          ++g_rc_lb_skipped;
+          continue;
+        }
+      }
+    }
+    ++g_rc_lb_evaled;
+#endif
+
     old_state = lboard->state;
     new_state = rc_evaluate_lboard(lboard, &leaderboard->value, client->state.legacy_peek, client, NULL);
 
@@ -7036,35 +7068,6 @@ static void rc_gc_restore_memref_values(rc_memrefs_t* mr,
       mml = mml->next;
     } while (mml);
   }
-}
-
-/* DIAGNOSTIC (project_exi_robust_handshake): run the evaluator's EXACT read path
- * (the UPDATE) on the CURRENT cache, with the v0.32 gate's save/rollback so it
- * leaves ZERO trace (delta/prior/value all restored). Side effect: read_memory_
- * ingame records peek_miss for THIS-frame's real evaluator misses. The adapter
- * compares those against the resolver's pending set: if the dry-UPDATE finds
- * misses the resolver (same cache) did not -> LOGIC divergence; if it finds none
- * -> the resolver-miss was FRAME-LATENCY (stale last-frame peek_miss). Mutex-
- * serialized with do_frame so the in-place update can't race the eval. */
-void rc_client_diag_dry_update(rc_client_t* client)
-{
-  uint32_t saved;
-  if (!client || !client->game || client->game->waiting_for_reset || !g_rc_doframe_save_buf)
-    return;
-
-  rc_mutex_lock(&client->state.mutex);
-  saved = rc_gc_save_memref_values(client->game->runtime.memrefs,
-                                   g_rc_doframe_save_buf, g_rc_doframe_save_cap);
-#ifdef RC_INCREMENTAL_UPD
-  /* Force a FULL resolve so the diagnostic reads EVERY chain (opt-B would skip
-   * cached/stable chains — harmless for the miss set, but we want zero doubt).
-   * The mutex makes the 1->0->1 transition atomic vs the real do_frame. */
-  client->game->runtime.memrefs->memrefs.incr_warmed = 0;
-#endif
-  rc_client_update_memref_values(client);   /* peeks via read_memory_ingame -> peek_miss */
-  rc_gc_restore_memref_values(client->game->runtime.memrefs,
-                              g_rc_doframe_save_buf, saved);
-  rc_mutex_unlock(&client->state.mutex);
 }
 
 void rc_client_do_frame(rc_client_t* client)
@@ -7864,4 +7867,74 @@ const rc_memrefs_t* rc_client_get_memrefs(const rc_client_t* client) {
   if (!client || !client->game)
     return NULL;
   return client->game->runtime.memrefs;
+}
+
+/* ===========================================================================
+ * rc_client_diag_cond_census - DIAGNOSTIC (sweet-spot study 2026-07-03)
+ *
+ * Counts PARSED conditions per bucket so the adapter's frame budget can be
+ * mapped to set sizes. The buckets have very different per-condition frame
+ * cost: achievements are shielded by dirty-eval/clean-replay; an ACTIVE
+ * leaderboard's 3 triggers (+ VALUE when STARTED) evaluate every frame; rich
+ * presence is throttled to 1x/60 frames (~free). One-shot at game load.
+ * =========================================================================== */
+static uint32_t rc_diag_count_trigger(const rc_trigger_t* t) {
+  uint32_t n = 0;
+  const rc_condset_t* cs;
+  const rc_condition_t* c;
+  if (!t)
+    return 0;
+  if (t->requirement)
+    for (c = t->requirement->conditions; c; c = c->next) ++n;
+  for (cs = t->alternative; cs; cs = cs->next)
+    for (c = cs->conditions; c; c = c->next) ++n;
+  return n;
+}
+
+static uint32_t rc_diag_count_value(const rc_value_t* v) {
+  uint32_t n = 0;
+  const rc_condset_t* cs;
+  const rc_condition_t* c;
+  for (cs = v->conditions; cs; cs = cs->next)
+    for (c = cs->conditions; c; c = c->next) ++n;
+  return n;
+}
+
+void rc_client_diag_cond_census(const rc_client_t* client,
+    uint32_t* out_ach, uint32_t* out_lb, uint32_t* out_rp) {
+  uint32_t na = 0, nl = 0, nr = 0;
+  const rc_client_subset_info_t* subset;
+  if (out_ach) *out_ach = 0;
+  if (out_lb)  *out_lb  = 0;
+  if (out_rp)  *out_rp  = 0;
+  if (!client || !client->game)
+    return;
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    const rc_client_achievement_info_t* ach = subset->achievements;
+    const rc_client_achievement_info_t* stop = ach + subset->public_.num_achievements;
+    const rc_client_leaderboard_info_t* lb = subset->leaderboards;
+    const rc_client_leaderboard_info_t* lb_stop = lb + subset->public_.num_leaderboards;
+    for (; ach < stop; ++ach)
+      na += rc_diag_count_trigger(ach->trigger);
+    for (; lb < lb_stop; ++lb) {
+      if (!lb->lboard)
+        continue;
+      nl += rc_diag_count_trigger(&lb->lboard->start);
+      nl += rc_diag_count_trigger(&lb->lboard->cancel);
+      nl += rc_diag_count_trigger(&lb->lboard->submit);
+      nl += rc_diag_count_value(&lb->lboard->value);
+    }
+  }
+  if (client->game->runtime.richpresence && client->game->runtime.richpresence->richpresence) {
+    const rc_richpresence_t* rp = client->game->runtime.richpresence->richpresence;
+    const rc_value_t* v;
+    const rc_richpresence_display_t* d;
+    for (v = rp->values; v; v = v->next)
+      nr += rc_diag_count_value(v);
+    for (d = rp->first_display; d; d = d->next)
+      nr += rc_diag_count_trigger(&d->trigger);
+  }
+  if (out_ach) *out_ach = na;
+  if (out_lb)  *out_lb  = nl;
+  if (out_rp)  *out_rp  = nr;
 }

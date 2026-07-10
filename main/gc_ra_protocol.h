@@ -259,11 +259,20 @@ typedef enum {
     RA_STATUS_LOADING_GAME   = 0x05,
     RA_STATUS_GAME_LOADED    = 0x06,
     RA_STATUS_ACTIVE         = 0x07,  /* Fully operational, processing frames */
-    RA_STATUS_ERROR_WIFI     = 0xE0,
-    RA_STATUS_ERROR_LOGIN    = 0xE1,
-    RA_STATUS_ERROR_GAME     = 0xE2,
+    /* Adapter has no stored WiFi/RA credentials and is serving its captive
+     * config portal (WII_RA_ADAPTER AP). Non-terminal from the adapter's
+     * point of view, but a frontend should tell the user to configure it. */
+    RA_STATUS_PORTAL         = 0x08,
+    RA_STATUS_ERROR_WIFI     = 0xE0,  /* no WiFi link / no internet (RC_NO_RESPONSE) */
+    RA_STATUS_ERROR_LOGIN    = 0xE1,  /* RA rejected the credentials / token expired */
+    RA_STATUS_ERROR_GAME     = 0xE2,  /* game load failed (server/API error) */
     RA_STATUS_ERROR_PROTOCOL = 0xE3,
+    /* Hash not in the RA database — likely a bad dump / unsupported image. */
+    RA_STATUS_ERROR_UNKNOWN_GAME = 0xE4,
 } ra_status_t;
+
+/** First status value that means "terminal failure". */
+#define RA_STATUS_IS_ERROR(s)  ((uint8_t)(s) >= 0xE0)
 
 /*
  * ============================================================================

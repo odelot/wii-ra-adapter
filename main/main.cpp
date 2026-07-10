@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <stdlib.h>   /* qsort (chain-root gate) */
-#line 1 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 /**
  * wii-ra-adapter.ino
  *
@@ -40,7 +39,8 @@ Pin 7: 3.3V
 
 Diagrama de ligação  (pinos exatos vêm de board_config.h / BOARD_VARIANT)
 
-Wii Memory Card Slot A    BOARD_DEV (S3 DevKit)   BOARD_XIAO (XIAO ESP32S3)
+Wii Memory Card Slot B    BOARD_DEV (S3 DevKit)   BOARD_XIAO (XIAO ESP32S3)
+(EXI channel 1 — all three console sides use chan 1: WiiFlow, d2x, Nintendont)
 ────────────────────────  ─────────────────────   ─────────────────────────
 Pin 7  3.3V ───────────── 3.3V  (alimentação)      3.3V
 Pin 1  GND  ───────────── GND                      GND
@@ -118,6 +118,11 @@ extern "C" {
   extern volatile uint32_t g_rc_lb_skipped;
   extern volatile uint32_t g_rc_lb_evaled;
   extern volatile int g_rc_rp_throttle_enabled;
+  /* lb dirty-eval + RP throttle (2026-07-03, the hardcore +3ms fix) */
+  extern volatile int g_rc_lb_dirty_enabled;
+  extern volatile uint32_t g_rc_lb_skipped;
+  extern volatile uint32_t g_rc_lb_evaled;
+  extern volatile int g_rc_rp_throttle_enabled;
   extern volatile uint32_t g_rc_lb_stat_active_ok, g_rc_lb_stat_total;  /* boot diag */
 #ifdef RC_CLEAN_REPLAY
   extern volatile uint32_t g_rc_de_replayed;   /* warm+clean cached-truth replays (subset of de_ev) */
@@ -181,13 +186,29 @@ static inline void ralog_write(const char *buf, uint32_t len) {
     portEXIT_CRITICAL(&log_mux);
 }
 
+/* ralog byte sink. On the XIAO the user monitors the NATIVE USB port (USB-
+ * Serial-JTAG): Arduino Serial rides UART0, which only reaches pads D6/D7
+ * (GPIO43/44) — every DEBUG= line would be invisible on the USB port. stdout
+ * goes through the IDF console, which mirrors to the USB-JTAG SECONDARY
+ * console (CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG) — visible on BOTH
+ * the USB port and the UART pads. The DEV board keeps the direct Serial
+ * path (UART bridge at 250000, the long-standing known-good setup). */
+static inline void ralog_sink(const char *buf, uint32_t len) {
+#if BOARD_VARIANT == BOARD_XIAO
+    fwrite(buf, 1, len, stdout);
+    fflush(stdout);
+#else
+    Serial.write((const uint8_t *)buf, len);
+#endif
+}
+
 static void ralog_vprintf(const char *fmt, va_list ap) {
     char buf[384];   /* FRAME line is ~300ch + margin (vsnprintf truncates) */
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (n <= 0) return;
     uint32_t len = (n < (int)sizeof(buf)) ? (uint32_t)n : (uint32_t)(sizeof(buf) - 1);
     if (g_log_async_ready) ralog_write(buf, len);
-    else Serial.write((const uint8_t *)buf, len);    /* boot: no EXI yet, blocking ok */
+    else ralog_sink(buf, len);                       /* boot: no EXI yet, blocking ok */
 }
 
 /* non-static: also called from exi_spi_slave.cpp via ra_log.h */
@@ -216,14 +237,14 @@ static void ralog_drain_task(void *pv) {
         }
         log_tail = tail;
         portEXIT_CRITICAL(&log_mux);
-        if (n) { Serial.write((const uint8_t *)chunk, n); continue; }  /* drained a chunk */
+        if (n) { ralog_sink(chunk, n); continue; }  /* drained a chunk */
         /* ring empty: if we ever dropped, say so (so silent loss is visible), then yield */
         if (log_dropped != last_dropped) {
             char w[56];
             int wn = snprintf(w, sizeof(w), "LOG_DROPPED total=%lu bytes\r\n",
                               (unsigned long)log_dropped);
             last_dropped = log_dropped;
-            if (wn > 0) Serial.write((const uint8_t *)w, (size_t)wn);
+            if (wn > 0) ralog_sink(w, (uint32_t)wn);
         }
         vTaskDelay(1);   /* empty → yield IDLE0 (TWDT-safe) */
     }
@@ -369,11 +390,6 @@ static void fr_trigger(void) {
 #define RC_DO_FRAME_IN_LOW_PRIO_TASK 1
 #endif
 
-/* When 0, the patch response is passed to rcheevos as-is (no field stripping).
- * Useful for isolating whether a parse failure is caused by the strip helpers
- * mangling JSON, vs. by something else in the response. The full SMG patch is
- * ~800KB and fits easily in 8MB PSRAM, so disabling strips is safe for triage. */
-#define STRIP_JSON_RESPONSE 0
 
 #define EEPROM_SIZE 2048
 #define EEPROM_ID_1 142
@@ -388,151 +404,85 @@ static void fr_trigger(void) {
 // WiiFlow can read resp.status and know exactly what the adapter is doing.
 // ============================================================================
 enum AdapterState {
-    STATE_INIT         = RA_STATUS_INITIALIZING,   // 0x00 — booting up
-    STATE_WAIT_GAME_ID = RA_STATUS_LOGGED_IN,      // 0x04 — WiFi+login OK, ready for game ID
-    STATE_LOADING_GAME = RA_STATUS_LOADING_GAME,   // 0x05 — fetching game data from RA servers
-    STATE_GAME_LOADED  = RA_STATUS_GAME_LOADED,    // 0x06 — data ready, WiiFlow may proceed to boot
-    STATE_ACTIVE       = RA_STATUS_ACTIVE,          // 0x07 — in-game, processing snapshots
-    STATE_ERROR        = RA_STATUS_ERROR_GAME,      // 0xE2 — generic error
-    STATE_IDLE         = 0x80,                      // internal only, not exposed via EXI
+    STATE_INIT          = RA_STATUS_INITIALIZING,    // 0x00 — booting up
+    STATE_WIFI_CONNECTING = RA_STATUS_WIFI_CONNECTING, // 0x01 — joining the stored WiFi network
+    STATE_LOGGING_IN    = RA_STATUS_LOGGING_IN,      // 0x03 — boot-time RA login check
+    STATE_WAIT_GAME_ID  = RA_STATUS_LOGGED_IN,       // 0x04 — WiFi+login OK, ready for game ID
+    STATE_LOADING_GAME  = RA_STATUS_LOADING_GAME,    // 0x05 — fetching game data from RA servers
+    STATE_GAME_LOADED   = RA_STATUS_GAME_LOADED,     // 0x06 — data ready, WiiFlow may proceed to boot
+    STATE_ACTIVE        = RA_STATUS_ACTIVE,          // 0x07 — in-game, processing snapshots
+    STATE_PORTAL        = RA_STATUS_PORTAL,          // 0x08 — captive config portal (no credentials)
+    STATE_ERROR_WIFI    = RA_STATUS_ERROR_WIFI,      // 0xE0 — no WiFi link / no internet
+    STATE_ERROR_LOGIN   = RA_STATUS_ERROR_LOGIN,     // 0xE1 — RA rejected the credentials
+    STATE_ERROR         = RA_STATUS_ERROR_GAME,      // 0xE2 — generic game-load error
+    STATE_ERROR_UNKNOWN_GAME = RA_STATUS_ERROR_UNKNOWN_GAME, // 0xE4 — hash not in RA DB (bad dump)
+    STATE_IDLE          = 0x80,                      // internal only, not exposed via EXI
 };
 
 volatile AdapterState state = STATE_INIT;
 
-#line 346 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void dump_cache_lru(void);
-#line 429 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
+/* Any terminal-failure state (0xE0..). WiiFlow aborts the boot on these. */
+static inline bool state_is_error() { return RA_STATUS_IS_ERROR((uint8_t)state); }
+
 static void tomb_put(uint32_t addr, uint8_t value);
-#line 444 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static bool tomb_get(uint32_t addr, uint8_t *out);
-#line 455 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void tomb_clear(void);
-#line 529 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void mut_record(uint16_t seq, const uint8_t *resp, uint16_t len);
-#line 538 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void mut_ring_clear(void);
-#line 545 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static bool mut_deliver_next(void);
-#line 665 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
  extern "C" int doframe_primed_cb(void);
-#line 684 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void trigger_watchlist_resync(const char *reason);
-#line 745 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void * ra_hot_alloc(size_t bytes, bool *from_internal);
-#line 755 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint32_t hash_addr(uint32_t addr);
-#line 759 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void hash_clear();
-#line 765 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void hash_insert(uint32_t addr, uint16_t watch_index);
-#line 779 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static int32_t hash_lookup(uint32_t addr);
-#line 794 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static int is_cached_cb(uint32_t addr, uint32_t num_bytes, void* ud);
-#line 819 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static const char * cmd_short_name(uint8_t cmd);
-#line 915 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void queue_event(uint8_t type, const uint8_t *data, uint16_t len);
-#line 929 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 bool has_pending_event();
-#line 933 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 PendingEvent* peek_event();
-#line 938 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void pop_event();
-#line 947 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void log_message(const char *message, const rc_client_t *client);
-#line 951 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void event_handler(const rc_client_event_t *event, rc_client_t *client);
-#line 1004 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer, uint32_t num_bytes, rc_client_t *client);
-#line 1080 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *ud);
-#line 1160 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint32_t read_memory_nop(uint32_t address, uint8_t *buffer, uint32_t num_bytes, rc_client_t *client);
-#line 1165 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void rc_callback(int result, const char *error_message, rc_client_t *client, void *userdata);
-#line 1169 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 rc_clock_t get_millisecs(const rc_client_t *client);
-#line 1182 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static bool json_quote_is_real(const char* data, size_t idx);
-#line 1188 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_remove_whitespace(PsramStream &buf);
-#line 1202 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_remove_field(PsramStream &buf, const char* field);
-#line 1266 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_clean_field_str(PsramStream &buf, const char* field);
-#line 1302 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_clean_field_array(PsramStream &buf, const char* field);
-#line 1366 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void json_keep_only_achievement_id(PsramStream &buf, const uint32_t *target_ids, int n_ids);
-#line 1454 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_remove_flags5_achievements(PsramStream &buf);
-#line 1502 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void json_keep_first_n_achievements(PsramStream &buf, int n);
-#line 1547 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void json_keep_first_set(PsramStream &buf);
-#line 1627 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static int count_mem_ops(const char* data, int objStart, int objEnd);
-#line 1647 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void json_cap_total_operations(PsramStream &buf, int target_ops);
-#line 1719 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
-static void json_strip_patch(PsramStream &buf);
-#line 1769 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void http_finish(const http_job_t *job, const char *body, size_t body_len, int status);
-#line 1790 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void server_call_blocking(const http_job_t *job);
-#line 2046 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void server_call(const rc_api_request_t *request, rc_client_server_callback_t callback, void *callback_data, rc_client_t *rc_client);
-#line 2066 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void httpTask(void *pvParameters);
-#line 2080 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void http_drain_done(void);
-#line 2134 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void send_esp_header_response_4pad(const ra_esp_header_t *hdr);
-#line 2174 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void set_new_snapshot(void);
-#line 2203 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint16_t collect_missing_addresses(void);
-#line 2306 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void send_addr_query_response(void);
-#line 2376 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void handle_exi_command(const uint8_t *rx_data, size_t rx_len);
-#line 3112 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static uint16_t watchlist_append(const uint32_t *addrs, const uint8_t *values, uint16_t count);
-#line 3161 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void ensure_watchlist_capacity();
-#line 3181 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void watchlist_update_if_changed(uint32_t new_count);
-#line 3423 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata);
-#ifdef RC_SHADOW_VALUES
-extern "C" void rc_shadow_set_arena(uint32_t* value, uint32_t* prior, uint8_t* changed, uint32_t cap);  /* memref.c (C linkage) */
-#endif
-#line 3507 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 static void login_then_load_cb(int result, const char *error_message, rc_client_t *client, void *userdata);
-#line 3519 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void loadGame(const char *hash);
-#line 3558 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void beginEEPROM(bool force);
-#line 3568 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 bool isConfigured();
-#line 3570 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void save_configuration_info_eeprom(String ra_user, String ra_pass);
-#line 3580 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 String read_ra_user_from_eeprom();
-#line 3587 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 String read_ra_pass_from_eeprom();
-#line 3603 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 String try_login_RA(String user, String pass);
-#line 3790 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void processSnapshot();
-#line 4047 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void processEXI();
-#line 4095 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void taskCore1(void *pvParameters);
-#line 4181 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void setup();
-#line 4326 "C:\\dev\\gamecube\\gamecube\\wii-ra-adapter\\wii-ra-adapter\\wii-ra-adapter.ino"
 void loop();
 // ============================================================================
 // Memory tracking - adapted for 32-bit addresses and snapshot model
@@ -673,68 +623,6 @@ static uint32_t lru_clock = 0;  /* = PPC VBI frame_counter (real game frames) si
  * multi-pass; subject to LRU eviction when watch_count > WATCHLIST_HIGH_WATER. */
 static uint16_t static_watch_count = 0;
 
-/* Diagnostic: dump the whole watchlist with per-entry LRU age. Called every
- * N frames from processSnapshot. Age = lru_clock - last_used_frame[i], now
- * in real PPC VBI game-frames (v0.28.8 — lru_clock mirrors frame_counter;
- * static entries are LRU_PROTECTED and have no age). This is HEAVY: it prints
- * thousands of lines and WILL stall SPI timing for a few seconds — only run
- * it sparingly (the user accepts the disruption for debugging). Yields every
- * 64 lines so the Serial backpressure doesn't trip the task watchdog. */
-static void dump_cache_lru(void) {
-    if (!watch_addresses || !memory_data) return;
-
-    /* Fine-grained age histogram over DYNAMIC entries. age = lru_clock -
-     * last_used_frame[i], in PPC VBI game-frames (~60/s). Buckets:
-     *   lo[0]=age0  lo[1]=1-9  lo[2]=10-99      (hot working set lives here)
-     *   c[0..8] = 100..999 in decades of 100   (c[0]=100-199 ... c[8]=900-999)
-     *   k[0..8] = >=1000 in 250-frame bins      (k[0]=1000-1249 ... k[7]=2750-2999,
-     *             k[8]=>=3000)
-     * The c[]/k[] tail is COLD dead-weight: the ra-module still reads each of
-     * those addresses from MEM1 and ships them in EVERY snapshot, but the
-     * evaluator hasn't touched them in 1.6s..50s. This quantifies the transfer
-     * we pay for data we no longer look at. */
-    uint32_t lo[3] = {0,0,0};
-    uint32_t c[9]  = {0,0,0,0,0,0,0,0,0};
-    uint32_t k[9]  = {0,0,0,0,0,0,0,0,0};
-    for (uint16_t i = static_watch_count; i < watch_count; i++) {
-        uint32_t luf = last_used_frame ? last_used_frame[i] : 0;
-        if (luf == LRU_PROTECTED) continue;
-        /* clamp: frame_counter can reset on game restart → lru_clock < luf */
-        uint32_t age = (lru_clock >= luf) ? (lru_clock - luf) : 0;
-        if      (age == 0)   lo[0]++;
-        else if (age < 10)   lo[1]++;
-        else if (age < 100)  lo[2]++;
-        else if (age < 1000) c[(age - 100) / 100]++;
-        else { uint32_t b = (age - 1000) / 250; if (b > 8) b = 8; k[b]++; }
-    }
-    LOG_DBG("=== CACHE DUMP watch=%u static=%u dyn=%u lru_clock=%lu ===\r\n",
-              (unsigned)watch_count, (unsigned)static_watch_count,
-              (unsigned)(watch_count - static_watch_count), (unsigned long)lru_clock);
-    LOG_DBG("  hot: age0=%lu 1-9=%lu 10-99=%lu\r\n",
-              (unsigned long)lo[0], (unsigned long)lo[1], (unsigned long)lo[2]);
-    LOG_DBG("  100s: 1xx=%lu 2xx=%lu 3xx=%lu 4xx=%lu 5xx=%lu 6xx=%lu 7xx=%lu 8xx=%lu 9xx=%lu\r\n",
-              (unsigned long)c[0], (unsigned long)c[1], (unsigned long)c[2],
-              (unsigned long)c[3], (unsigned long)c[4], (unsigned long)c[5],
-              (unsigned long)c[6], (unsigned long)c[7], (unsigned long)c[8]);
-    LOG_DBG("  1k+: 1.00k=%lu 1.25k=%lu 1.50k=%lu 1.75k=%lu 2.00k=%lu 2.25k=%lu 2.50k=%lu 2.75k=%lu 3k+=%lu\r\n",
-              (unsigned long)k[0], (unsigned long)k[1], (unsigned long)k[2],
-              (unsigned long)k[3], (unsigned long)k[4], (unsigned long)k[5],
-              (unsigned long)k[6], (unsigned long)k[7], (unsigned long)k[8]);
-
-//     for (uint16_t i = 0; i < watch_count; i++) {
-//         uint32_t luf = last_used_frame ? last_used_frame[i] : 0;
-//         const char *region = (i < static_watch_count) ? "S" : "D";
-//         if (luf == LRU_PROTECTED)
-//             LOG_FRAME("%u %s 0x%08lX=%02X prot\r\n", (unsigned)i, region,
-//                       (unsigned long)watch_addresses[i], (unsigned)memory_data[i]);
-//         else
-//             LOG_FRAME("%u %s 0x%08lX=%02X age=%lu\r\n", (unsigned)i, region,
-//                       (unsigned long)watch_addresses[i], (unsigned)memory_data[i],
-//                       (unsigned long)(lru_clock - luf));
-//         if ((i & 0x3F) == 0x3F) vTaskDelay(1);   /* yield every 64 lines */
-//     }
-//     LOG_FRAME("=== END CACHE DUMP ===\r\n");
-}   /* per-entry dump above intentionally disabled — histogram is enough */
 
 /* When > 0, pending REMOVE event payload waiting to be emitted on the
  * next response. Holds the addresses (BE wire order) to be removed.
@@ -906,20 +794,8 @@ static bool mut_deliver_next(void) {
  * eviction is age-gated (LRU_MIN_AGE) + index-based + tombstoned, and
  * HIGH_WATER is a "start reclaiming above this" line, not a hard
  * ceiling — RA_MAX_WATCH_ADDRS=6144 is the only hard cap.
- *
- * STRESS_TEST_HIGH_WATER reproduces the exact eviction pressure of the
- * failed v0.24.6 SMG run (HW=3800, demand ~3700 sitting on the line) —
- * the A/B harness for validating Phase D1 under fire. The Wii side
- * (sized for 6144) needs NO rebuild between configs. Expected under
- * stress: REMOVE_IDX evictions logged ("only N/256 cold enough" is
- * normal), ZERO "mismatch PERSISTED", ZERO false unlocks, fires high.
- * After validation, set to 0 for the release config (HW=5888). */
-#define STRESS_TEST_HIGH_WATER 0   /* release config — D1/D2 validated under stress 2026-06-12 */
-#if STRESS_TEST_HIGH_WATER
-#define WATCHLIST_HIGH_WATER 3800
-#else
-#define WATCHLIST_HIGH_WATER 4608   /* v0.31: 75% of RA_MAX_WATCH_ADDRS=6144 — eviction trigger (was 5888, ~never hit before the cap froze the list) */
-#endif
+ */
+#define WATCHLIST_HIGH_WATER 4608   /* v0.31: 75% of RA_MAX_WATCH_ADDRS=6144 — eviction trigger */
 
 /* v0.32.1 PERIODIC GARBAGE COLLECTOR. Two eviction modes now:
  *   - PRESSURE (watch_count > WATCHLIST_HIGH_WATER): emergency, reclaim half,
@@ -1571,6 +1447,196 @@ static void ledCelebrateTask(void *arg) {
     }
 }
 
+/* ============================================================================
+ * Buzzer event sounds — ported from nes-ra-adapter (nes-esp-firmware.ino).
+ *
+ * Four jingles on a passive buzzer (PIN_BUZZER from board_config.h: GPIO9 on
+ * BOARD_DEV, GPIO4/pad D3 on BOARD_XIAO):
+ *   SND_ATTENTION — config portal opened (connect to WII_RA_ADAPTER)
+ *   SND_SUCCESS   — RA login OK
+ *   SND_ERROR     — login/load failure
+ *   SND_UNLOCK    — achievement unlocked
+ *   SND_VICTORY   — game mastered (FF fanfare, ~2.5s)
+ *
+ * Same core discipline as the LED celebration above: requesters (Core 1
+ * event_handler / setup) only store a pending id; the tone generation +
+ * multi-second delays run in soundTask on Core 0. The NES firmware's
+ * tone()/noTone() is NOT used — arduino-esp32's Tone.cpp spawns an UNPINNED
+ * prio-10 helper task that could hop onto Core 1; we drive the LEDC channel
+ * directly (ledcWriteTone) from our own pinned task instead.
+ *
+ * The enum is priority-ordered: when UNLOCK and VICTORY land in the same
+ * do_frame batch (mastery = TRIGGERED immediately followed by GAME_COMPLETED),
+ * snd_request keeps the higher id and only the fanfare plays — matching the
+ * NES behaviour of victory REPLACING the normal unlock jingle. */
+#define RA_BUZZER 1
+
+enum {
+    SND_NONE = 0,
+    SND_ATTENTION,
+    SND_SUCCESS,
+    SND_ERROR,
+    SND_UNLOCK,
+    SND_VICTORY,
+};
+
+#if RA_BUZZER
+
+/* note frequencies (Hz) — the subset of the NES firmware's table we use */
+#define NOTE_C4   262
+#define NOTE_G4   392
+#define NOTE_GS4  415
+#define NOTE_AS4  466
+#define NOTE_C5   523
+#define NOTE_D5   587
+#define NOTE_CS6  1109
+#define NOTE_D6   1175
+#define NOTE_E6   1319
+#define NOTE_G5   784
+#define NOTE_G6   1568
+#define NOTE_C7   2093
+#define NOTE_D7   2349
+#define NOTE_E7   2637
+#define NOTE_G7   3136
+
+static volatile uint8_t g_snd_pending = SND_NONE;   /* written by any core, consumed by soundTask */
+
+/* Safe from Core 1 (single aligned byte store). Higher id wins so VICTORY
+ * overrides an UNLOCK requested in the same event batch. */
+static inline void snd_request(uint8_t id) {
+    if (id > g_snd_pending) g_snd_pending = id;
+}
+
+/* PASSIVE buzzer/piezo: LEDC PWM generates each note's frequency. */
+static inline void snd_tone(uint32_t freq) { ledcWriteTone(PIN_BUZZER, freq); }
+static inline void snd_off(void)           { ledcWriteTone(PIN_BUZZER, 0); }
+/* Crude volume: shrink the pulse width below the 50% (511/1023) that
+ * ledcWriteTone sets. Stepping it down fakes a note's decay envelope. */
+static inline void snd_duty(uint32_t d)    { ledcWrite(PIN_BUZZER, d); }
+#define SND_MS(ms) vTaskDelay(pdMS_TO_TICKS(ms))
+
+// play a sound to get the user attention (portal open)
+static void snd_play_attention(void) {
+    static const uint16_t seq[6] = {NOTE_G4, NOTE_G5, NOTE_G6, NOTE_G4, NOTE_G5, NOTE_G6};
+    SND_MS(35);
+    for (int i = 0; i < 6; i++) { snd_tone(seq[i]); SND_MS(35); }
+    snd_off();
+}
+
+// play a sound to indicate a success (login OK)
+static void snd_play_success(void) {
+    static const uint16_t seq[6] = {NOTE_E6, NOTE_G6, NOTE_E7, NOTE_C7, NOTE_D7, NOTE_G7};
+    SND_MS(130);
+    for (int i = 0; i < 6; i++) {
+        snd_tone(seq[i]);
+        SND_MS(125);
+        snd_off();
+        SND_MS(5);
+    }
+}
+
+// play a sound to indicate an error
+static void snd_play_error(void) {
+    SND_MS(100);
+    snd_tone(NOTE_G4);
+    SND_MS(250);
+    snd_tone(NOTE_C4);
+    SND_MS(500);
+    snd_off();
+}
+
+/* Unlock sound flavor: 1 = Xbox 360 blip transcribed from web/snd.mp3
+ * (spectral analysis 2026-07-04: D5 grace ~35ms at ~30% level, ~45ms rest,
+ * then D6 one octave up peaking at 110ms and decaying out by ~300ms);
+ * 0 = the original NES-firmware jingle (D5 D5 C#6 D6). */
+#define RA_SND_XBOX_UNLOCK 1
+
+// play a sound to indicate an achievement unlocked
+static void snd_play_unlock(void) {
+#if RA_SND_XBOX_UNLOCK
+    /* "tu...TUUM": grace note, gap, accented ding. A square wave has no
+     * volume envelope, so the ding's decay is faked by stepping the PWM
+     * duty down (passive only; on the active buzzer it plays flat and the
+     * cadence alone carries the effect). */
+    snd_tone(NOTE_D5);
+    SND_MS(40);
+    snd_off();
+    SND_MS(45);
+    snd_tone(NOTE_D6);
+    SND_MS(70);
+    snd_duty(256);   /* ~25% */
+    SND_MS(50);
+    snd_duty(96);    /* ~9%  */
+    SND_MS(40);
+    snd_duty(24);    /* ~2%  */
+    SND_MS(40);
+    snd_off();
+#else
+    /* NES original passes "velocity" as the tone() duration and sleeps
+     * duration*16 per note — i.e. the note SOUNDS for min(vel, slot) ms and
+     * the rest of the slot is silence. */
+    static const uint16_t note[4] = {NOTE_D5, NOTE_D5, NOTE_CS6, NOTE_D6};
+    static const uint16_t vel[4]  = {52, 37, 83, 74};
+    static const uint16_t slot[4] = {2 * 16, 4 * 16, 3 * 16, 12 * 16};
+    for (int i = 0; i < 4; i++) {
+        uint16_t on = vel[i] < slot[i] ? vel[i] : slot[i];
+        snd_tone(note[i]);
+        SND_MS(on);
+        snd_off();
+        if (slot[i] > on) SND_MS(slot[i] - on);
+    }
+#endif
+}
+
+// play a sound to celebrate mastery (FF Victory Fanfare)
+static void snd_play_victory(void) {
+    const int BIG_GAP   = 45;
+    const int NOTE_GAP  = 30;
+    const int SIXTEENTH = 100;
+    const int EIGHTH    = 200;
+    const int QUARTER   = 400;
+    const int DOTTED_Q  = 600;
+    const int HALF      = 800;
+
+    // Intro: C C C
+    for (int i = 0; i < 3; i++) {
+        snd_tone(NOTE_C5);  SND_MS(SIXTEENTH); snd_off(); SND_MS(BIG_GAP);
+    }
+    // C (long) / Ab / Bb / C (8th + rest) / Bb (16th) / C (hold)
+    snd_tone(NOTE_C5);  SND_MS(DOTTED_Q);       snd_off(); SND_MS(NOTE_GAP);
+    snd_tone(NOTE_GS4); SND_MS(QUARTER);        snd_off(); SND_MS(NOTE_GAP);
+    snd_tone(NOTE_AS4); SND_MS(QUARTER);        snd_off(); SND_MS(NOTE_GAP);
+    snd_tone(NOTE_C5);  SND_MS(EIGHTH);         snd_off(); SND_MS(SIXTEENTH + NOTE_GAP);
+    snd_tone(NOTE_AS4); SND_MS(SIXTEENTH);      snd_off(); SND_MS(NOTE_GAP);
+    snd_tone(NOTE_C5);  SND_MS(HALF + QUARTER); snd_off();
+}
+
+static void soundTask(void *arg) {
+    (void)arg;
+    /* 10-bit resolution like Tone.cpp; ledcWriteTone retunes freq per note. */
+    ledcAttach(PIN_BUZZER, 2000, 10);
+    snd_off();
+    for (;;) {
+        uint8_t id = g_snd_pending;
+        if (id != SND_NONE) {
+            g_snd_pending = SND_NONE;
+            switch (id) {
+                case SND_ATTENTION: snd_play_attention(); break;
+                case SND_SUCCESS:   snd_play_success();   break;
+                case SND_ERROR:     snd_play_error();     break;
+                case SND_UNLOCK:    snd_play_unlock();    break;
+                case SND_VICTORY:   snd_play_victory();   break;
+                default: break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+#else  /* !RA_BUZZER */
+static inline void snd_request(uint8_t) {}
+#endif /* RA_BUZZER */
+
 static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
     /* Diagnostic logging: name the event and, for the achievement-bearing ones,
      * print id + title + measured progress so a flickering CHALLENGE indicator can be
@@ -1674,12 +1740,23 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
              * Just bump the counter — the actual neopixelWrite() runs on Core 0's
              * ledCelebrateTask, NEVER here on the Core 1 EXI critical path. */
             g_celebrate_req++;
+            /* Unlock jingle, same discipline (soundTask on Core 0 plays it). If
+             * GAME_COMPLETED follows in this same batch, VICTORY overrides. */
+            snd_request(SND_UNLOCK);
             ralog_printf("ACHIEVEMENT=%lu;%s\r\n", (unsigned long)ach->id, ach->title);
 #if RA_WEB_DASHBOARD
             /* Instant toast on the phone dashboard. badge_name → the browser
              * builds the media.retroachievements.org URL. */
             ra_web_push_unlock(ach->id, ach->title, ach->badge_name);
 #endif
+            break;
+        }
+        case RC_CLIENT_EVENT_GAME_COMPLETED: {
+            /* Mastery: every achievement in the set unlocked. Same warm-up
+             * guard as TRIGGERED — a boot-storm "completion" must not fanfare. */
+            if (g_warmup_active) break;
+            LOG_INFO("DEBUG=GAME MASTERED! playing victory fanfare\r\n");
+            snd_request(SND_VICTORY);
             break;
         }
         default:
@@ -2026,101 +2103,7 @@ static void json_clean_field_array(PsramStream &buf, const char* field) {
     buf.setLength(w);
 }
 
-/* DEBUG helper: keep only ONE achievement (by ID) in the patch response.
- * Drastically reduces the watchlist and pointer-chain count so we can
- * validate the bootstrap end-to-end without optimising for scale. Set to 0
- * to disable (keep all achievements). */
-#ifndef DEBUG_KEEP_ONLY_ACHIEVEMENT_ID
-#define DEBUG_KEEP_ONLY_ACHIEVEMENT_ID 1  /* 0 = keep all achievements (Kirby milestone 2026-05-31 was 557557) */
-#endif
 
-static void json_keep_only_achievement_id(PsramStream &buf, const uint32_t *target_ids, int n_ids) {
-    json_remove_whitespace(buf);
-
-    int total_kept = 0, total_removed = 0;
-    int search_from = 0;
-
-    /* The achievementset response has one "Achievements":[] per Set
-     * (typically 2 — the core set and the bonus set). Iterate through
-     * each independently so the target cheevo is preserved wherever it
-     * lives and everything else is dropped. */
-    while (search_from < (int)buf.length()) {
-        vTaskDelay(1);  // yield to IDLE0 between achievement-set iterations
-        int achvStart = buf.indexOf("\"Achievements\":[", search_from);
-        if (achvStart == -1) break;
-        char *data = buf.data();
-        int arrayStart = buf.indexOf("[", achvStart);
-        int arrayEnd   = buf.indexOf("]", arrayStart);
-        if (arrayStart == -1 || arrayEnd == -1) break;
-
-        int kept = 0, removed = 0;
-        int pos = arrayStart + 1;
-        while (pos < arrayEnd) {
-            vTaskDelay(1);  // yield to IDLE0 between per-achievement iterations
-            int objStart = buf.indexOf("{", pos);
-            if (objStart == -1 || objStart > arrayEnd) break;
-            int objEnd = objStart, braces = 1;
-            while (braces > 0 && objEnd < arrayEnd) {
-                objEnd++;
-                if (data[objEnd] == '{') braces++;
-                else if (data[objEnd] == '}') braces--;
-            }
-            if (objEnd >= arrayEnd) break;
-
-            bool isTarget = false;
-            for (int t = 0; t < n_ids && !isTarget; t++) {
-                char id_pattern[32];
-                snprintf(id_pattern, sizeof(id_pattern), "\"ID\":%lu,", (unsigned long)target_ids[t]);
-                size_t id_pattern_len = strlen(id_pattern);
-                for (int i = objStart; i < objEnd - (int)id_pattern_len; i++) {
-                    if (strncmp(data + i, id_pattern, id_pattern_len) == 0) {
-                        isTarget = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!isTarget) {
-                int removeStart = objStart;
-                int removeEnd   = objEnd;  /* inclusive */
-
-                /* Strip surrounding whitespace first */
-                while (removeStart > arrayStart
-                       && (data[removeStart-1] == ' ' || data[removeStart-1] == '\n'))
-                    removeStart--;
-                while (removeEnd + 1 < (int)buf.length()
-                       && (data[removeEnd+1] == ' ' || data[removeEnd+1] == '\n'))
-                    removeEnd++;
-
-                /* Strip leading comma if present, otherwise trailing comma.
-                 * Never both, never neither: that's what keeps the array
-                 * valid (`[a,b,c]` minus `b` → `[a,c]`, minus `a` → `[b,c]`,
-                 * minus everything → `[]`). The previous logic only stripped
-                 * trailing comma on the very first removal, leaving stray
-                 * `,` after subsequent removals from the array head. */
-                if (removeStart > arrayStart && data[removeStart-1] == ',') {
-                    removeStart--;
-                } else if (removeEnd + 1 < (int)buf.length() && data[removeEnd+1] == ',') {
-                    removeEnd++;
-                }
-
-                buf.removeRange(removeStart, removeEnd - removeStart + 1);
-                arrayEnd = buf.indexOf("]", arrayStart);
-                pos = removeStart;
-                data = buf.data();
-                removed++;
-            } else {
-                pos = objEnd + 1;
-                kept++;
-            }
-        }
-        total_kept    += kept;
-        total_removed += removed;
-        search_from   = arrayEnd + 1;
-    }
-        LOG_DBG("DEBUG=Filtered Achievements (all sets): kept=%d removed=%d\r\n",
-                total_kept, total_removed);
-}
 
 static void json_remove_flags5_achievements(PsramStream &buf) {
     json_remove_whitespace(buf);
@@ -2162,46 +2145,6 @@ static void json_remove_flags5_achievements(PsramStream &buf) {
     }
 }
 
-/* EXPERIMENT (v0.27.6) — keep only the first N achievements in the set,
- * to MEASURE how do_frame cost (df_us) scales with achievement count.
- * The SMG set is 1 "core" set with 161 achievements + 48 leaderboards;
- * the leaderboards are already stripped, so the ~26ms do_frame is the
- * 161 achievements' trigger eval. This is a DIAGNOSTIC, not production —
- * the dropped achievements simply won't be monitored. N=0 keeps all.
- * Expected: df_us ≈ 26ms × (N/161); find the N where df_us < ~16ms
- * (df/s ~60) to quantify "cost per achievement" and confirm the ceiling. */
-static void json_keep_first_n_achievements(PsramStream &buf, int n) {
-    if (n <= 0) return;
-    json_remove_whitespace(buf);
-    char* data = buf.data();
-    int achvStart = buf.indexOf("\"Achievements\":[");
-    if (achvStart == -1) return;
-    int arrayStart = buf.indexOf("[", achvStart);
-    int arrayEnd   = buf.indexOf("]", arrayStart);
-    if (arrayStart == -1 || arrayEnd == -1) return;
-    int objCount = 0, pos = arrayStart + 1;
-    while (pos < arrayEnd) {
-        int objStart = buf.indexOf("{", pos);
-        if (objStart == -1 || objStart > arrayEnd) break;
-        int objEnd = objStart, braces = 1;
-        while (braces > 0 && objEnd < arrayEnd) {
-            objEnd++;
-            if (data[objEnd] == '{') braces++;
-            else if (data[objEnd] == '}') braces--;
-        }
-        if (objEnd >= arrayEnd) break;
-        objCount++;
-        if (objCount >= n) {
-            /* Keep up to & including this object; drop the rest up to ']'. */
-            if (objEnd + 1 < arrayEnd)
-                buf.removeRange(objEnd + 1, arrayEnd - objEnd - 1);
-            LOG_DBG("DEBUG=keep_first_n: kept %d achievements (was more)\r\n", n);
-            return;
-        }
-        pos = objEnd + 1;
-    }
-    LOG_DBG("DEBUG=keep_first_n: set had <= %d achievements, no change\r\n", n);
-}
 
 /* v0.27.6 — keep only the FIRST set in "Sets":[...], dropping bonus/
  * specialty sets. SMG's full achievementsets response has 2 sets: "core"
@@ -2267,213 +2210,7 @@ static void json_keep_first_set(PsramStream &buf) {
     }
 }
 
-/* ───────────────────────────────────────────────────────────────────────
- * v0.27.x — TOTAL-OPERATION BUDGET CAP  (feature toggle, starts ENABLED)
- *
- * do_frame's trigger-eval cost scales with the TOTAL number of conditions
- * ("operations") across every kept achievement, NOT with the achievement
- * count. SMG's core set is ~32768 ops and measured ~25ms (25274us) on the
- * ESP32 — that alone blows past half of a 16.7ms frame and starves the EXI
- * / comm work that must also finish each frame.
- *
- * Run AFTER every other strip, this pass removes achievements from the
- * HEAVIEST (most operations) to the lightest until the running total drops
- * to <= MAX_TOTAL_OPERATIONS (~20000, ~60% of SMG), buying frame
- * headroom at the cost of a handful of the most expensive achievements.
- * It logs (INFO) how many were dropped and names each one.
- *
- * Operation count = conditions in MemAddr: +1 per '_' (AND within a group),
- * +1 per 'S' group separator (NOT the '0xS' bit6 size prefix — that S is
- * preceded by 'x'), +1 for the first condition. Empty MemAddr counts 0.
- * ─────────────────────────────────────────────────────────────────────── */
-#ifndef CAP_TOTAL_OPERATIONS
-#define CAP_TOTAL_OPERATIONS 0            // 1 = on, 0 = keep every achievement
-#endif
-#ifndef MAX_TOTAL_OPERATIONS
-#define MAX_TOTAL_OPERATIONS 20000        // target ceiling (~60% of SMG's 32768)
-#endif
 
-/* Count rcheevos "operations" (conditions) in one achievement object's
- * MemAddr value, scanning only the [objStart, objEnd] span. */
-static int count_mem_ops(const char* data, int objStart, int objEnd) {
-    static const char* KEY  = "\"MemAddr\":\"";
-    static const int   KLEN = 11;
-    int p = -1;
-    for (int i = objStart; i <= objEnd - KLEN; i++) {
-        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
-    }
-    if (p == -1) return 0;
-    if (data[p] == '"') return 0;          // empty MemAddr
-    int ops = 1;                           // first condition
-    for (int i = p; i < objEnd; i++) {
-        char c = data[i];
-        if (c == '\\') { i++; continue; }  // skip escaped char
-        if (c == '"') break;               // closing quote → end of value
-        if (c == '_') ops++;
-        else if (c == 'S' && data[i-1] != 'x') ops++;   // group sep, not 0xS
-    }
-    return ops;
-}
-
-/* Copy the "Title" value of one achievement object's [objStart,objEnd] span into
- * out (NUL-terminated, truncated to outsize). Used to name the achievements the
- * op-cap drops so the INFO log lists exactly what was removed. */
-static void cap_extract_title(const char* data, int objStart, int objEnd,
-                              char* out, int outsize) {
-    static const char* KEY  = "\"Title\":\"";
-    static const int   KLEN = 9;
-    int p = -1, w = 0;
-    for (int i = objStart; i <= objEnd - KLEN; i++) {
-        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
-    }
-    if (p != -1) {
-        for (int i = p; i < objEnd && w < outsize - 1; i++) {
-            char c = data[i];
-            if (c == '\\') { if (i + 1 < objEnd && w < outsize - 1) out[w++] = data[++i]; continue; }
-            if (c == '"') break;            // closing quote → end of value
-            out[w++] = c;
-        }
-    }
-    out[w] = '\0';
-    if (w == 0) snprintf(out, outsize, "(no title)");
-}
-
-/* Achievements whose Type is "progression" (RA needs ALL) or "win_condition"
- * (RA needs ANY) gate beaten-game / mastery detection — the op-cap must NEVER
- * drop these, even when heavy, or the player can't get credit for finishing.
- * The patch is whitespace-stripped before the cap runs ("Type":"progression"),
- * but tolerate an optional space for safety. Type core/bonus/null = droppable. */
-static bool cap_is_protected(const char* data, int objStart, int objEnd) {
-    static const char* KEY  = "\"Type\":";
-    static const int   KLEN = 7;
-    int p = -1;
-    for (int i = objStart; i <= objEnd - KLEN; i++) {
-        if (strncmp(data + i, KEY, KLEN) == 0) { p = i + KLEN; break; }
-    }
-    if (p == -1) return false;
-    while (p < objEnd && (data[p] == ' ' || data[p] == '\t')) p++;
-    if (p >= objEnd || data[p] != '"') return false;   // null / non-string => droppable
-    p++;
-    return strncmp(data + p, "progression\"",  12) == 0
-        || strncmp(data + p, "win_condition\"", 14) == 0;
-}
-
-static void json_cap_total_operations(PsramStream &buf, int target_ops) {
-    json_remove_whitespace(buf);
-    char* data = buf.data();
-    int achvStart = buf.indexOf("\"Achievements\":[");
-    if (achvStart == -1) return;
-    int arrayStart = buf.indexOf("[", achvStart);
-    int arrayEnd   = buf.indexOf("]", arrayStart);
-    if (arrayStart == -1 || arrayEnd == -1) return;
-
-    /* Pass 1 — enumerate achievement objects: span + operation count + whether
-     * it's a protected (progression/win_condition) achievement the cap can't drop. */
-    struct AchSpan { int start, end, ops; bool removed; bool prot; };
-    const int MAX_ACH = 512;               // SMG core = 161; generous headroom
-    AchSpan* spans = (AchSpan*) ps_malloc(sizeof(AchSpan) * MAX_ACH);
-    if (!spans) { LOG_ERR("ERROR=cap_ops: ps_malloc failed, skipping\r\n"); return; }
-
-    int count = 0, total_ops = 0, pos = arrayStart + 1;
-    int prot_count = 0, prot_ops = 0;
-    while (pos < arrayEnd && count < MAX_ACH) {
-        int objStart = buf.indexOf("{", pos);
-        if (objStart == -1 || objStart > arrayEnd) break;
-        int objEnd = objStart, braces = 1;
-        while (braces > 0 && objEnd < arrayEnd) {
-            objEnd++;
-            if (data[objEnd] == '{') braces++;
-            else if (data[objEnd] == '}') braces--;
-        }
-        if (objEnd >= arrayEnd) break;
-        bool prot = cap_is_protected(data, objStart, objEnd);
-        spans[count] = { objStart, objEnd, count_mem_ops(data, objStart, objEnd), false, prot };
-        total_ops += spans[count].ops;
-        if (prot) { prot_count++; prot_ops += spans[count].ops; }
-        count++;
-        pos = objEnd + 1;
-    }
-
-    LOG_DBG("DEBUG=cap_ops: %d achievements, %d total operations (target <= %d), %d protected (%d ops)\r\n",
-             count, total_ops, target_ops, prot_count, prot_ops);
-    if (total_ops <= target_ops) {
-        LOG_DBG("DEBUG=cap_ops: already under target, removed 0 achievements\r\n");
-        free(spans);
-        return;
-    }
-
-    /* Pass 2 — greedily mark the heaviest DROPPABLE achievement until the running
-     * total drops to <= target. Protected (progression/win_condition) achievements
-     * are NEVER candidates — if only protected remain, we stop above target (better
-     * to overshoot the op budget than break beaten-game detection). O(n^2) max-find. */
-    int removed = 0, removed_ops = 0, min_removed_ops = -1;
-    while (total_ops > target_ops) {
-        int maxIdx = -1, maxOps = -1;
-        for (int i = 0; i < count; i++)
-            if (!spans[i].removed && !spans[i].prot && spans[i].ops > maxOps) { maxOps = spans[i].ops; maxIdx = i; }
-        if (maxIdx == -1) break;           // nothing droppable left (rest are protected)
-        spans[maxIdx].removed = true;
-        total_ops   -= spans[maxIdx].ops;
-        removed_ops += spans[maxIdx].ops;
-        removed++;
-        if (min_removed_ops < 0 || spans[maxIdx].ops < min_removed_ops) min_removed_ops = spans[maxIdx].ops;
-        /* Name each dropped achievement (INFO). data offsets are still valid here —
-         * the physical removeRange happens in Pass 3 below. Heaviest dropped first. */
-        {
-            char title[80];
-            cap_extract_title(data, spans[maxIdx].start, spans[maxIdx].end, title, sizeof(title));
-            LOG_INFO("DEBUG=cap_ops removed: \"%s\" (%d ops)\r\n", title, spans[maxIdx].ops);
-        }
-    }
-
-    /* Surface the protected achievements that protection actually saved — i.e.
-     * ones at least as heavy as the lightest we dropped, which the greedy pass
-     * WOULD have cut if they weren't progression/win_condition. */
-    if (removed > 0) {
-        for (int i = 0; i < count; i++) {
-            if (spans[i].prot && spans[i].ops >= min_removed_ops) {
-                char title[80];
-                cap_extract_title(data, spans[i].start, spans[i].end, title, sizeof(title));
-                LOG_INFO("DEBUG=cap_ops KEPT (progression/win): \"%s\" (%d ops)\r\n", title, spans[i].ops);
-            }
-        }
-    }
-
-    /* Pass 3 — physically delete the marked objects, HIGHEST offset first so
-     * lower spans' offsets stay valid. Eat the comma joining the object to the
-     * array (leading comma normally; trailing comma if it's the first one). */
-    for (int i = count - 1; i >= 0; i--) {
-        if (!spans[i].removed) continue;
-        data = buf.data();                 // re-fetch; buffer shrinks each pass
-        int rs = spans[i].start, re = spans[i].end;
-        if (rs > 0 && data[rs-1] == ',')                          rs--;
-        else if (re + 1 < (int)buf.length() && data[re+1] == ',') re++;
-        buf.removeRange(rs, re - rs + 1);
-    }
-
-    free(spans);
-    LOG_INFO("DEBUG=cap_ops: removed %d achievements (%d ops), %d remain (%d ops), %d protected kept%s\r\n",
-             removed, removed_ops, count - removed, total_ops, prot_count,
-             (total_ops > target_ops) ? " [target unreachable — protected floor]" : "");
-}
-
-// Apply all strips to a patch.php response held in PSRAM
-static void json_strip_patch(PsramStream &buf) {
-    vTaskDelay(1); json_remove_whitespace(buf);
-    vTaskDelay(1); json_remove_field(buf,      "Warning");
-    vTaskDelay(1); json_remove_field(buf,      "BadgeLockedURL");
-    vTaskDelay(1); json_remove_field(buf,      "BadgeURL");
-    vTaskDelay(1); json_remove_field(buf,      "ImageIconURL");
-    vTaskDelay(1); json_remove_field(buf,      "Rarity");
-    vTaskDelay(1); json_remove_field(buf,      "RarityHardcore");
-    vTaskDelay(1); json_remove_field(buf,      "Author");
-    vTaskDelay(1); json_remove_field(buf,      "RichPresencePatch");
-    vTaskDelay(1); json_clean_field_array(buf, "Leaderboards");
-    vTaskDelay(1); json_remove_flags5_achievements(buf);
-#if CAP_TOTAL_OPERATIONS
-    vTaskDelay(1); json_cap_total_operations(buf, MAX_TOTAL_OPERATIONS);
-#endif
-}
 
 // ============================================================================
 // HTTP — async worker on Core 0 (v0.24.0)
@@ -2682,18 +2419,7 @@ static void server_call_blocking(const http_job_t *job) {
         }
         LOG_DBG("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
                 written, (unsigned)ESP.getFreePsram());
-        size_t before = ps.length();
 
-
-#if DEBUG_KEEP_ONLY_ACHIEVEMENT_ID
-        /* DEBUG: filter to a single achievement AND drop RichPresence +
-         * Leaderboards so rcheevos doesn't pull in their address sets.
-         * Watchlist size shrinks dramatically (from ~671 to ~20) which
-         * makes the multi-pass bootstrap fit in 1 ADDR_RESPONSE round
-         * and the live `KIRBY ...` dump readable. Leaderboards alone
-         * pull in dozens of memrefs per set on Kirby. */
-        //static const uint32_t keep_ids[] = { 557557, 577564, 557558 };
-        //json_keep_only_achievement_id(ps, keep_ids, 3);
         vTaskDelay(1); json_remove_whitespace(ps);
         /* v0.27.6 — drop bonus/specialty sets, keep only "core". Cuts the
          * SMG do_frame ~40% (270→161 achievements) → df/s toward 60, the
@@ -2713,11 +2439,22 @@ static void server_call_blocking(const http_job_t *job) {
          * cc= in the PhaseC line — cc < shipped means the bigger blob pushed
          * the window into rotation (the freshness guard only protects flat). */
         #ifndef RA_KEEP_LB_RP
-        #define RA_KEEP_LB_RP 1
+        #define RA_KEEP_LB_RP 1  /* 2026-07-03: LB back ON for the sweet-spot bisect (RA_LB_KEEP_N below) */
+        #endif
+        /* SWEET-SPOT BISECT (2026-07-03): with LB kept, RA_LB_KEEP_N keeps only
+         * the FIRST N leaderboards (0 = all 48). Measured points @80M chase:
+         * LB stripped -> df_us 14.7ms (zero loss), 48 LBs -> 17.2ms (3% loss),
+         * budget 16.68ms -> predicted knee ~N=38. Rebuild per N; judge by the
+         * cumulative drop counter (q=x/y/DROPS) + chase df_us in CATCHUP. */
+        #ifndef RA_LB_KEEP_N
+        #define RA_LB_KEEP_N 0
         #endif
         #if !RA_KEEP_LB_RP
-        vTaskDelay(1); json_clean_field_str(ps,   "RichPresencePatch");
+        /* strip Leaderboards ONLY — RichPresence stays in the payload
+         * (RP eval is throttled to 1x/60 frames so its cost is ~nil). */
         vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
+        #elif RA_LB_KEEP_N > 0
+        vTaskDelay(1); json_keep_first_n_leaderboards(ps, RA_LB_KEEP_N);
         #endif
         vTaskDelay(1); json_remove_field(ps,      "Warning");
         vTaskDelay(1); json_remove_field(ps,      "BadgeLockedURL");
@@ -2728,28 +2465,11 @@ static void server_call_blocking(const http_job_t *job) {
         vTaskDelay(1); json_remove_field(ps,      "Author");
         vTaskDelay(1); json_remove_flags5_achievements(ps);
 
-        /* v0.27.x — cap the total operation budget by dropping the heaviest
-         * achievements until total ops <= MAX_TOTAL_OPERATIONS. Runs LAST so
-         * it sees the final kept set. Toggle via CAP_TOTAL_OPERATIONS. */
-#if CAP_TOTAL_OPERATIONS
-        vTaskDelay(1); json_cap_total_operations(ps, MAX_TOTAL_OPERATIONS);
-#endif
 
         // print ths shrinked ps
         LOG_DBG("DEBUG=Patch after stripping fields: size=%u bytes\r\n", (unsigned)ps.length());
 
-        /* v0.27.6 EXPERIMENT — cap the achievement count to measure the
-         * do_frame cost curve. Set EXPERIMENT_KEEP_FIRST_N>0 to limit;
-         * 0 = keep all. Watch df_us in the CATCHUP log: it should scale
-         * ~linearly with the kept count. DIAGNOSTIC ONLY — capped builds
-         * don't monitor the dropped achievements. */
-        #ifndef EXPERIMENT_KEEP_FIRST_N
-        #define EXPERIMENT_KEEP_FIRST_N 0
-        #endif
-        #if EXPERIMENT_KEEP_FIRST_N > 0
-        json_keep_first_n_achievements(ps, EXPERIMENT_KEEP_FIRST_N);
-        #endif
-#endif
+
         /* Hand off to the done-queue — the rc_client callback runs on the
          * loop task (Core 1), not here. ps destructor frees its PSRAM. */
         http_finish(job, ps.c_str(), ps.length(), httpCode);
@@ -3057,27 +2777,6 @@ static inline bool is_chain_root(uint32_t baddr) {
     return false;
 }
 
-/* DRY-UPDATE diagnostic (project_exi_robust_handshake): defined in rc_client.c.
- * Runs the evaluator's exact read path on the current cache with save/rollback,
- * populating peek_miss as a side effect — used to tell resolver logic-divergence
- * from frame-latency. Toggle for A/B; off = zero overhead. */
-extern "C" void rc_client_diag_dry_update(rc_client_t* client);
-static volatile bool g_diag_dry_update = false;  /* OFF for the servicer build — adds ~7ms in taskCore1 */
-
-/* STEP 0 diagnostic (project_collect_resolver_handoff) — "cap collect to 0 walks"
- * causal test. When TRUE, collect_missing_addresses() returns 0 immediately,
- * BEFORE the rc_memrefs_get_pending_addresses walk — so the EXI servicer does
- * ZERO collect CPU (apc_us/cm_cpu_us -> ~0) and convergence is allowed to LAG.
- * Correctness is backstopped by the v0.32 do_frame gate + peek_miss (a missed
- * address -> DEFERred frame, never a false unlock), so this is safe to A/B on
- * real hardware. A/B PROTOCOL: build with FALSE (baseline = current behavior),
- * flash, capture the SAME bunny chase; then build with TRUE (collect capped),
- * flash, capture the SAME scene. Compare CATCHUP df/s in the storm windows:
- *   - dip DISAPPEARS with cap ON  -> the dip is collect-preemption  -> lever B.
- *   - dip PERSISTS  with cap ON   -> residual is the eval spikes (apc already 0
- *                                    on those frames) -> collect levers can't fix
- *                                    it alone; pivot decision. */
-static volatile bool g_collect_cap_walks = false;  /* STEP 0 hard cap — OFF (was the confounded test) */
 
 /* lever B (project_collect_resolver_handoff) — per-VBLANK collect walk budget.
  * 0 = OFF (baseline = coelho-capoff.log). >0 caps cumulative chain walks per
@@ -3502,10 +3201,6 @@ static uint16_t collect_missing_addresses(void) {
                                   ? rc_client_get_memrefs(g_client) : NULL;
     if (!memrefs || g_watchlist_pending) return 0;
 
-    /* STEP 0 cap-collect test (g_collect_cap_walks): short-circuit the whole
-     * resolver walk so apc_us drops to ~0 and convergence lags. See the toggle's
-     * comment for the A/B protocol. No-op when the flag is FALSE. */
-    if (g_collect_cap_walks) return 0;
 
     uint32_t cm_t0 = (uint32_t)esp_timer_get_time();
     uint32_t n = rc_memrefs_get_pending_addresses(
@@ -3607,31 +3302,6 @@ static uint16_t collect_missing_addresses(void) {
                       (unsigned)pm_added, (unsigned)g_stuck_count,
                       (unsigned long)g_stuck_addr, (unsigned)watch_count, buf);
 
-            /* THE DECISIVE TEST: run the evaluator's EXACT read path on THIS SAME
-             * cache and see what IT misses. peek_miss_count is 0 here (reset just
-             * above). If the dry-UPDATE finds misses the resolver (part1==0) did
-             * NOT -> LOGIC divergence (fix #1 or #2/#3). If it finds none -> the
-             * resolver was right on this cache and the resolver-miss is just
-             * FRAME-LATENCY (stale last-frame peek_miss) -> #2/#3 this-frame exact
-             * is the answer, NOT patching the resolver. Restores peek_miss +
-             * g_update_miss_count so the real flow is untouched. */
-            if (g_diag_dry_update && g_client) {
-                uint32_t umc_save = g_update_miss_count;
-                peek_miss_count = 0;
-                rc_client_diag_dry_update(g_client);   /* evaluator, SAME cache */
-                uint16_t dry = peek_miss_count;
-                char dbuf[120]; int doff = 0;
-                uint16_t dn = dry < 8 ? dry : 8;
-                for (uint16_t k = 0; k < dn && doff < (int)sizeof(dbuf) - 12; k++)
-                    doff += snprintf(dbuf + doff, sizeof(dbuf) - doff, " %08lX",
-                                     (unsigned long)peek_miss_addrs[k]);
-                LOG_DBG("DEBUG=DRY-DIAG dry_miss=%u verdict=%s:%s\r\n",
-                          (unsigned)dry,
-                          dry > 0 ? "LOGIC-DIVERGENCE" : "frame-latency(resolver-ok)",
-                          dbuf);
-                peek_miss_count     = 0;          /* discard the dry-UPDATE's misses */
-                g_update_miss_count = umc_save;   /* don't perturb the gate */
-            }
         }
     }
 
@@ -3669,25 +3339,6 @@ static void send_addr_query_response(void) {
         }
     }
 
-    /* GALAXY-FREEZE forensics: garbage pointers (read in-flux during a galaxy load)
-     * resolve to LOW addresses (a pointer read as ~0, + offset). The ra-module
-     * Swi_MLoad's every queried address from PPC RAM; a wild low/unmapped address
-     * is the prime suspect for the Starlet fault -> IOS hang -> freeze. Flag the
-     * low ones so the last ADDR_QUERY before a freeze names the culprit. */
-    {
-        uint16_t n_low = 0, n_high = 0;
-        uint32_t min_qa = 0xFFFFFFFFu, max_qa = 0;
-        for (uint16_t i = 0; i < round_count; i++) {
-            uint32_t a = query_addrs[pending_query_start + i];
-            if (a < min_qa) min_qa = a;
-            if (a > max_qa) max_qa = a;
-            if (a < 0x00100000u) { if (n_low  < 6) LOG_DBG("DEBUG=LOWQA=0x%08lX\r\n",  (unsigned long)a); n_low++;  }
-            if (a > 0x13000000u) { if (n_high < 6) LOG_DBG("DEBUG=HIGHQA=0x%08lX\r\n", (unsigned long)a); n_high++; }
-        }
-        LOG_DBG("DEBUG=ADDR_QUERY round=%u min=0x%08lX max=0x%08lX n_low=%u n_high=%u\r\n",
-                (unsigned)round_count, (unsigned long)min_qa, (unsigned long)max_qa,
-                (unsigned)n_low, (unsigned)n_high);
-    }
 
     addr_query_pending = true;
     uint16_t payload_len = sizeof(ra_addr_query_t) + round_count * 4;
@@ -3823,6 +3474,43 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             // RA knows, exactly like Dolphin. The game-ID table remains the
             // fallback for physical discs / unsupported image formats.
             if (rx_len < sizeof(ra_gc_header_t) + RA_GAME_ID_LEN) break;
+
+            /* Not ready yet (still connecting/logging in/portal): don't start a
+             * load that loop() can't run — just echo the current status so the
+             * frontend can tell the user what the adapter is waiting for.
+             * (WiiFlow waits for status >= LOGGED_IN before sending LOAD_GAME,
+             * so this is a belt-and-suspenders guard for other frontends.) */
+            if ((uint8_t)state < RA_STATUS_LOGGED_IN || state == STATE_PORTAL) {
+                LOG_ERR("ERROR=EXI: LOAD_GAME rejected — adapter not ready (state=%02X)\r\n",
+                        (uint8_t)state);
+                ra_esp_header_t resp;
+                resp.magic = RA_MAGIC_ESP_TO_GC;
+                resp.status = (uint8_t)state;
+                resp.event_type = RA_EVT_NONE;
+                resp.event_count = 0;
+                resp.data_len = 0;
+                exi_spi_prepare_response((uint8_t*)&resp, sizeof(resp));
+                break;
+            }
+
+            /* No WiFi at load time (router died after boot): fail fast with a
+             * specific code instead of letting the login HTTP time out. loop()'s
+             * reconnect loop keeps retrying in the background; a later
+             * LOAD_GAME retry is accepted (error states pass the guard above). */
+            if (WiFi.status() != WL_CONNECTED) {
+                LOG_ERR("ERROR=EXI: LOAD_GAME with WiFi down — reporting ERROR_WIFI\r\n");
+                state = STATE_ERROR_WIFI;
+                snd_request(SND_ERROR);
+                ra_esp_header_t resp;
+                resp.magic = RA_MAGIC_ESP_TO_GC;
+                resp.status = (uint8_t)state;
+                resp.event_type = RA_EVT_NONE;
+                resp.event_count = 0;
+                resp.data_len = 0;
+                exi_spi_prepare_response((uint8_t*)&resp, sizeof(resp));
+                break;
+            }
+
             const uint8_t *p = rx_data + sizeof(ra_gc_header_t);
             char gid[RA_GAME_ID_LEN + 1];
             memcpy(gid, p, RA_GAME_ID_LEN);
@@ -3861,7 +3549,8 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 } else {
                     LOG_ERR("ERROR=No hash for Wii game ID %s (no console hash either)\r\n", gid);
                     gameId = String(gid);
-                    state = STATE_ERROR;
+                    state = STATE_ERROR_UNKNOWN_GAME;  // unidentifiable — RA can't know this game
+                    snd_request(SND_ERROR);   // game won't record achievements
                 }
             }
             
@@ -3881,7 +3570,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             // can be delivered while the watchlist is being built.
             // STATE_GAME_LOADED transitions to STATE_ACTIVE on the first snapshot
             // received from ra-module (i.e. after WiiFlow has booted the game).
-            if (state == STATE_INIT || state == STATE_ERROR) break;
+            if (state == STATE_INIT || state_is_error()) break;
             if (state == STATE_GAME_LOADED) {
                 state = STATE_ACTIVE;
                 g_roots_built = false;   /* rebuild chain-root gate for this game's memrefs */
@@ -5084,6 +4773,12 @@ static void build_and_publish_web_json(void) {
     o += snprintf(buf + o, cap - o, "{\"state\":%u,\"game_id\":%lu,\"title\":\"",
                   (unsigned)state, (unsigned long)(g ? g->id : 0));
     o = web_json_esc(buf, cap, o, g ? g->title : "");
+    /* Game box-art URL (media.retroachievements.org). The BROWSER fetches it
+     * directly from RA's CDN — zero ESP bandwidth. badge_url survives the
+     * payload strip because rcheevos rebuilds it from "ImageIcon" (we only
+     * strip "ImageIconURL"). Empty when no game is loaded. */
+    o += snprintf(buf + o, cap - o, "\",\"img\":\"");
+    o = web_json_esc(buf, cap, o, (g && g->badge_url) ? g->badge_url : "");
     o += snprintf(buf + o, cap - o,
                   "\",\"total\":%lu,\"unlocked\":%lu,\"points_total\":%lu,"
                   "\"points_unlocked\":%lu,\"achievements\":[",
@@ -5123,10 +4818,26 @@ static void build_and_publish_web_json(void) {
 // Game loading - runs on Core 0 when state == STATE_LOADING_GAME
 // ============================================================================
 
+/* rc_client.c diagnostic — parsed-condition census per bucket (sweet-spot). */
+extern "C" void rc_client_diag_cond_census(const rc_client_t*,
+                                           uint32_t*, uint32_t*, uint32_t*);
+
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
-        LOG_ERR("ERROR=rc_client: game load failed: %s\r\n", error_message ? error_message : "?");
-        state = STATE_ERROR;
+        LOG_ERR("ERROR=rc_client: game load failed (%d): %s\r\n", result,
+                error_message ? error_message : "?");
+        /* Map the rcheevos result to a distinct EXI status so WiiFlow can show
+         * the user WHY the load failed instead of a generic error:
+         *   RC_NO_GAME_LOADED — the hash isn't in the RA database (bad dump /
+         *                       unsupported version);
+         *   RC_NO_RESPONSE    — HTTP never got an answer (no internet). */
+        if (result == RC_NO_GAME_LOADED)
+            state = STATE_ERROR_UNKNOWN_GAME;
+        else if (result == RC_NO_RESPONSE)
+            state = STATE_ERROR_WIFI;
+        else
+            state = STATE_ERROR;
+        snd_request(SND_ERROR);
         return;
     }
     LOG_DBG("DEBUG=Game loaded, building initial watchlist...\r\n");
@@ -5247,6 +4958,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         g_watch_high_water = WATCHLIST_HIGH_WATER;   /* legacy default until auth re-arms */
         free(g_phasec_mm_ship);   g_phasec_mm_ship = NULL; g_phasec_mm_total = 0;
         g_pc_reads = g_pc_inv = g_pc_defer = 0;
+        g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0; g_pc_dpskip = 0;   /* Phase D */
         g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0; g_pc_dpskip = 0;   /* Phase D */
         g_rc_lb_stat_active_ok = 0; g_rc_lb_stat_total = 0;   /* lb dirty-eval boot diag */
         free(g_phasec_nodes);     g_phasec_nodes = NULL;
@@ -5443,38 +5155,102 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         }
     }
 
-#ifdef RC_SHADOW_VALUES
-    /* Shadow-array arena: compact PSRAM {value,prior,changed} so the eval reads memref
-     * values densely instead of strided 56-byte structs (MEMBENCH: 13.7x cheaper read;
-     * the lever to crave 60 df/s at 80MHz). Sized to the exact memref count, re-allocated
-     * each game load. rc_shadow_set_arena resets the slot counter; rc_de_build_game (first
-     * do_frame) assigns the slots. Alloc fail -> arena NULL -> eval falls back to struct. */
+    /* U1 leaf-widx cache: size it to the exact modified_memref count (the chains
+     * rc_modified_memref_can_skip walks). Placement is the Phase C SRAM dividend:
+     * with the authoritative mode armed, U1 only serves the ~90 legacy (dp/exotic)
+     * chains per frame, so it lives in PSRAM and returns its 18KB of internal
+     * SRAM to the WiFi/TLS budget (the 2026-07-01 heap=304B network outage was
+     * exactly this budget crossing zero). Without Phase C (no table / emit fail)
+     * U1 is the hot per-chain path again -> INTERNAL SRAM as before. Register
+     * the hooks only on a successful alloc; otherwise leave them NULL so
+     * memref.c keeps the original B2 path (g_rc_leaf_unchanged). */
     {
-        static uint32_t* sv_value = NULL;
-        static uint32_t* sv_prior = NULL;
-        static uint8_t*  sv_changed = NULL;
-        uint32_t svc = rc_client_memref_count(client);
-        free(sv_value);   sv_value = NULL;
-        free(sv_prior);   sv_prior = NULL;
-        free(sv_changed); sv_changed = NULL;
-        if (svc > 0) {
-            sv_value   = (uint32_t*)ps_malloc((size_t)svc * sizeof(uint32_t));
-            sv_prior   = (uint32_t*)ps_malloc((size_t)svc * sizeof(uint32_t));
-            sv_changed = (uint8_t*)ps_malloc((size_t)svc);
+        free(g_u1); g_u1 = NULL; g_u1_cap = 0;
+        g_rc_u1_cached = NULL; g_rc_u1_populate = NULL; g_rc_u1_invalidate = NULL;
+        uint32_t mmc = rc_client_modified_memref_count(client);
+        /* Placement keys on TABLE-READY, not g_phasec_auth (which only arms
+         * when the console fetches — AFTER this point; keying on auth put U1
+         * back in internal SRAM and sank the heap floor to 17.5KB, wii6.log).
+         * Table ready + Wii console → U1 serves ~5 exotic chains → PSRAM is
+         * free SRAM. Table ready + legacy console (Nintendont never fetches)
+         * → U1 serves ALL chains from PSRAM: ~0.3µs/entry on GC-sized sets
+         * (~0.15ms/frame) — acceptable, still far better than no U1. */
+        bool u1_psram = (g_phasec_nodes != NULL && g_phasec_shipped > 0);
+        uint32_t caps = u1_psram ? MALLOC_CAP_SPIRAM
+                                 : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (mmc > 0) {
+            g_u1 = (u1_entry_t*)heap_caps_malloc((size_t)mmc * sizeof(u1_entry_t), caps);
         }
-        if (sv_value && sv_prior && sv_changed) {
-            rc_shadow_set_arena(sv_value, sv_prior, sv_changed, svc);
-            LOG_DBG("DEBUG=shadow arena: %u memrefs, %u KB PSRAM\r\n",
-                    (unsigned)svc, (unsigned)(((size_t)svc * 9) / 1024));
+        if (g_u1) {
+            g_u1_cap = mmc;
+            u1_clear_all();                 /* n=0 everywhere -> all miss until populated */
+            g_rc_u1_cached     = rc_u1_cached;
+            g_rc_u1_populate   = rc_u1_populate;
+            g_rc_u1_invalidate = rc_u1_invalidate;
+            LOG_DBG("DEBUG=U1 cache: %u chains, %u KB %s\r\n",
+                     (unsigned)mmc, (unsigned)((size_t)mmc * sizeof(u1_entry_t) / 1024),
+                     u1_psram ? "PSRAM (Phase C dividend)" : "internal SRAM");
         } else {
-            free(sv_value); sv_value = NULL;
-            free(sv_prior); sv_prior = NULL;
-            free(sv_changed); sv_changed = NULL;
-            rc_shadow_set_arena(NULL, NULL, NULL, 0);   /* shadow off -> struct fallback */
-            LOG_ERR("ERROR=shadow arena alloc failed (%u memrefs) -> shadow disabled\r\n", (unsigned)svc);
+            LOG_ERR("ERROR=U1 cache: alloc(%u chains) failed — U1 OFF, original B2 path\r\n",
+                    (unsigned)mmc);
         }
     }
-#endif
+
+    /* Phase C step-0 census: how many AddAddress chains fit the simple d2x
+     * descriptor shape leaf = read(mask(parent) + const_offset)? Decides the
+     * descriptor format + how much stays on the legacy ADDR_QUERY path
+     * (Nintendont/GameCube keep legacy). One-shot, read-only diagnostic. */
+    {
+        rc_phasec_census_t cs;
+        rc_memrefs_phasec_census(rc_client_get_memrefs(client), &cs);
+        uint32_t elig_all = cs.eligible + cs.eligible_mref_mod;
+        uint32_t pct = cs.mm_indirect ? (elig_all * 100u) / cs.mm_indirect : 0;
+        LOG_DBG("DEBUG=PhaseC census v3: mm=%u indirect=%u elig=%u eligMmod=%u (%u%%) combine=%u | "
+                "inel: dp=%u xform=%u nonmem=%u chain=%u mod=%u op=%u\r\n",
+                (unsigned)cs.mm_total, (unsigned)cs.mm_indirect, (unsigned)cs.eligible,
+                (unsigned)cs.eligible_mref_mod, (unsigned)pct,
+                (unsigned)(cs.mm_total - cs.mm_indirect),
+                (unsigned)cs.inel_parent_dp, (unsigned)cs.inel_parent_xform,
+                (unsigned)cs.inel_parent_nonmem, (unsigned)cs.inel_parent_chain,
+                (unsigned)cs.inel_modifier, (unsigned)cs.inel_op);
+        /* levels = mm->depth + 1 (depth 0 == single-deref chain) */
+        LOG_DBG("DEBUG=PhaseC levels: 1=%u 2=%u 3=%u 4=%u 5=%u 6+=%u | "
+                "leaf bytes: 1=%u 2=%u 3=%u 4=%u | wire=%uB\r\n",
+                (unsigned)cs.depth_hist[0], (unsigned)cs.depth_hist[1],
+                (unsigned)cs.depth_hist[2], (unsigned)cs.depth_hist[3],
+                (unsigned)cs.depth_hist[4],
+                (unsigned)(cs.depth_hist[5] + cs.depth_hist[6] + cs.depth_hist[7]),
+                (unsigned)cs.leaf_bytes_hist[1], (unsigned)cs.leaf_bytes_hist[2],
+                (unsigned)cs.leaf_bytes_hist[3], (unsigned)cs.leaf_bytes_hist[4],
+                (unsigned)cs.eligible_value_bytes);
+        {   /* which ALU ops + parent mask sizes the d2x walker must implement,
+             * and WHAT the non-memref parents are (recall => legacy forever). */
+            static const char* const kOp[18] = {
+                "eq","lt","le","gt","ge","ne","none","mul","div","and",
+                "xor","mod","add","sub","subp","adda","suba","ind" };
+            static const char* const kOpnd[10] = {
+                "addr","delta","const","fp","func","prior","bcd","inv","recall","?" };
+            char buf[192]; int o = 0;
+            for (unsigned s = 0; s < 18; s++)
+                if (cs.op_hist[s] && o < (int)sizeof(buf) - 20)
+                    o += snprintf(buf + o, sizeof(buf) - o, " %s=%u",
+                                  kOp[s], (unsigned)cs.op_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | nonmem:");
+            for (unsigned s = 0; s < 10; s++)
+                if (cs.nonmem_hist[s] && o < (int)sizeof(buf) - 20)
+                    o += snprintf(buf + o, sizeof(buf) - o, " %s=%u",
+                                  kOpnd[s], (unsigned)cs.nonmem_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | psz:");
+            for (unsigned s = 0; s < 32; s++)
+                if (cs.parent_size_hist[s] && o < (int)sizeof(buf) - 16)
+                    o += snprintf(buf + o, sizeof(buf) - o, " sz%u=%u",
+                                  s, (unsigned)cs.parent_size_hist[s]);
+            o += snprintf(buf + o, sizeof(buf) - o, " | rcl=%u cbase=%u",
+                          (unsigned)cs.recall_hops, (unsigned)cs.const_base);
+            LOG_DBG("DEBUG=PhaseC ops:%s\r\n", buf);
+        }
+    }
+
 
     const rc_client_game_t *game = rc_client_get_game_info(client);
     if (game) {
@@ -5490,6 +5266,16 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
              (unsigned)watch_count);
+
+    {   /* Condition census (sweet-spot study): parsed conditions per bucket.
+         * The buckets price differently per frame: ach = dirty-eval-shielded,
+         * lb = ACTIVE triggers run every frame (~10-20x/cond), rp = 1/60. */
+        uint32_t na = 0, nl = 0, nr = 0;
+        rc_client_diag_cond_census(client, &na, &nl, &nr);
+        LOG_INFO("DEBUG=COND-CENSUS ach=%lu lb=%lu rp=%lu total=%lu\r\n",
+                 (unsigned long)na, (unsigned long)nl, (unsigned long)nr,
+                 (unsigned long)(na + nl + nr));
+    }
 
     /* v0.27.1 warm-up: NOW the session exists (startsession fired during
      * begin_load_game), so spectator mode is togglable — not LOCKED. It
@@ -5523,7 +5309,13 @@ static void login_then_load_cb(int result, const char *error_message, rc_client_
     if (result != RC_OK) {
         LOG_ERR("ERROR=RA login failed (%d): %s\r\n", result,
                 error_message ? error_message : "?");
-        state = STATE_ERROR;
+        /* RC_NO_RESPONSE = the HTTP layer never reached the RA server (WiFi up
+         * but no internet, or server unreachable) — that's a connectivity
+         * problem, not a credentials problem. Everything else from the login
+         * API (invalid credentials, expired token, access denied) is a login
+         * failure the user must fix via the config portal. */
+        state = (result == RC_NO_RESPONSE) ? STATE_ERROR_WIFI : STATE_ERROR_LOGIN;
+        snd_request(SND_ERROR);
         return;
     }
     LOG_INFO("DEBUG=Login OK — loading game with hash: %s\r\n", g_pending_hash);
@@ -5944,15 +5736,6 @@ static void process_one_frame() {
          * mk=chains dirtied (0 in steady state with no movement is normal). */
         g_rc_collect_skips = 0; g_rc_collect_walks = 0; g_incr_rebuilds = 0; g_incr_marks = 0;
 
-        /* Every 1000 frames: dump the full cache + LRU ages. Heavy (stalls
-         * SPI for a few seconds) but by 1000 frames we already have enough
-         * FRAME lines to debug; the user accepts the disruption. */
-        static uint32_t last_cache_dump = 0;
-        if (frame_counter - last_cache_dump >= 1000) {
-            last_cache_dump = frame_counter;
-            dump_cache_lru();
-        }
-
         /* Catch-up + profiling telemetry (every 5s). df/s should track the
          * game's ~60 fps. df_us = mean do_frame µs, cm_us = mean
          * collect_missing µs, cm_skip = walks skipped in steady state. If
@@ -5964,14 +5747,7 @@ static void process_one_frame() {
         if (df_now - last_df_log >= 5000) {
             uint32_t dt = df_now - last_df_log;
             uint32_t gf = frame_counter - g_df_prev_gameframe;
-            {
-#ifdef RC_SHADOW_VALUES
-            extern uint32_t g_rc_shadow_count; extern volatile int g_rc_shadow_enabled;
-            unsigned long sv_slots = (unsigned long)g_rc_shadow_count, sv_on = (unsigned long)g_rc_shadow_enabled;
-#else
-            unsigned long sv_slots = 0, sv_on = 0;
-#endif
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu sv=%lu/%lu q=%lu/%lu/%lu\r\n",
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu q=%lu/%lu/%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -5981,10 +5757,8 @@ static void process_one_frame() {
                      (unsigned long)(g_cm_n ? g_cm_us / g_cm_n : 0),
                      (unsigned long)g_cm_n,
                      (unsigned long)g_cm_skipped,
-                     sv_slots, sv_on,
                      (unsigned long)g_q_enq, (unsigned long)g_q_hwm,
                      (unsigned long)g_q_drop);   /* q=enqueued/high-water/dropped */
-            }
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
@@ -6100,56 +5874,6 @@ void taskCore1(void *pvParameters) {
 // ============================================================================
 static void exi_watchdog_task(void *arg);  // defined below loop(); fwd-decl for setup()
 
-#ifndef RA_MEMBENCH
-#define RA_MEMBENCH 1
-#endif
-#if RA_MEMBENCH
-/* Decisive pre-surgery probe for the shadow-array (memref->value -> SRAM) lever.
- * Measures, on the real S3 @80MHz, the read cost the eval pays vs the shadow target,
- * with NO rcheevos changes. Three patterns over ~SMG memref count:
- *   strided_psram = read one u32 out of every 56-byte slot (= the eval reading
- *                   ->value.value from rc_modified_memref_t structs; 56B stride busts
- *                   the 64KB cache at N*56=149KB working set -> true PSRAM cost).
- *   compact_psram = read from an 8-byte-packed array in PSRAM (N*8=21KB FITS cache
- *                   -> shows if compactness alone, via cache residency, is the win).
- *   compact_sram  = same packed array in INTERNAL SRAM (off the MSPI bus -> the
- *                   shadow-array ideal; immune to the 80M bandwidth cut + cache pressure).
- * If strided >> compact_sram the surgery pays (proportional to read volume). If
- * compact_psram already ~= compact_sram, compactness suffices (less invasive: keep
- * the shadow in PSRAM, no SRAM budget fight). If all three ~equal -> eval is CPU-bound,
- * ABORT the surgery (would be another clean-replay). */
-static void ra_membench(void) {
-  const int N = 2666;       /* ~SMG distinct memref count */
-  const int STRIDE = 56;    /* ~sizeof(rc_modified_memref_t): the eval's read stride */
-  const int PASSES = 8;     /* ~reads-per-memref per do_frame (≈8000 reads / ~1336 distinct) */
-  uint8_t*  strided = (uint8_t*)heap_caps_malloc((size_t)N * STRIDE, MALLOC_CAP_SPIRAM);
-  uint32_t* cpsram  = (uint32_t*)heap_caps_malloc((size_t)N * 8, MALLOC_CAP_SPIRAM);
-  uint32_t* csram   = (uint32_t*)heap_caps_malloc((size_t)N * 8, MALLOC_CAP_INTERNAL);
-  if (!strided || !cpsram || !csram) {
-    ralog_printf("MEMBENCH alloc fail strided=%p cpsram=%p csram=%p\n",
-                 (void*)strided, (void*)cpsram, (void*)csram);
-    if (strided) heap_caps_free(strided);
-    if (cpsram) heap_caps_free(cpsram);
-    if (csram) heap_caps_free(csram);
-    return;
-  }
-  for (int i = 0; i < N; i++) { *(volatile uint32_t*)(strided + (size_t)i * STRIDE) = (uint32_t)i; cpsram[i*2] = i; csram[i*2] = i; }
-  volatile uint32_t sink = 0;
-  unsigned long t0, t1, t2, t3;
-  t0 = micros();
-  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += *(uint32_t*)(strided + (size_t)i * STRIDE);
-  t1 = micros();
-  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += cpsram[i*2];
-  t2 = micros();
-  for (int p = 0; p < PASSES; p++) for (int i = 0; i < N; i++) sink += csram[i*2];
-  t3 = micros();
-  ralog_printf("MEMBENCH N=%d passes=%d sink=%u | strided_psram=%luus compact_psram=%luus compact_sram=%luus\n",
-               N, PASSES, (unsigned)sink,
-               (unsigned long)(t1 - t0), (unsigned long)(t2 - t1), (unsigned long)(t3 - t2));
-  heap_caps_free(strided); heap_caps_free(cpsram); heap_caps_free(csram);
-}
-#endif
-
 void setup() {
     /* v0.24.3 — route big allocations to PSRAM. Field forensics showed
      * the INTERNAL heap collapsing to 2.6KB after game load (rcheevos
@@ -6173,7 +5897,16 @@ void setup() {
      * FreeRTOS objects, the UART ring and the WiFi driver allocate
      * with explicit internal caps and are unaffected; our SPI/ISR
      * buffers are static .bss (internal) by construction. */
-    heap_caps_malloc_extmem_enable(256);
+    /* 2026-07-03 SSBM fix: 256 -> 96. At 256, giant sets (SSBM: 339
+     * achievements) leave +68KB of <256B parse-time small allocations in
+     * internal SRAM, collapsing the heap to ~344B in ACTIVE -> every TLS
+     * socket fails -> awards never reach the server (gc.log). SMG proves
+     * the hot eval data already lives in PSRAM (its 1.5MB struct set leaves
+     * only +16KB internal), so 96 moves ONLY parse bookkeeping; SRAM-critical
+     * allocs (task stacks, DMA, addr_hash, log ring) use explicit caps and
+     * bypass this threshold. Validate: SSBM sram-free at game-loaded (expect
+     * ~50-60KB) + SMG bunny-chase A/B vs wii13/wii14 (expect unchanged). */
+    heap_caps_malloc_extmem_enable(96);
 
     /* Big working buffers — allocated AFTER the extmem threshold is set
      * so they land in PSRAM (all ≥256B, task-context-only, never ISR). */
@@ -6232,16 +5965,13 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    ralog_printf("WII-RA-ADAPTER v0.32.2-wsteal (build %s %s)\n", __DATE__, __TIME__);
+    ralog_printf("WII-RA-ADAPTER v0.35.0-bootstatus-%s (build %s %s)\n",
+                 (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
+                 __DATE__, __TIME__);
     /* lever B: arm the per-vblank collect walk budget from boot (also refreshed
      * each vblank). 0 = baseline; >0 = capped. Logged so the A/B run is labelled. */
     g_rc_collect_walk_budget = g_collect_walk_budget;
     ralog_printf("DEBUG=leverB: collect walk budget=%d (0=off)\n", g_collect_walk_budget);
-
-#if RA_MEMBENCH
-    /* one-shot shadow-array feasibility probe (read-only; see ra_membench comment) */
-    ra_membench();
-#endif
 
     // Initialize SPI slave for EXI
     if (!exi_spi_init(NULL)) {
@@ -6250,8 +5980,28 @@ void setup() {
     }
     LOG_DBG("DEBUG=SPI slave initialized\r\n");
 
+    /* Start the EXI servicer BEFORE the WiFi/portal/login phase. Until v0.34
+     * it was created after WiFi connected, so a Wii probing an adapter that
+     * was stuck in the config portal (or waiting for a dead router) saw a
+     * dead device — indistinguishable from "not plugged in". Started here,
+     * IDENTIFY/POLL always answer and the status byte exposes the boot
+     * progress (PORTAL / WIFI_CONNECTING / LOGGING_IN) so WiiFlow can tell
+     * the user exactly what the adapter is waiting for. Pre-ready commands
+     * that need rc_client are rejected by the state guards in processEXI.
+     * (Prio 19 with a vTaskDelay(1) per iteration — the setup flow below
+     * keeps running on the prio-1 loop task.) */
+    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 19, &taskCore1Handle, 1);
+
+#if RA_BUZZER
+    /* Buzzer jingles run on Core 0 (multi-second vTaskDelay chains must never
+     * touch the Core 1 EXI path). Started BEFORE the WiFi block so the portal/
+     * login sounds below already have a consumer. Prio 0 like LED_Task. */
+    xTaskCreatePinnedToCore(soundTask, "SND_Task", 4096, nullptr, 0, nullptr, 0);
+#endif
+
     // WiFi + RA login (same flow as fpga-ra-adapter)
     if (!isConfigured()) {
+        state = STATE_PORTAL;   // visible to the Wii: "configure me first"
         // Heap (not stack: the captive portal's web server is stack-hungry on the
         // 8KB loop task) and constructed HERE, with Serial up — not at static-init.
         WiFiManager* wm = new WiFiManager();
@@ -6265,21 +6015,30 @@ void setup() {
         
         while (!isConfigured()) {
             LOG_DBG("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
+            snd_request(SND_ATTENTION);
             if (wm->startConfigPortal("WII_RA_ADAPTER", "12345678")) {
                 String token = try_login_RA(custom_user.getValue(), custom_pass.getValue());
                 if (token != "null") {
+                    snd_request(SND_SUCCESS);
                     save_configuration_info_eeprom(custom_user.getValue(), custom_pass.getValue());
+                } else {
+                    snd_request(SND_ERROR);   // wifi up but RA rejected the credentials
                 }
             }
         }
     } else {
+        state = STATE_WIFI_CONNECTING;
         WiFi.mode(WIFI_STA);
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
         LOG_DBG("DEBUG=WiFi OK\r\n");
+        state = STATE_LOGGING_IN;
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
             LOG_DBG("DEBUG=RA login OK\r\n");
+            snd_request(SND_SUCCESS);
+        } else {
+            snd_request(SND_ERROR);
         }
     }
 
@@ -6300,8 +6059,8 @@ void setup() {
      * prio 1, preempted the EXI task mid-frame (the residual fire-rate
      * dips that survived the v0.24.0 core split). 19 sits above tcpip
      * and below the WiFi driver (23). Safe: taskCore1 blocks on the SPI
-     * result queue / vTaskDelay every iteration, never busy-spins. */
-    xTaskCreatePinnedToCore(taskCore1, "EXI_Task", 16384, nullptr, 19, &taskCore1Handle, 1);
+     * result queue / vTaskDelay every iteration, never busy-spins.
+     * (Created right after exi_spi_init above, BEFORE the WiFi phase.) */
 
     /* HTTP worker on Core 0, beside the WiFi/lwIP tasks. 12KB stack —
      * TLS+HTTPClient ran for months on loopTask's default 8KB, so 12KB
@@ -6319,7 +6078,10 @@ void setup() {
     /* Achievement-unlock LED celebration. Dedicated task on Core 0 so the
      * RMT-backed neopixelWrite() never stalls the Core 1 EXI realtime path.
      * Prio 0, tiny stack (no rc_client here). */
-    xTaskCreatePinnedToCore(ledCelebrateTask, "LED_Task", 2048, nullptr, 0, nullptr, 0);
+    /* 4096 stack: on the XIAO, led_init()'s pinMode(21) logs through ESP_LOGI
+     * (vfs/printf ~2KB of stack) and OVERFLOWS a 2048 stack → boot loop.
+     * (Recurred 2026-07-04; originally found in the XIAO bring-up.) */
+    xTaskCreatePinnedToCore(ledCelebrateTask, "LED_Task", 4096, nullptr, 0, nullptr, 0);
 
 #if RA_WEB_DASHBOARD
     /* LAN dashboard: mDNS (http://wii-ra.local/) + esp_http_server, pinned to

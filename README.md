@@ -112,6 +112,9 @@ The full path from a stock Wii to achievements popping on screen:
 <center>
 <img src="images/pcb-xiao.png" width="50%" alt="Compact XIAO ESP32S3 adapter PCB">
 </center>
+<p>Disclaimer: We ordered but not tested yet</p>
+<p>
+Thanks <b>Sage2050</b> for design the PCB - <a href="https://github.com/sage2050/Wii_RA">https://github.com/sage2050/Wii_RA</a></p>
 
 
 Optionally add a **passive buzzer** (DevKit: GPIO9 / XIAO: D3) for unlock jingles. Everything runs at 3.3 V — never feed 5 V into the memory card lines.

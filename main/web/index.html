@@ -129,6 +129,7 @@
   </main>
   <footer>Wii RA Adapter · live dashboard</footer>
   <div id="toasts"></div>
+  <audio id="snd" src="/snd.mp3" preload="auto"></audio>
 
   <script>
     const $ = id => document.getElementById(id);
@@ -232,14 +233,9 @@
 
     function beep(){
       try{
-        const c = new (window.AudioContext||window.webkitAudioContext)();
-        const o = c.createOscillator(), g = c.createGain();
-        o.connect(g); g.connect(c.destination);
-        o.type='triangle'; o.frequency.setValueAtTime(880,c.currentTime);
-        o.frequency.setValueAtTime(1320,c.currentTime+0.12);
-        g.gain.setValueAtTime(0.25,c.currentTime);
-        g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.4);
-        o.start(); o.stop(c.currentTime+0.4);
+        const au = $('snd');
+        au.currentTime = 0;
+        au.play().catch(()=>{});
       }catch(e){}
     }
 

@@ -28,7 +28,7 @@
 
 /* >>> SELECT THE TARGET BOARD HERE <<< */
 #ifndef BOARD_VARIANT
-#define BOARD_VARIANT  BOARD_XIAO
+#define BOARD_VARIANT  BOARD_DEV
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -80,19 +80,6 @@
 
 #else
   #error "board_config.h: BOARD_VARIANT must be BOARD_DEV or BOARD_XIAO"
-#endif
-
-/* ---------------------------------------------------------------------------
- * Buzzer type (applies to whichever board is selected above)
- *
- *   1 = ACTIVE buzzer  — has an internal oscillator with a FIXED pitch; the
- *       GPIO only gates it on/off (via the driver transistor). Note frequencies
- *       are ignored, so the jingles play as rhythm patterns of beeps.
- *   0 = PASSIVE buzzer/piezo — no internal oscillator; LEDC PWM generates each
- *       note's frequency on the pin, so the jingles play as real melodies.
- * ------------------------------------------------------------------------- */
-#ifndef BUZZER_ACTIVE
-#define BUZZER_ACTIVE  1
 #endif
 
 #endif /* BOARD_CONFIG_H */

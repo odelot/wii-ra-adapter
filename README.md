@@ -102,11 +102,17 @@ The full path from a stock Wii to achievements popping on screen:
 
 **Option A — hand-wired dev board.** Solder wires from a memory card connector to the ESP32-S3 DevKit following the table in the [Hardware](#hardware) section above:
 
-![Memory card to ESP32-S3 DevKit wiring](images/wiring-devkit.png)
+<center>
+<img src="images/wiring-devkit.png" width="50%" alt="Memory card to ESP32-S3 DevKit wiring">
+</center>
+
 
 **Option B — compact PCB.** A miniaturized board that carries a XIAO ESP32S3 and slots straight into the memory card port:
 
-![Compact XIAO ESP32S3 adapter PCB](images/pcb-xiao.png)
+<center>
+<img src="images/pcb-xiao.png" width="50%" alt="Compact XIAO ESP32S3 adapter PCB">
+</center>
+
 
 Optionally add a **passive buzzer** (DevKit: GPIO9 / XIAO: D3) for unlock jingles. Everything runs at 3.3 V — never feed 5 V into the memory card lines.
 

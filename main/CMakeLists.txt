@@ -18,6 +18,8 @@ idf_component_register(
         mdns
     # LAN dashboard (ra_web): single-file HTML embedded into flash, served at "/".
     EMBED_TXTFILES "web/index.html"
+    # Unlock jingle played by the dashboard page, served at "/snd.mp3".
+    EMBED_FILES "web/snd.mp3"
 )
 
 # main.cpp is the Arduino .ino (lenient Arduino warning level). IDF's -Werror=all

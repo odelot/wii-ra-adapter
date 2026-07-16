@@ -21,6 +21,11 @@ static const char *TAG = "ra_web";
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[]   asm("_binary_index_html_end");
 
+/* Unlock jingle, embedded from main/web/snd.mp3 (EMBED_FILES — binary, no
+ * null terminator, so the length MUST come from the start/end symbols). */
+extern const char snd_mp3_start[] asm("_binary_snd_mp3_start");
+extern const char snd_mp3_end[]   asm("_binary_snd_mp3_end");
+
 /* Small header snapshot, guarded by a cross-core spinlock. Core 1 holds it only
  * for a ~150-byte struct copy — negligible for do_frame. Used as the /api/state
  * fallback until the full achievement JSON exists (before a phone connects). */
@@ -334,6 +339,13 @@ static esp_err_t root_get(httpd_req_t *req)
     return httpd_resp_send(req, index_html_start, len);
 }
 
+static esp_err_t snd_get(httpd_req_t *req)
+{
+    const size_t len = (size_t)(snd_mp3_end - snd_mp3_start);
+    httpd_resp_set_type(req, "audio/mpeg");
+    return httpd_resp_send(req, snd_mp3_start, len);
+}
+
 static esp_err_t state_get(httpd_req_t *req)
 {
     s_last_fetch_ms = now_ms();
@@ -418,6 +430,12 @@ void ra_web_init(void)
     st.method = HTTP_GET;
     st.handler = state_get;
 
+    httpd_uri_t snd;
+    memset(&snd, 0, sizeof(snd));
+    snd.uri = "/snd.mp3";
+    snd.method = HTTP_GET;
+    snd.handler = snd_get;
+
     httpd_uri_t ws;
     memset(&ws, 0, sizeof(ws));
     ws.uri = "/ws";
@@ -427,6 +445,7 @@ void ra_web_init(void)
 
     httpd_register_uri_handler(s_server, &root);
     httpd_register_uri_handler(s_server, &st);
+    httpd_register_uri_handler(s_server, &snd);
     httpd_register_uri_handler(s_server, &ws);
 
     /* Live-push plumbing: event queue (Core 1 → Core 0) + the sender task on

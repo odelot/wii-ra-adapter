@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <stdlib.h>   /* qsort (chain-root gate) */
+#include <ctype.h>    /* isxdigit (chunked-header sniff, small-response path) */
 /**
  * wii-ra-adapter.ino
  *
@@ -1013,6 +1014,22 @@ extern "C" int doframe_primed_cb(void) {
         }
     }
     return 1;
+}
+
+/* Bitwise CRC32 (poly 0xEDB88320, reflected, init/final 0xFFFFFFFF) for the
+ * chunked-response trailer (v0.35.2 — see gc_ra_protocol.h). Must match the
+ * d2x module's ra_crc32 byte for byte. Bitwise on purpose: keeps the two
+ * implementations trivially comparable; cost (~µs for 4KB at 240MHz) is
+ * irrelevant at chunk-fetch cadence. */
+static uint32_t ra_crc32_calc(const uint8_t *p, uint32_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= p[i];
+        for (uint32_t b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
 }
 
 // Dedicated watchlist buffer for chunked delivery
@@ -2484,19 +2501,68 @@ static void server_call_blocking(const http_job_t *job) {
         int total_read = 0;
         uint32_t deadline = millis() + 15000;
         uint32_t last_rx_ms = millis();   // stall guard (same TLS-drop rationale as patch path)
-        while ((https.connected() || stream->available()) && millis() < deadline) {
-            vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
-            int avail = stream->available();
-            if (avail > 0) {
-                int n = stream->readBytes(chunk, min(avail, (int)sizeof(chunk)));
-                responseStr.concat((const char*)chunk, n);
-                total_read += n;
-                last_rx_ms = millis();
-            } else {
-                delay(1);
+        bool identity = (contentLen > 0);
+
+        if (!identity) {
+            /* No Content-Length → chunked transfer encoding. The RA server
+             * started chunking small responses too (startsession, 2026-07);
+             * fed raw, the framing reached rc_client as "12b\r\n{...}" →
+             * RC_INVALID_JSON (-26). Same manual de-chunking as the patch
+             * path above. Guard: if the FIRST header line is not a hex
+             * chunk size (connection-close identity body), keep the bytes
+             * already consumed and drain the rest via the raw loop below. */
+            int empty_hdrs = 0;   // fast TLS-death detector (see patch path)
+            bool first_hdr = true;
+            while (millis() < deadline) {
+                vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
+                if (!https.connected() && !stream->available()) break;
+                if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
+                String raw_hdr = stream->readStringUntil('\n');
+                String chunk_hdr = raw_hdr;
+                chunk_hdr.trim();
+                if (chunk_hdr.length() == 0) {
+                    if (++empty_hdrs > 64) break;   // dead fd returns instantly
+                    continue;
+                }
+                empty_hdrs = 0;
+                if (first_hdr && !isxdigit((unsigned char)chunk_hdr[0])) {
+                    responseStr += raw_hdr;
+                    responseStr += '\n';   // readStringUntil consumed the LF
+                    total_read = responseStr.length();
+                    identity = true;
+                    break;
+                }
+                first_hdr = false;
+                int chunk_sz = (int)strtol(chunk_hdr.c_str(), NULL, 16);
+                if (chunk_sz == 0) break;  // final chunk
+                int remaining = chunk_sz;
+                while (remaining > 0 && millis() < deadline) {
+                    vTaskDelay(1);
+                    int n = stream->readBytes(chunk,
+                                (size_t)min(remaining, (int)sizeof(chunk)));
+                    if (n > 0) { responseStr.concat((const char*)chunk, n); total_read += n; remaining -= n; last_rx_ms = millis(); }
+                    else if (!https.connected()) break;
+                    if (millis() - last_rx_ms > 4000) break;
+                }
+                stream->readStringUntil('\n');  // consume trailing CRLF
             }
-            if (contentLen > 0 && total_read >= contentLen) break;
-            if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
+        }
+
+        if (identity) {
+            while ((https.connected() || stream->available()) && millis() < deadline) {
+                vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
+                int avail = stream->available();
+                if (avail > 0) {
+                    int n = stream->readBytes(chunk, min(avail, (int)sizeof(chunk)));
+                    responseStr.concat((const char*)chunk, n);
+                    total_read += n;
+                    last_rx_ms = millis();
+                } else {
+                    delay(1);
+                }
+                if (contentLen > 0 && total_read >= contentLen) break;
+                if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
+            }
         }
         LOG_DBG("DEBUG=HTTP body: declared=%d received=%d\r\n", contentLen, total_read);
 
@@ -4129,9 +4195,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     (unsigned)(sizeof(ra_esp_header_t) + resp_data_len),
                     (unsigned)total_len);
 
-            uint8_t *buf = (uint8_t*)malloc(total_len);
+            uint8_t *buf = (uint8_t*)malloc(total_len + 4);   /* +4: CRC32 trailer */
             if (!buf) {
-                LOG_ERR("DEBUG=GET_CHUNK: malloc(%u) FAILED\n", (unsigned)total_len);
+                LOG_ERR("DEBUG=GET_CHUNK: malloc(%u) FAILED\n", (unsigned)(total_len + 4));
                 break;
             }
 
@@ -4183,7 +4249,16 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 LOG_DBG("%s\r\n", hb);
             }
 
-            exi_spi_prepare_response(buf, total_len);
+            /* CRC32 trailer (v0.35.2) over [esp_hdr .. payload end] — see
+             * gc_ra_protocol.h. Appended after the payload, so pre-CRC
+             * consumers (older d2x, Nintendont) simply never clock it. */
+            {
+                uint32_t crc_be = ra_host_to_be32(ra_crc32_calc(
+                        buf + GC_WRITE_PADDING,
+                        sizeof(ra_esp_header_t) + resp_data_len));
+                memcpy(buf + total_len, &crc_be, 4);
+            }
+            exi_spi_prepare_response(buf, total_len + 4);
             free(buf);
             if (is_last) g_watchlist_pending = false;
             break;
@@ -4221,9 +4296,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                                             + sizeof(ra_chain_chunk_req_t); /* 6 */
             uint32_t total_len = GC_WRITE_PADDING + sizeof(ra_esp_header_t)
                                                   + resp_data_len;
-            uint8_t *buf = (uint8_t*)malloc(total_len);
+            uint8_t *buf = (uint8_t*)malloc(total_len + 4);   /* +4: CRC32 trailer */
             if (!buf) {
-                LOG_ERR("ERROR=CHAIN_CHUNK: malloc(%u) FAILED\r\n", (unsigned)total_len);
+                LOG_ERR("ERROR=CHAIN_CHUNK: malloc(%u) FAILED\r\n", (unsigned)(total_len + 4));
                 break;
             }
             memset(buf, 0xFF, GC_WRITE_PADDING);
@@ -4246,6 +4321,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 
             uint8_t *out = buf + GC_WRITE_PADDING + sizeof(ra_esp_header_t)
                                + sizeof(ra_chain_chunk_t);
+            unsigned serve_bad = 0;
             for (uint16_t i = 0; i < n_in_chunk; i++) {
                 const rc_phasec_node_t *nd = &g_phasec_nodes[start + i];
                 uint32_t ob = ra_host_to_be32(nd->operand);
@@ -4254,12 +4330,41 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                 memcpy(out + 4, &pb, 2);
                 out[6] = nd->op;
                 out[7] = nd->psize;
+                /* DIAG 2026-07-18: re-validate at SERVE time with the module's
+                 * rules and dump the exact wire bytes. EMIT clean + SERVE bad
+                 * = PSRAM corruption between load and serve; both clean while
+                 * the module still errs = wire-level corruption (compare the
+                 * module's "CHN i=N b=..." dump against this line). */
+                uint8_t vop = nd->op & 0x1F;
+                bool op_ok = (vop == (uint8_t)RA_CN_OP_NONE) ||
+                             (vop == (uint8_t)RA_CN_OP_DEREF) ||
+                             (vop >= (uint8_t)RA_CN_OP_MULT &&
+                              vop <= (uint8_t)RA_CN_OP_SUB_ACC);
+                bool par_ok = (nd->parent == RC_PHASEC_PARENT_NONE) ||
+                              (nd->parent < start + i);
+                if (!op_ok || !par_ok) {
+                    if (serve_bad < 4)
+                        LOG_ERR("ERROR=PhaseC SERVE-INVALID node=%u wire=%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
+                                (unsigned)(start + i), out[0], out[1], out[2],
+                                out[3], out[4], out[5], out[6], out[7]);
+                    serve_bad++;
+                }
                 out += RA_CHAIN_NODE_SIZE;
             }
+            if (serve_bad)
+                LOG_ERR("ERROR=PhaseC SERVE-INVALID total=%u in chunk %u\r\n",
+                        serve_bad, chunk_idx);
 
             LOG_DBG("DEBUG=CHAIN_CHUNK req: idx=%u n=%u total=%u last=%u\r\n",
                     chunk_idx, n_in_chunk, (unsigned)total, is_last);
-            exi_spi_prepare_response(buf, total_len);
+            /* CRC32 trailer (v0.35.2) — same spec as the watchlist chunk. */
+            {
+                uint32_t crc_be = ra_host_to_be32(ra_crc32_calc(
+                        buf + GC_WRITE_PADDING,
+                        sizeof(ra_esp_header_t) + resp_data_len));
+                memcpy(buf + total_len, &crc_be, 4);
+            }
+            exi_spi_prepare_response(buf, total_len + 4);
             free(buf);
 
             /* CAPABILITY NEGOTIATION: the console just fetched the whole
@@ -4991,6 +5096,33 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
                 LOG_DBG("DEBUG=PhaseC table: nodes=%u (%uB) shipped=%u blob=%uB refused=%u\r\n",
                         (unsigned)n, (unsigned)(n * sizeof(rc_phasec_node_t)),
                         (unsigned)shipped, (unsigned)blob, (unsigned)refused);
+                /* DIAG 2026-07-18 (module CHN err=106 on Kirby): validate the
+                 * emitted table against the d2x walker's EXACT acceptance
+                 * rules. Any hit = emitter bug (recall census?); silence =
+                 * the table left the emitter clean. */
+                {
+                    unsigned bad = 0;
+                    for (uint32_t vi = 0; vi < n; vi++) {
+                        const rc_phasec_node_t* vn = &nodes[vi];
+                        uint8_t vop = vn->op & 0x1F;
+                        bool op_ok = (vop == (uint8_t)RA_CN_OP_NONE) ||
+                                     (vop == (uint8_t)RA_CN_OP_DEREF) ||
+                                     (vop >= (uint8_t)RA_CN_OP_MULT &&
+                                      vop <= (uint8_t)RA_CN_OP_SUB_ACC);
+                        bool par_ok = (vn->parent == RC_PHASEC_PARENT_NONE) ||
+                                      (vn->parent < vi);
+                        if (!op_ok || !par_ok) {
+                            if (bad < 4)
+                                LOG_ERR("ERROR=PhaseC EMIT-INVALID node=%u op=%02X psize=%02X parent=%u operand=%08X\r\n",
+                                        (unsigned)vi, vn->op, vn->psize,
+                                        (unsigned)vn->parent, (unsigned)vn->operand);
+                            bad++;
+                        }
+                    }
+                    if (bad)
+                        LOG_ERR("ERROR=PhaseC EMIT-INVALID total=%u of %u nodes\r\n",
+                                bad, (unsigned)n);
+                }
                 /* Shadow-ingestion side arrays: shipped<->node maps, blob
                  * prefix offsets, validity/fresh bitmaps, slot blob. Any
                  * alloc failure disables ingestion (blob NULL gates it). */
@@ -5965,7 +6097,7 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    ralog_printf("WII-RA-ADAPTER v0.35.0-bootstatus-%s (build %s %s)\n",
+    ralog_printf("WII-RA-ADAPTER v0.35.2-crc-%s (build %s %s)\n",
                  (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
                  __DATE__, __TIME__);
     /* lever B: arm the per-vblank collect walk budget from boot (also refreshed

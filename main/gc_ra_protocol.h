@@ -390,6 +390,16 @@ typedef struct __attribute__((packed)) {
 /**
  * RA_CMD_GET_WATCHLIST_CHUNK response header
  * Followed by up to RA_WATCHLIST_CHUNK_ADDRS × uint32_t addresses (big-endian)
+ *
+ * CRC32 TRAILER (ESP fw v0.35.2+): both chunked responses (watchlist and
+ * chain) append a CRC32 — poly 0xEDB88320, reflected, init/final 0xFFFFFFFF
+ * — big-endian AFTER the payload, covering [ra_esp_header_t .. payload end].
+ * esp_header.data_len does NOT include it. Backward compatible: consumers
+ * that don't read the trailer simply never clock those 4 bytes; consumers
+ * that verify it (d2x 2026-07-18+) REQUIRE ESP fw v0.35.2+ or every fetch
+ * fails CRC. Rationale: the 4KB chunk reads are the longest EXI transfers
+ * and field-corrupted once (CHN err=106); the CRC turns silent tail
+ * corruption into a retryable error.
  */
 typedef struct __attribute__((packed)) {
     uint16_t chunk_index;       /* echoes the requested chunk index */
@@ -538,7 +548,9 @@ typedef struct __attribute__((packed)) {
 } ra_chain_chunk_req_t;
 
 /** RA_CMD_GET_CHAIN_CHUNK response header, followed by node_count nodes.
- *  node_count == 0 on chunk 0 => no table for this game (Phase C off). */
+ *  node_count == 0 on chunk 0 => no table for this game (Phase C off).
+ *  ESP fw v0.35.2+ appends a CRC32 trailer after the nodes — see
+ *  ra_watchlist_chunk_t above for the exact spec. */
 typedef struct __attribute__((packed)) {
     uint16_t chunk_index;    /* echoes the requested index */
     uint16_t node_count;     /* nodes in THIS chunk */

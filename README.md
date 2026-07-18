@@ -6,6 +6,8 @@ The wii-ra-adapter is an ESP32-S3 firmware. The board plugs into the Wii's GameC
 
 This is the Wii/GameCube member of a family of adapters that started with the [nes-ra-adapter](https://github.com/odelot/nes-ra-adapter).
 
+> **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/baM7y3xbsA)) go a long way.
+
 > **This repository is the distribution point**: releases here bundle the binaries of **all four projects** needed for a working setup (ESP32 firmware + WiiFlow Lite + d2x cIOS + Nintendont).
 
 ## The four projects
@@ -119,6 +121,8 @@ Thanks <b>Sage2050</b> for design the PCB - <a href="https://github.com/sage2050
 
 Optionally add a **passive buzzer** (DevKit: GPIO9 / XIAO: D3) for unlock jingles. Everything runs at 3.3 V — never feed 5 V into the memory card lines.
 
+**Power**: the memory card slot does **not** power the ESP32-S3 — the board needs its own power through the USB-C port. The Wii's own USB ports work fine as a source, and so does any other 5 V USB supply (phone charger, power bank, etc.).
+
 ### 2. Flash the ESP32-S3 firmware
 
 1. Download the release zip from the [Releases](../../releases) section and open the `firmware/` folder for **your board** (`esp32-s3-devkit` or `xiao-esp32s3`).
@@ -165,7 +169,7 @@ Also install games as you normally would (USB drive, SD card, or real discs — 
 ### 6. Turn the adapter on for the first time
 
 1. With the Wii turned **off**, insert the adapter into GameCube memory card **Slot B**.
-2. Power the ESP32-S3 through its USB-C port — the Wii's own USB ports work fine as a power source.
+2. Power the ESP32-S3 through its USB-C port (the memory card slot does not power the board) — the Wii's own USB ports work fine as a power source, or use any 5 V USB charger.
 3. Turn on the Wii.
 4. On your phone or tablet, open the Wi-Fi settings and connect to the network **`WII_RA_ADAPTER`** (password: **`12345678`**).
 5. A configuration portal opens automatically (if it doesn't, browse to `http://192.168.1.1`). There:
@@ -193,6 +197,7 @@ Then just launch a game. The loader shows the boot progress on screen (detecting
 - **Login or download errors on boot** — the boot status line tells you which stage failed (Wi-Fi, login, game download). Wrong credentials? Reset them from WiiFlow's Settings and redo step 6.
 - **A game identifies but has no achievements** — the game needs an achievement set on retroachievements.org, and your dump must match the RA database hash. For Wii games in particular, **scrubbed WBFS images hash incorrectly** — use accurate (unscrubbed) dumps.
 - **Live status** — while playing, open `http://wii-ra.local/` from any device on your network to watch the adapter in real time (see below).
+- **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/baM7y3xbsA).
 
 ### Live web dashboard
 
@@ -215,6 +220,10 @@ wii-ra-adapter-vX.Y.Z.zip
 ```
 
 Sources for the console-side projects live in their own repositories (forks of [wiidev/d2x-cios](https://github.com/wiidev/d2x-cios), [WiiFlow Lite](https://github.com/Fledge68/WiiFlow_Lite) and [FIX94's Nintendont](https://github.com/FIX94/Nintendont)).
+
+## Support & community
+
+Questions about the installation, something not working as expected, or found a bug? Open an [issue](../../issues) or join the community on [Discord](https://discord.gg/baM7y3xbsA).
 
 ## Credits
 

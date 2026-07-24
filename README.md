@@ -6,7 +6,7 @@ The wii-ra-adapter is an ESP32-S3 firmware. The board plugs into the Wii's GameC
 
 This is the Wii/GameCube member of a family of adapters that started with the [nes-ra-adapter](https://github.com/odelot/nes-ra-adapter).
 
-> **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/57v2GPHMx6)) go a long way.
+> **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/6eYGq7NNfF)) go a long way.
 
 > **This repository is the distribution point**: releases here bundle the binaries of **all four projects** needed for a working setup (ESP32 firmware + WiiFlow Lite + d2x cIOS + Nintendont).
 
@@ -197,7 +197,7 @@ Then just launch a game. The loader shows the boot progress on screen (detecting
 - **Login or download errors on boot** — the boot status line tells you which stage failed (Wi-Fi, login, game download). Wrong credentials? Reset them from WiiFlow's Settings and redo step 6.
 - **A game identifies but has no achievements** — the game needs an achievement set on retroachievements.org, and your dump must match the RA database hash. For Wii games in particular, **scrubbed WBFS images hash incorrectly** — use accurate (unscrubbed) dumps.
 - **Live status** — while playing, open `http://wii-ra.local/` from any device on your network to watch the adapter in real time (see below).
-- **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/57v2GPHMx6).
+- **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/6eYGq7NNfF).
 
 ### Live web dashboard
 

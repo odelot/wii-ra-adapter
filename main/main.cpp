@@ -2282,17 +2282,98 @@ static void http_finish(const http_job_t *job, const char *body, size_t body_len
     }
 }
 
-// HTTP blocking worker body (runs ONLY on httpTask, Core 0).
-static void server_call_blocking(const http_job_t *job) {
-    // Large responses: rcheevos 11.x uses r=patch, 12.x uses r=achievementsets.
-    // Both can be ~500-700KB for games like SSBM.
-    // rcheevos puts these in the URL as query params (not in post_data).
-    bool is_patch = (strstr(job->url, "r=patch")           != nullptr) ||
-                    (strstr(job->url, "r=achievementsets")  != nullptr) ||
-                    (job->post_data && strstr(job->post_data, "r=patch")           != nullptr) ||
-                    (job->post_data && strstr(job->post_data, "r=achievementsets") != nullptr);
-    LOG_DBG("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch, job->url, job->post_data);
+/* ---- v0.36.0 HTTP resilience ----------------------------------------------
+ * Field failure 2026-08-22: mbedTLS -29184 "invalid SSL record" mid-
+ * achievementsets → the Arduino core closes the socket from inside
+ * available(), but the download loop was sitting in Stream::readBytes /
+ * readStringUntil. Those wait INSIDE the core (NetworkClient::readBytes'
+ * delay(2) wait-loop runs for the full 15s stream timeout per call, re-arming
+ * SO_RCVTIMEO on the dead fd every pass → the "setSocketOption(): fail on 0,
+ * errno: 9" flood at ~4ms/line), so the old stall guard — which only ran
+ * BETWEEN Stream calls — never fired and IDLE0 starved (task_wdt). Worse, the
+ * abort path dropped the rc_client callback: state stuck at LOADING_GAME with
+ * load_started=true, so WiiFlow's LOAD_GAME retries were no-ops → only a
+ * power cycle recovered. Three rules now:
+ *  1. All waiting happens HERE (http_drain_body): the client is only asked
+ *     for bytes it already has (available() > 0), so a dead TLS fd costs one
+ *     log line, not 15s of flood.
+ *  2. Completeness is judged from the CONTENT framing (Content-Length match /
+ *     chunked terminal 0-chunk), never from transport state — a mid-stream
+ *     TLS drop and a normal connection-close end look identical at the
+ *     socket.
+ *  3. A callback is ALWAYS delivered. Transport failures retry up to
+ *     HTTP_MAX_ATTEMPTS on a fresh socket first (same philosophy as the
+ *     v0.35.2 EXI CRC retry×3), then report RETRYABLE_CLIENT_ERROR so
+ *     rc_client fails the pending login/load (loop() re-arms load_started →
+ *     the next LOAD_GAME restarts clean) and arms its own backoff retry for
+ *     award/lb submissions (robustness audit 2026-07-10 item #1: lost
+ *     unlocks). */
 
+/* Drain the response body into dst. want = expected byte count (Content-
+ * Length), or -1 to read until the peer closes. Returns bytes read; *aborted
+ * is set on a no-progress stall or deadline (definitely abnormal — a clean
+ * close just returns and the caller judges the framing). */
+static size_t http_drain_body(WiFiClient *s, uint8_t *dst, size_t cap, int want,
+                              uint32_t stall_ms, uint32_t deadline, bool *aborted) {
+    size_t got = 0;
+    uint32_t last_rx = millis();
+    *aborted = false;
+    while ((want < 0 || got < (size_t)want) && got < cap) {
+        int avail = s->available();   /* secure client: decrypts buffered records;
+                                       * on a TLS error it closes itself here */
+        if (avail > 0) {
+            size_t ask = (size_t)avail;
+            if (ask > cap - got) ask = cap - got;
+            if (want >= 0 && ask > (size_t)want - got) ask = (size_t)want - got;
+            if (ask > 4096) ask = 4096;              /* yield at least every 4KB */
+            int n = s->read(dst + got, ask);
+            if (n > 0) { got += (size_t)n; last_rx = millis(); }
+            else if (n < 0) break;    /* error despite avail>0: client is broken */
+        } else if (!s->connected()) {
+            break;                    /* peer closed / TLS torn down */
+        }
+        if (millis() - last_rx > stall_ms || millis() >= deadline) {
+            *aborted = true;
+            break;
+        }
+        vTaskDelay(1);                /* feed IDLE0 (TWDT) */
+    }
+    return got;
+}
+
+/* De-chunk a fully buffered "Transfer-Encoding: chunked" body in place.
+ * Returns the assembled payload length; *terminal = the 0-size final chunk
+ * was present — the only reliable proof the download wasn't cut short.
+ * buf must be NUL-terminated at len (setLength/manual '\0' does it). */
+static size_t http_dechunk_in_place(char *buf, size_t len, bool *terminal) {
+    size_t rd = 0, wr = 0;
+    *terminal = false;
+    while (rd < len) {
+        while (rd < len && (buf[rd] == '\r' || buf[rd] == '\n')) rd++;  /* chunk-boundary CRLF */
+        if (rd >= len) break;
+        char *end = NULL;
+        long sz = strtol(buf + rd, &end, 16);
+        if (end == buf + rd || sz < 0) break;        /* framing lost — bail */
+        rd = (size_t)(end - buf);
+        while (rd < len && buf[rd] != '\n') rd++;    /* skip chunk extensions */
+        if (rd >= len) break;
+        rd++;                                        /* past the LF */
+        if (sz == 0) { *terminal = true; break; }    /* final chunk (trailers ignored) */
+        size_t take = (size_t)sz;
+        if (rd + take > len) take = len - rd;        /* payload cut short */
+        memmove(buf + wr, buf + rd, take);
+        wr += take; rd += take;
+        if (take != (size_t)sz) break;
+    }
+    return wr;
+}
+
+// HTTP blocking worker body (runs ONLY on httpTask, Core 0).
+/* One request/response attempt. Returns 0 when a response was delivered to
+ * the done-queue (success OR a server-spoken HTTP error status — rc_client's
+ * error handling knows best), -1 on a transport-level failure worth retrying
+ * on a fresh socket (connect/TLS failure, mid-body drop, truncated framing). */
+static int server_call_attempt(const http_job_t *job, bool is_patch) {
     client.setInsecure();
     https.begin(client, String(job->url));
     /* RA's dorequest can be slow; the default 5s read timeout produced
@@ -2316,25 +2397,51 @@ static void server_call_blocking(const http_job_t *job) {
         httpCode = https.GET();
     }
 
-    if (httpCode != HTTP_CODE_OK) {
-        /* Same semantics as the old synchronous path: no callback on HTTP
-         * failure — rcheevos' own retry/ping cadence re-issues the call.
-         * Forensics (error path only): elapsed discriminates fast-fail
-         * (connect/TLS/power-save wakeup) from a genuine read timeout;
-         * heap catches mbedTLS allocation failure (~45KB/session needed);
-         * RSSI/status catch RF or association drops. */
+    if (httpCode <= 0) {
+        /* Transport-level failure (connect/TLS/read timeout) — never reached
+         * an HTTP response; worth retrying on a fresh socket. Forensics:
+         * elapsed discriminates fast-fail (connect/TLS/power-save wakeup)
+         * from a genuine read timeout; heap catches mbedTLS allocation
+         * failure (~45KB/session needed); RSSI/status catch RF drops. */
         LOG_ERR("DEBUG=HTTP error: %d url=%s elapsed=%lums heap=%u maxblk=%u rssi=%d wifi=%d\r\n",
                 httpCode, job->url, (unsigned long)(millis() - req_start_ms),
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (int)WiFi.RSSI(), (int)WiFi.status());
         https.end();
-        return;
+        client.stop();
+        return -1;
     }
 
     int contentLen = https.getSize();  // -1 if chunked/unknown
     LOG_DBG("DEBUG=HTTP ok is_patch=%d content-length=%d psram-free=%u heap-free=%u\r\n",
             (int)is_patch, contentLen, (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+
+    if (httpCode != HTTP_CODE_OK) {
+        /* The server answered with an error status. v0.36.0: deliver it (with
+         * whatever small body it carried — RA errors are JSON with a message)
+         * instead of dropping the callback: rc_client maps 5xx/429 to its own
+         * backoff retry for award/lb submissions and fails login/load visibly. */
+        char err_body[1024];
+        bool aborted = false;
+        size_t elen = http_drain_body(https.getStreamPtr(), (uint8_t *)err_body,
+                                      sizeof(err_body) - 1,
+                                      (contentLen > 0 && contentLen < (int)sizeof(err_body) - 1) ? contentLen : -1,
+                                      2000, millis() + 5000, &aborted);
+        err_body[elen] = '\0';
+        if (contentLen < 0 && elen > 0 && isxdigit((unsigned char)err_body[0])) {
+            bool terminal = false;
+            elen = http_dechunk_in_place(err_body, elen, &terminal);
+            err_body[elen] = '\0';
+        }
+        LOG_ERR("DEBUG=HTTP status %d url=%s body=%u bytes elapsed=%lums\r\n",
+                httpCode, job->url, (unsigned)elen,
+                (unsigned long)(millis() - req_start_ms));
+        http_finish(job, err_body, elen, httpCode);
+        https.end();
+        client.stop();
+        return 0;
+    }
 
     if (is_patch) {
         // ----------------------------------------------------------------
@@ -2351,91 +2458,47 @@ static void server_call_blocking(const http_job_t *job) {
             LOG_ERR("ERROR=PSRAM alloc failed (%u bytes), psram-free=%u\r\n",
                     (unsigned)buf_size, (unsigned)ESP.getFreePsram());
             https.end();
-            return;
+            client.stop();
+            return -1;
         }
 
-        // Large response: read in a loop with vTaskDelay(1) between chunks
-        // so IDLE0 gets CPU time and can reset its TWDT subscription.
-        // Implements the same chunked-transfer and identity encoding logic
-        // as HTTPClient::writeToStream but yields every iteration.
-        int written = 0;
-        bool dl_stalled = false;
-        {
-            WiFiClient *dl_stream = https.getStreamPtr();
-            /* Two independent limits guard the download:
-             *  - dl_deadline: absolute cap for a well-behaved but slow link.
-             *  - stall guard: abort shortly after the LAST byte arrives. A
-             *    TLS-level failure mid-download (mbedTLS -29184 "invalid SSL
-             *    record") leaves https.connected() lying true while
-             *    readStringUntil/readBytes return empty INSTANTLY on the dead
-             *    fd. Without this guard the loop spins re-arming SO_RCVTIMEO on
-             *    a closed socket, flooding "setSocketOption EBADF" to the UART
-             *    until the 120s deadline — starving IDLE0 → task watchdog, and
-             *    (TWDT panic off) wedging the box until a manual reset. */
-            const uint32_t dl_deadline = millis() + 120000UL;  // 120s hard cap
-            const uint32_t DL_STALL_MS = 4000;                 // no-progress abort (< 5s TWDT)
-            uint32_t last_rx_ms = millis();
-            int empty_hdrs = 0;                                // fast TLS-death detector
-            if (contentLen > 0) {
-                // Identity encoding: known length, read in blocks
-                uint8_t dl_buf[4096];
-                while (written < contentLen && millis() < dl_deadline) {
-                    vTaskDelay(1);  // yield to IDLE0 every iteration
-                    int avail = dl_stream->available();
-                    if (avail > 0) {
-                        int n = dl_stream->readBytes(dl_buf,
-                                    (size_t)min(avail, (int)sizeof(dl_buf)));
-                        if (n > 0) { ps.write(dl_buf, n); written += n; last_rx_ms = millis(); }
-                    } else if (!https.connected()) break;
-                    if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
-                }
-            } else {
-                // Chunked transfer encoding: parse chunk-size headers manually
-                uint8_t dl_buf[4096];
-                while (millis() < dl_deadline) {
-                    vTaskDelay(1);  // yield to IDLE0 every chunk
-                    if (!https.connected() && !dl_stream->available()) break;
-                    if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
-                    String chunk_hdr = dl_stream->readStringUntil('\n');
-                    chunk_hdr.trim();
-                    if (chunk_hdr.length() == 0) {
-                        /* Healthy-but-slow link: readStringUntil blocks up to its
-                         * ~1s stream timeout before returning empty. Dead TLS fd:
-                         * it returns instantly, so a burst of empties == the
-                         * connection is gone. Break fast (well under DL_STALL_MS)
-                         * to keep the EBADF flood to a handful of lines. */
-                        if (++empty_hdrs > 64) { dl_stalled = true; break; }
-                        continue;
-                    }
-                    empty_hdrs = 0;
-                    int chunk_sz = (int)strtol(chunk_hdr.c_str(), NULL, 16);
-                    if (chunk_sz == 0) break;  // final chunk
-                    int remaining = chunk_sz;
-                    while (remaining > 0 && millis() < dl_deadline) {
-                        vTaskDelay(1);
-                        int n = dl_stream->readBytes(dl_buf,
-                                    (size_t)min(remaining, (int)sizeof(dl_buf)));
-                        if (n > 0) { ps.write(dl_buf, n); written += n; remaining -= n; last_rx_ms = millis(); }
-                        else if (!https.connected()) break;
-                        if (millis() - last_rx_ms > DL_STALL_MS) { dl_stalled = true; break; }
-                    }
-                    if (dl_stalled) break;
-                    dl_stream->readStringUntil('\n');  // consume trailing CRLF
-                }
-            }
+        /* Raw drain with progress guards (rule 1), then judge completeness
+         * from the framing (rule 2): identity = Content-Length match;
+         * chunked = terminal 0-chunk found by the offline de-chunker. */
+        const uint32_t DL_STALL_MS = 4000;   // no-progress abort (< 5s TWDT)
+        bool aborted = false;
+        size_t written = http_drain_body(https.getStreamPtr(),
+                                         (uint8_t *)ps.data(), ps.capacity(),
+                                         (contentLen > 0) ? contentLen : -1,
+                                         DL_STALL_MS, millis() + 120000UL, &aborted);
+        ps.setLength(written);
+
+        bool complete_body;
+        if (contentLen > 0) {
+            complete_body = !aborted && (int)written == contentLen;
+        } else if (written > 0 && isxdigit((unsigned char)ps.charAt(0))) {
+            /* Chunked vs identity sniff: a chunk-size line opens with a hex
+             * digit, dorequest identity JSON opens with '{' (the v0.35.1
+             * connection-close identity fallback, kept). */
+            bool terminal = false;
+            size_t plen = http_dechunk_in_place(ps.data(), written, &terminal);
+            ps.setLength(plen);
+            complete_body = !aborted && terminal;
+        } else {
+            /* Close-delimited identity body: close == end, nothing to check
+             * beyond "we got something" (can't tell a drop from EOF here). */
+            complete_body = !aborted && written > 0 && written < ps.capacity();
         }
-        if (dl_stalled) {
-            /* Forced teardown: the fd is already EBADF, but stop() clears the
-             * NetworkClientSecure state so the next request opens a clean
-             * socket. No callback → rcheevos re-issues on its ping cadence. */
-            LOG_ERR("DEBUG=HTTP patch stalled after %d bytes (TLS drop mid-download?), aborting; heap=%u rssi=%d wifi=%d\r\n",
-                    written, (unsigned)ESP.getFreeHeap(), (int)WiFi.RSSI(), (int)WiFi.status());
+        if (!complete_body) {
+            LOG_ERR("DEBUG=HTTP patch truncated after %u bytes (TLS drop mid-download?); heap=%u rssi=%d wifi=%d\r\n",
+                    (unsigned)ps.length(), (unsigned)ESP.getFreeHeap(),
+                    (int)WiFi.RSSI(), (int)WiFi.status());
             client.stop();
             https.end();
-            return;
+            return -1;
         }
-        LOG_DBG("DEBUG=Patch read: %d bytes, stripping (psram-free=%u)...\r\n",
-                written, (unsigned)ESP.getFreePsram());
+        LOG_DBG("DEBUG=Patch read: %u bytes, stripping (psram-free=%u)...\r\n",
+                (unsigned)ps.length(), (unsigned)ESP.getFreePsram());
 
         vTaskDelay(1); json_remove_whitespace(ps);
         /* v0.27.6 — drop bonus/specialty sets, keep only "core". Cuts the
@@ -2492,84 +2555,95 @@ static void server_call_blocking(const http_job_t *job) {
         http_finish(job, ps.c_str(), ps.length(), httpCode);
     } else {
         // ----------------------------------------------------------------
-        // Small response (login, resolve_hash, etc.) — use heap String
+        // Small response (login, startsession, award, etc.)
         // ----------------------------------------------------------------
-        WiFiClient *stream = https.getStreamPtr();
-        String responseStr;
-        if (contentLen > 0) responseStr.reserve(contentLen + 1);
-        uint8_t chunk[512];
-        int total_read = 0;
-        uint32_t deadline = millis() + 15000;
-        uint32_t last_rx_ms = millis();   // stall guard (same TLS-drop rationale as patch path)
-        bool identity = (contentLen > 0);
-
-        if (!identity) {
-            /* No Content-Length → chunked transfer encoding. The RA server
-             * started chunking small responses too (startsession, 2026-07);
-             * fed raw, the framing reached rc_client as "12b\r\n{...}" →
-             * RC_INVALID_JSON (-26). Same manual de-chunking as the patch
-             * path above. Guard: if the FIRST header line is not a hex
-             * chunk size (connection-close identity body), keep the bytes
-             * already consumed and drain the rest via the raw loop below. */
-            int empty_hdrs = 0;   // fast TLS-death detector (see patch path)
-            bool first_hdr = true;
-            while (millis() < deadline) {
-                vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
-                if (!https.connected() && !stream->available()) break;
-                if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
-                String raw_hdr = stream->readStringUntil('\n');
-                String chunk_hdr = raw_hdr;
-                chunk_hdr.trim();
-                if (chunk_hdr.length() == 0) {
-                    if (++empty_hdrs > 64) break;   // dead fd returns instantly
-                    continue;
-                }
-                empty_hdrs = 0;
-                if (first_hdr && !isxdigit((unsigned char)chunk_hdr[0])) {
-                    responseStr += raw_hdr;
-                    responseStr += '\n';   // readStringUntil consumed the LF
-                    total_read = responseStr.length();
-                    identity = true;
-                    break;
-                }
-                first_hdr = false;
-                int chunk_sz = (int)strtol(chunk_hdr.c_str(), NULL, 16);
-                if (chunk_sz == 0) break;  // final chunk
-                int remaining = chunk_sz;
-                while (remaining > 0 && millis() < deadline) {
-                    vTaskDelay(1);
-                    int n = stream->readBytes(chunk,
-                                (size_t)min(remaining, (int)sizeof(chunk)));
-                    if (n > 0) { responseStr.concat((const char*)chunk, n); total_read += n; remaining -= n; last_rx_ms = millis(); }
-                    else if (!https.connected()) break;
-                    if (millis() - last_rx_ms > 4000) break;
-                }
-                stream->readStringUntil('\n');  // consume trailing CRLF
-            }
+        /* v0.36.0: same raw-drain + offline de-chunk as the patch path (the
+         * RA server chunks small responses too since 2026-07 — startsession
+         * fed raw reached rc_client as "12b\r\n{...}" → RC_INVALID_JSON).
+         * PSRAM scratch instead of a heap String: keeps internal SRAM out of
+         * the picture and the copy lands in PSRAM via http_finish anyway. */
+        const size_t SMALL_CAP = 64 * 1024;
+        size_t cap = (contentLen > 0) ? (size_t)contentLen : SMALL_CAP;
+        char *body = (char *)ps_malloc(cap + 1);
+        if (!body) {
+            LOG_ERR("ERROR=http small-body alloc failed (%u bytes)\r\n",
+                    (unsigned)(cap + 1));
+            https.end();
+            client.stop();
+            return -1;
         }
-
-        if (identity) {
-            while ((https.connected() || stream->available()) && millis() < deadline) {
-                vTaskDelay(1);  // yield to IDLE0 so it can reset its TWDT subscription
-                int avail = stream->available();
-                if (avail > 0) {
-                    int n = stream->readBytes(chunk, min(avail, (int)sizeof(chunk)));
-                    responseStr.concat((const char*)chunk, n);
-                    total_read += n;
-                    last_rx_ms = millis();
-                } else {
-                    delay(1);
-                }
-                if (contentLen > 0 && total_read >= contentLen) break;
-                if (millis() - last_rx_ms > 4000) break;   // no progress: connection gone
-            }
+        bool aborted = false;
+        size_t got = http_drain_body(https.getStreamPtr(), (uint8_t *)body, cap,
+                                     (contentLen > 0) ? contentLen : -1,
+                                     4000, millis() + 15000, &aborted);
+        body[got] = '\0';
+        size_t blen = got;
+        bool complete_body;
+        if (contentLen > 0) {
+            complete_body = !aborted && (int)got == contentLen;
+        } else if (got > 0 && isxdigit((unsigned char)body[0])) {
+            /* chunked (see the patch path for the sniff rationale) */
+            bool terminal = false;
+            blen = http_dechunk_in_place(body, got, &terminal);
+            body[blen] = '\0';
+            complete_body = !aborted && terminal;
+        } else {
+            /* connection-close identity body ('{'-first JSON) */
+            complete_body = !aborted && got > 0 && got < cap;
         }
-        LOG_DBG("DEBUG=HTTP body: declared=%d received=%d\r\n", contentLen, total_read);
-
-        http_finish(job, responseStr.c_str(), responseStr.length(), httpCode);
+        LOG_DBG("DEBUG=HTTP body: declared=%d received=%u%s\r\n",
+                contentLen, (unsigned)got, complete_body ? "" : " INCOMPLETE");
+        if (!complete_body) {
+            free(body);
+            client.stop();
+            https.end();
+            return -1;
+        }
+        http_finish(job, body, blen, httpCode);
+        free(body);
     }
 
     https.end();
+    return 0;
+}
+
+static void server_call_blocking(const http_job_t *job) {
+    // Large responses: rcheevos 11.x uses r=patch, 12.x uses r=achievementsets.
+    // Both can be ~500-700KB for games like SSBM.
+    // rcheevos puts these in the URL as query params (not in post_data).
+    bool is_patch = (strstr(job->url, "r=patch")           != nullptr) ||
+                    (strstr(job->url, "r=achievementsets")  != nullptr) ||
+                    (job->post_data && strstr(job->post_data, "r=patch")           != nullptr) ||
+                    (job->post_data && strstr(job->post_data, "r=achievementsets") != nullptr);
+    LOG_DBG("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch, job->url, job->post_data);
+
+    /* Transport failures (TLS record corruption, connection drop, truncated
+     * body) are transient link noise — retry on a fresh socket before
+     * reporting anything (rule 3; same philosophy as the v0.35.2 EXI CRC
+     * retry×3). Server-spoken HTTP statuses are delivered on the first try —
+     * rc_client owns that policy. */
+    const int HTTP_MAX_ATTEMPTS = 3;
+    for (int attempt = 1; attempt <= HTTP_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 1) {
+            vTaskDelay(pdMS_TO_TICKS(750));   /* let lwIP/WiFi settle */
+            LOG_ERR("DEBUG=HTTP retry %d/%d url=%s\r\n",
+                    attempt, HTTP_MAX_ATTEMPTS, job->url);
+        }
+        if (WiFi.status() != WL_CONNECTED) break;  /* loop()'s reconnect owns this — fail now */
+        if (server_call_attempt(job, is_patch) == 0) return;
+    }
+
+    /* Every attempt failed at the transport level (or WiFi is down). Deliver
+     * a retryable client error instead of dropping the callback — the
+     * pre-v0.36.0 silent drop left rc_client waiting forever: state stuck at
+     * LOADING_GAME with load_started=true → WiiFlow's LOAD_GAME retries were
+     * no-ops → power cycle. With the callback: login/load fail into an error
+     * state (loop() re-arms load_started, the next LOAD_GAME restarts clean)
+     * and award/lb submissions arm rc_client's own backoff retry. */
+    LOG_ERR("DEBUG=HTTP gave up after %d attempts url=%s — reporting retryable error\r\n",
+            HTTP_MAX_ATTEMPTS, job->url);
+    const char *err = "transport failure (TLS drop / no connection)";
+    http_finish(job, err, strlen(err), RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR);
 }
 
 /* rc_client server-call hook — Core 1. Deep-copies the request (rcheevos

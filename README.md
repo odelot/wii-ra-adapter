@@ -69,9 +69,9 @@ Wiring to the GameCube memory card connector (Slot B):
 | 1 | GND | GND | GND |
 | 3 | CS | GPIO10 | GPIO7 (D8) |
 | 4 | CLK | GPIO12 | GPIO8 (D9) |
-| 5 | DI (Wii → ESP) | GPIO11 | GPIO9 (D10) |
-| 6 | DO (ESP → Wii) | GPIO13 | GPIO5 (D4) |
-| 2 | INT | GPIO14 | GPIO6 (D5) |
+| 5 | DI (Wii → ESP) | GPIO11 | GPIO5 (D4) |
+| 6 | DO (ESP → Wii) | GPIO13 | GPIO9 (D10) |
+| 2 | INT | GPIO14 | GPIO4 (D3) |
 
 The ESP32 acts as SPI slave on the EXI bus. The per-frame snapshot path (Wii games, d2x ra-module) runs at **16 MHz**; the boot handshake (WiiFlow) and the Nintendont module currently run at 8 MHz. A single EXI transaction carries up to 8 KB, enough for a full snapshot of 6144 watched addresses plus pointer-chain data.
 
@@ -114,12 +114,12 @@ The full path from a stock Wii to achievements popping on screen:
 <center>
 <img src="images/pcb-xiao.png" width="50%" alt="Compact XIAO ESP32S3 adapter PCB">
 </center>
-<p>Disclaimer: We ordered but not tested yet</p>
+<p>Use the <code>BOARD_XIAO</code> firmware variant with this PCB.</p>
 <p>
 Thanks <b>Sage2050</b> for design the PCB - <a href="https://github.com/sage2050/Wii_RA">https://github.com/sage2050/Wii_RA</a></p>
 
 
-Optionally add a **passive buzzer** (DevKit: GPIO9 / XIAO: D3) for unlock jingles. Everything runs at 3.3 V — never feed 5 V into the memory card lines.
+Optionally add a **passive buzzer** to GPIO9 on the DevKit for unlock jingles. The compact XIAO PCB uses D3 for EXI INT, so it does not support the optional buzzer. Everything runs at 3.3 V — never feed 5 V into the memory card lines.
 
 **Power**: the memory card slot does **not** power the ESP32-S3 — the board needs its own power through the USB-C port. The Wii's own USB ports work fine as a source, and so does any other 5 V USB supply (phone charger, power bank, etc.).
 

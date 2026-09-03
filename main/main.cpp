@@ -1467,8 +1467,8 @@ static void ledCelebrateTask(void *arg) {
 /* ============================================================================
  * Buzzer event sounds — ported from nes-ra-adapter (nes-esp-firmware.ino).
  *
- * Four jingles on a passive buzzer (PIN_BUZZER from board_config.h: GPIO9 on
- * BOARD_DEV, GPIO4/pad D3 on BOARD_XIAO):
+ * Four jingles on a passive buzzer when the selected board defines
+ * PIN_BUZZER (GPIO9 on BOARD_DEV; unavailable on the compact XIAO PCB):
  *   SND_ATTENTION — config portal opened (connect to WII_RA_ADAPTER)
  *   SND_SUCCESS   — RA login OK
  *   SND_ERROR     — login/load failure
@@ -1486,7 +1486,11 @@ static void ledCelebrateTask(void *arg) {
  * do_frame batch (mastery = TRIGGERED immediately followed by GAME_COMPLETED),
  * snd_request keeps the higher id and only the fanfare plays — matching the
  * NES behaviour of victory REPLACING the normal unlock jingle. */
+#ifdef PIN_BUZZER
 #define RA_BUZZER 1
+#else
+#define RA_BUZZER 0
+#endif
 
 enum {
     SND_NONE = 0,
@@ -6346,4 +6350,3 @@ void loop() {
 #endif
     vTaskDelay(1);
 }
-

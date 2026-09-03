@@ -66,17 +66,18 @@
    *                    only covers GPIO 0-31). */
   #define EXI_PIN_CS      7   // XIAO pad D8  — GameCube CS (active low)
   #define EXI_PIN_CLK     8   // XIAO pad D9  — GameCube CLK
-  #define EXI_PIN_MOSI    9   // XIAO pad D10 — GameCube DI  -> ESP32
-  #define EXI_PIN_MISO    5   // XIAO pad D4  — ESP32 -> GameCube DO
-  #define EXI_PIN_INT     6   // XIAO pad D5  — INT ESP32 -> GameCube
+  /* sage2050/Wii_RA routes the console-to-adapter data line to D4 and the
+   * adapter-to-console data line to D10. */
+  #define EXI_PIN_MOSI    5   // XIAO pad D4  — GameCube -> ESP32
+  #define EXI_PIN_MISO    9   // XIAO pad D10 — ESP32 -> GameCube
+  #define EXI_PIN_INT     4   // XIAO pad D3  — INT ESP32 -> GameCube
 
   /* Unlock LED: single yellow user LED on GPIO21, ACTIVE-LOW (drive low = on). */
   #define LED_USE_GPIO        1
   #define PIN_LED_GPIO        21
   #define PIN_LED_ACTIVE_LOW  1
 
-  /* Passive buzzer for RA event sounds (login/error/unlock/mastery). */
-  #define PIN_BUZZER          4   // XIAO pad D3
+  /* No buzzer: the compact PCB uses D3/GPIO4 for EXI INT. */
 
 #else
   #error "board_config.h: BOARD_VARIANT must be BOARD_DEV or BOARD_XIAO"

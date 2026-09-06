@@ -138,6 +138,14 @@ uint32_t exi_spi_get_transaction_count(void);
 /** Get total bytes received (for debug) */
 uint32_t exi_spi_get_total_bytes_rx(void);
 
+/**
+ * Diagnostic: describe what the Wii->ESP data line (MOSI) actually delivered on
+ * the transactions that were NOT recognised as requests. Distinguishes a dead
+ * wire (and == or, i.e. the line never changes) from a live but mis-sampled one
+ * (and == 00 with or == FF). See the comment block in exi_spi_slave.cpp.
+ */
+void exi_spi_rxdiag(char *out, size_t out_size);
+
 /** True if the robust re-arm servicer task is running (project_exi_robust_
  * handshake). When false, the caller must arm unconditionally as a fallback. */
 bool exi_spi_servicer_active(void);

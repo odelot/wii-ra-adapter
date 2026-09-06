@@ -78,6 +78,75 @@ static inline bool rx_is_request(const uint8_t* rx, size_t bytes) {
 static volatile uint32_t total_transactions = 0;
 static volatile uint32_t total_bytes_rx = 0;
 
+/* ---- MOSI forensics -------------------------------------------------------
+ * Field diagnostic for the failure mode where the ESP counts transactions with
+ * the right size and cadence (so CS + CLK are healthy) but never sees the 0x52
+ * request magic. Records what the Wii->ESP data line actually delivered, so a
+ * remote user can tell a dead wire from a mis-sampled one without a scope:
+ *   and == or             -> line stuck at that value (0x00 = undriven/shorted
+ *                            to GND, 0xFF = open / pull-up only)
+ *   and == 00, or == FF   -> the line IS toggling; the bytes simply never start
+ *                            with 0x52, which points at sampling/bit alignment
+ *                            rather than at a broken connection
+ * Fed only from the servicer's non-request branch, so on a healthy link this
+ * just reports the read-phase junk. Scan is capped so it stays off the hot
+ * path for large snapshot transactions. */
+#define RXDIAG_SCAN_MAX  16
+/* A console-side memory-card probe is only ~2 bytes wide; a real protocol frame
+ * is at least 10 (4-byte header + the shortest read phase). Frames at or above
+ * this are the ones that SHOULD have parsed, so they get latched separately and
+ * the probe traffic cannot overwrite the interesting sample. */
+#define RXDIAG_FRAME_MIN 8
+
+/* Apply a weak internal pull-up to MOSI so an OPEN line reads 0xFF instead of
+ * floating. See the call site in exi_spi_init. Reported as pu= in the rxdiag
+ * line so a log is self-describing. Set to 0 to restore the stock floating
+ * input. */
+#define RXDIAG_MOSI_PULLUP 1
+static volatile uint32_t rxd_n       = 0;     /* non-request transactions seen */
+static volatile uint32_t rxd_big     = 0;     /* ... of those, frame-sized ones */
+static volatile uint32_t rxd_stuck0  = 0;     /* payloads that were all 0x00 */
+static volatile uint32_t rxd_stuck1  = 0;     /* payloads that were all 0xFF */
+static volatile uint8_t  rxd_and     = 0xFF;  /* AND of every byte scanned */
+static volatile uint8_t  rxd_or      = 0x00;  /* OR  of every byte scanned */
+static volatile uint8_t  rxd_last[8] = {0};   /* first bytes of the last frame */
+static volatile uint8_t  rxd_last_len = 0;
+static volatile uint16_t rxd_last_size = 0;   /* full length of that frame */
+
+static void rxdiag_feed(const uint8_t *rx, size_t bytes)
+{
+    size_t scan = bytes < RXDIAG_SCAN_MAX ? bytes : RXDIAG_SCAN_MAX;
+    uint8_t a = 0xFF, o = 0x00;
+    for (size_t i = 0; i < scan; i++) { a &= rx[i]; o |= rx[i]; }
+    rxd_n++;
+    if (o == 0x00)      rxd_stuck0++;
+    else if (a == 0xFF) rxd_stuck1++;
+    rxd_and = (uint8_t)(rxd_and & a);
+    rxd_or  = (uint8_t)(rxd_or  | o);
+    if (bytes >= RXDIAG_FRAME_MIN) {
+        rxd_big++;
+        size_t keep = scan < 8 ? scan : 8;
+        for (size_t i = 0; i < keep; i++) rxd_last[i] = rx[i];
+        rxd_last_len  = (uint8_t)keep;
+        rxd_last_size = (uint16_t)bytes;
+    }
+}
+
+void exi_spi_rxdiag(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    int pos = snprintf(out, out_size,
+                       "pu=%d junk=%lu frames=%lu zero=%lu ones=%lu and=%02X or=%02X "
+                       "lastframe=%uB head=",
+                       RXDIAG_MOSI_PULLUP,
+                       (unsigned long)rxd_n, (unsigned long)rxd_big,
+                       (unsigned long)rxd_stuck0, (unsigned long)rxd_stuck1,
+                       rxd_and, rxd_or, (unsigned)rxd_last_size);
+    uint8_t n = rxd_last_len;
+    for (uint8_t i = 0; i < n && pos < (int)out_size - 4; i++)
+        pos += snprintf(out + pos, out_size - pos, "%02X ", rxd_last[i]);
+}
+
 /* Deadlock-locator heartbeats (project_exi_robust_handshake): each is bumped
  * once per loop of its task. A Core-0 watchdog dumps them — if Core 1 deadlocks
  * during the galaxy convergence, whichever counter STOPS is where it hung.
@@ -238,6 +307,7 @@ static void exi_servicer_task(void* arg)
             spi_slave_queue_trans(SPI2_HOST, &current_trans, portMAX_DELAY);
         } else {
             g_servicer_stage = 3;   // arming receive
+            if (bytes > 0) rxdiag_feed(rx_buf, bytes);
             // Response-read / junk / idle — reset tx_buf to a sane fallback and
             // re-arm RECEIVE for the next request immediately.
             memcpy(tx_buf, default_ack, sizeof(default_ack));
@@ -294,6 +364,17 @@ bool exi_spi_init(exi_transaction_cb_t callback)
         LOG_ERR("ERROR=spi_slave_initialize failed: %d\n", ret);
         return false;
     }
+
+    /* Weak pull-up on MOSI (console->ESP data). On the GPIO-matrix path the SPI
+     * driver leaves this pin a bare floating input (spi_common.c: plain
+     * GPIO_MODE_INPUT, no pull), so a disconnected line reads as noise rather
+     * than a defined level. Pulling it up makes the failure modes separable in
+     * the rxdiag log: an OPEN line now reads 0xFF, while a line held low by a
+     * solder bridge (or by a console driving it) still reads 0x00 — a ~45k
+     * internal pull-up cannot fight a short. Harmless in normal operation: the
+     * console drives DI push-pull, which overrides the pull-up either way. */
+    if (RXDIAG_MOSI_PULLUP)
+        gpio_set_pull_mode((gpio_num_t)EXI_PIN_MOSI, GPIO_PULLUP_ONLY);
 
     // Configure INT pin
     gpio_config_t int_cfg = {};

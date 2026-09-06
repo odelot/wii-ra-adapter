@@ -6071,6 +6071,13 @@ void taskCore1(void *pvParameters) {
                                 (unsigned long)delta);
             }
             LOG_DBG("%s\n", line);
+
+            /* What the Wii->ESP data line actually carried on the transactions
+             * that never parsed as a request. Silent on a link that is only
+             * seeing normal read-phase junk; decisive when cmds stays empty. */
+            char rxd[128];
+            exi_spi_rxdiag(rxd, sizeof(rxd));
+            LOG_DBG("DEBUG=rxdiag | %s\n", rxd);
         }
     }
 }

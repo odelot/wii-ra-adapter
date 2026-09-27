@@ -223,7 +223,7 @@ Sources for the console-side projects live in their own repositories (forks of [
 
 ## Support & community
 
-Questions about the installation, something not working as expected, or found a bug? Open an [issue](../../issues) or join the community on [Discord](https://discord.gg/baM7y3xbsA).
+Questions about the installation, something not working as expected, or found a bug? Open an [issue](../../issues) or join the community on [Discord](https://discord.gg/6eYGq7NNfF).
 
 ## Credits
 

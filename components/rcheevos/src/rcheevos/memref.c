@@ -1853,7 +1853,8 @@ have_parent:
 uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
                                 rc_phasec_node_t* nodes, const void** keys,
                                 uint32_t cap, uint32_t* out_blob_bytes,
-                                uint32_t* out_shipped, uint32_t* out_refused) {
+                                uint32_t* out_shipped, uint32_t* out_refused,
+                                uint32_t* out_cap_refused) {
   const rc_modified_memref_list_t* list;
   rc_phasec_emit_ctx_t c;
 
@@ -1861,9 +1862,10 @@ uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
   c.nodes = nodes;
   c.keys = keys;
   c.cap = cap;
-  if (out_blob_bytes) *out_blob_bytes = 0;
-  if (out_shipped)    *out_shipped = 0;
-  if (out_refused)    *out_refused = 0;
+  if (out_blob_bytes)  *out_blob_bytes = 0;
+  if (out_shipped)     *out_shipped = 0;
+  if (out_refused)     *out_refused = 0;
+  if (out_cap_refused) *out_cap_refused = 0;
   if (!memrefs || !nodes || !keys || !cap)
     return 0;
 
@@ -1873,12 +1875,32 @@ uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
     const rc_modified_memref_t* stop = mm + list->count;
 
     for (; mm < stop; ++mm) {
+      /* Chain-level rollback point. A chain that doesn't fit the cap is
+       * refused WHOLE (stays on the legacy ADDR_QUERY path) instead of
+       * disabling Phase C for the game: MKW 2026-09-25 was 3084 nodes vs the
+       * console's 3072 and lost all 2348 chains (df/s 55 -> 8). Restoring
+       * count drops the partial chain's nodes/keys (dedup only scans
+       * [0,count), coverage is built from keys[0,n)); blob/shipped/dp_n are
+       * restored with it so nothing references a dropped slot. Later chains
+       * still get a try — they may fit through dedup with earlier nodes. */
+      uint32_t save_count = c.count, save_blob = c.blob, save_shipped = c.shipped;
+      uint16_t save_dp_n = c.dp_n;
+
       if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ)
         continue;
-      if (rc_phasec_emit_memref(&mm->memref, 64, &c) < 0 && out_refused)
-        ++*out_refused;
-      if (c.overflow)
-        return 0xFFFFFFFFu;
+      if (rc_phasec_emit_memref(&mm->memref, 64, &c) < 0) {
+        if (c.overflow) {
+          c.count = save_count;
+          c.blob = save_blob;
+          c.shipped = save_shipped;
+          c.dp_n = save_dp_n;
+          c.overflow = 0;
+          if (out_cap_refused)
+            ++*out_cap_refused;
+        }
+        if (out_refused)
+          ++*out_refused;
+      }
     }
 
     list = list->next;

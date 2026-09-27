@@ -61,6 +61,15 @@ public:
     _capacity = _length = _readPos = 0;
   }
 
+  // Hand the buffer (NUL-terminated at length()) to the caller, who frees it
+  // with free(); the stream is left empty. Avoids a body-sized copy.
+  char* detach() {
+    char* b = _buffer;
+    _buffer = nullptr;
+    _capacity = _length = _readPos = 0;
+    return b;
+  }
+
   bool shrink(size_t newSize) {
     if (newSize >= _capacity) return true;
     return reserve(newSize);

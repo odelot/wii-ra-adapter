@@ -498,13 +498,17 @@ typedef struct rc_phasec_node_t {
 } rc_phasec_node_t;
 /* Emit the table for every eligible INDIRECT chain. keys = caller scratch
  * (cap entries) for the dedup map, only needed during the call. Returns node
- * count, or 0xFFFFFFFF on cap overflow. out_blob_bytes = per-frame value blob
- * size; out_shipped = shipped deref count; out_refused = census-eligible
- * chains the emitter still refused (stricter edge-size/immediate rules). */
+ * count (<= cap). A chain that does not fit the cap is refused whole (rolled
+ * back, stays on the legacy path) instead of failing the table.
+ * out_blob_bytes = per-frame value blob size; out_shipped = shipped deref
+ * count; out_refused = chains not emitted (stricter edge-size/immediate rules
+ * OR no room); out_cap_refused = the subset refused for lack of room.
+ * NOTE: declared in BOTH rc_internal.h copies. */
 uint32_t rc_memrefs_phasec_emit(const rc_memrefs_t* memrefs,
                                 rc_phasec_node_t* nodes, const void** keys,
                                 uint32_t cap, uint32_t* out_blob_bytes,
-                                uint32_t* out_shipped, uint32_t* out_refused);
+                                uint32_t* out_shipped, uint32_t* out_refused,
+                                uint32_t* out_cap_refused);
 
 #ifdef RC_INCREMENTAL_COLLECT
 /* Reverse-hash incremental collect (see memref.c). The adapter sets a hook that

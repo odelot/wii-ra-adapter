@@ -60,6 +60,7 @@ Unlock LED:               WS2812 RGB GPIO48        yellow user LED GPIO21 (activ
 #include <EEPROM.h>
 #include <StreamString.h>
 #include "rc_client.h"
+#include "rc_api_user.h"   /* portal-time login check (rc_api_init_login_request) */
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "SPI.h"
@@ -238,7 +239,17 @@ static void ralog_drain_task(void *pv) {
         }
         log_tail = tail;
         portEXIT_CRITICAL(&log_mux);
-        if (n) { ralog_sink(chunk, n); continue; }  /* drained a chunk */
+        if (n) {
+            ralog_sink(chunk, n);
+            /* Yield after EVERY chunk. The "blocks on the UART" premise only
+             * holds for the DEV board's Serial: on the XIAO the sink is stdout
+             * (UART0 console at 115200 + USB-Serial-JTAG secondary), whose
+             * writes BUSY-WAIT — with a backlog this loop never slept and IDLE0
+             * starved (task_wdt x4 on MKW 2026-09-25, 248 SPIKE dumps). 1 tick
+             * per 512B chunk caps drain at ~512KB/s, far above the port. */
+            vTaskDelay(1);
+            continue;
+        }
         /* ring empty: if we ever dropped, say so (so silent loss is visible), then yield */
         if (log_dropped != last_dropped) {
             char w[56];
@@ -318,6 +329,11 @@ static volatile bool g_wdog_verbose = RA_WDOG_VERBOSE;
 #define FR_LINE_MAX  384       /* a FRAME line is ~300ch + margin (vsnprintf truncates) */
 #define FR_BAD_DF_US 20000u    /* do_frame over ~budget (16.6ms) */
 #define FR_BAD_AP_US 30000u    /* convergence/EXI spike (matches the d2x SPK >30ms) */
+/* Rate limit: at most one dump per FR_MIN_GAP_MS. When the set itself runs
+ * over budget EVERY frame is a "spike" (MKW 2026-09-25: 248 dumps, ~4KB each)
+ * and the dumps flood the log ring (257KB dropped) and the drain's CPU. The
+ * spikes skipped in between are counted and reported on the next dump. */
+#define FR_MIN_GAP_MS 5000u
 /* Mode toggle: logging is async (ralog ring, never blocks Core 1). DEFAULT here is
  * flight-recorder mode = only the worst frames + before/after context. Set
  * RA_LOG_ALL_FRAMES 1 (or flip g_log_all_frames at runtime) to log EVERY frame. */
@@ -329,6 +345,8 @@ static char          fr_ring[FR_BEFORE][FR_LINE_MAX];
 static uint8_t        fr_head   = 0;   /* next slot to write = oldest in the ring */
 static uint8_t        fr_after  = 0;   /* remaining after-context frames to print */
 static unsigned long  fr_spikes = 0;   /* diag: total spikes dumped */
+static unsigned long  fr_skipped = 0;  /* spikes suppressed by FR_MIN_GAP_MS since the last dump */
+static uint32_t       fr_last_ms = 0;  /* millis() of the last dump */
 
 static void fr_record(const char *fmt, ...) {
     if (!RA_LOG_FRAME_STATS || RA_LOG_LEVEL < 1) return;   /* FRAME = INFO channel */
@@ -351,9 +369,13 @@ static void fr_record(const char *fmt, ...) {
 static void fr_trigger(void) {
     if (g_log_all_frames) return;   /* every frame already logged → nothing to dump */
     if (fr_after) { fr_after = FR_AFTER; return; }
+    uint32_t now = millis();
+    if (fr_spikes && now - fr_last_ms < FR_MIN_GAP_MS) { fr_skipped++; return; }
+    fr_last_ms = now;
     fr_spikes++;
-    ralog_printf("---- SPIKE #%lu (flight recorder: %u before + this + %u after) ----\r\n",
-               fr_spikes, (unsigned)(FR_BEFORE - 1), (unsigned)FR_AFTER);
+    ralog_printf("---- SPIKE #%lu (flight recorder: %u before + this + %u after; %lu spikes skipped by rate limit) ----\r\n",
+               fr_spikes, (unsigned)(FR_BEFORE - 1), (unsigned)FR_AFTER, fr_skipped);
+    fr_skipped = 0;
     for (uint8_t i = 0; i < FR_BEFORE; i++) {
         char *slot = fr_ring[(fr_head + i) % FR_BEFORE];   /* oldest → newest (the bad frame) */
         if (slot[0]) ralog_write(slot, strlen(slot));
@@ -1842,7 +1864,7 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
             buffer[j] = has_tomb ? tv : 0;
             /* Sanity-checked miss tracking — same rules as peek_from_snapshot. */
             bool valid_ppc_addr = (byte_addr <= 0x017FFFFF)
-                               || (byte_addr >= 0x10000000 && byte_addr <= 0x137FFFFF  /* IOS-reserved top of MEM2 excluded (read-fault guard) */);
+                               || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */);
             if (valid_ppc_addr) {
                 /* v0.32 gate: a NO-tombstone miss is a read that returns 0 —
                  * the only miss that can forge a Delta "became X" edge. Bump
@@ -1925,7 +1947,7 @@ static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *u
              * the address falls outside mapped RAM, the Starlet thread can
              * hang or trip a bus error, taking the whole system down. */
             bool valid_ppc_addr = (byte_addr <= 0x017FFFFF)
-                               || (byte_addr >= 0x10000000 && byte_addr <= 0x137FFFFF  /* IOS-reserved top of MEM2 excluded (read-fault guard) */);
+                               || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */);
             if (valid_ppc_addr && peek_miss_count < PEEK_MISS_MAX) {
                 bool dup = false;
                 for (uint16_t k = 0; k < peek_miss_count; k++) {
@@ -2175,6 +2197,523 @@ static void json_remove_flags5_achievements(PsramStream &buf) {
  * Robust brace/bracket scan that SKIPS string contents (a stray { } [ ]
  * inside a Title/Description/Mem would otherwise desync the depth count
  * across this huge cut). */
+/* Sizing diagnostic for big sets: total bytes of every value of "key"
+ * (arrays/objects bracket-matched, strings to the closing quote) and how many
+ * times the key occurs. Expects whitespace already stripped. */
+static size_t json_field_value_bytes(const PsramStream &buf, const char *key, unsigned *count) {
+    const char *data = buf.c_str();
+    size_t len = buf.length(), total = 0;
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    size_t plen = strlen(pat);
+    *count = 0;
+    const char *p = data;
+    while ((p = strstr(p, pat)) != NULL) {
+        size_t start = (size_t)(p - data) + plen, i = start;
+        if (i >= len) break;
+        char open = data[i];
+        if (open == '[' || open == '{') {
+            int depth = 0; bool in_str = false;
+            for (; i < len; i++) {
+                char c = data[i];
+                if (in_str) { if (c == '\\') i++; else if (c == '"') in_str = false; continue; }
+                if (c == '"') in_str = true;
+                else if (c == '[' || c == '{') depth++;
+                else if ((c == ']' || c == '}') && --depth == 0) { i++; break; }
+            }
+        } else if (open == '"') {
+            for (i++; i < len; i++) {
+                if (data[i] == '\\') i++;
+                else if (data[i] == '"') { i++; break; }
+            }
+        } else {
+            while (i < len && data[i] != ',' && data[i] != '}' && data[i] != ']') i++;
+        }
+        total += i - start;
+        (*count)++;
+        p = data + (i > start ? i : start + 1);
+    }
+    return total;
+}
+
+/* ---- Condition budget (2026-09-25, ported from the NES adapter's
+ * JsonCleaner trim) --------------------------------------------------------
+ * The per-frame eval cost scales with the number of trigger conditions: SMG
+ * (~32K) sat at the 80MHz ceiling, MKW (44K) runs ~21ms eval in a race and
+ * froze the console at race start. When the set's estimated condition count
+ * exceeds RA_COND_BUDGET, drop the most expensive achievements until it fits —
+ * NEVER "progression" / "win_condition" ones (the game must stay beatable),
+ * and log every drop. RA_COND_BUDGET 0 = feature off. */
+#ifndef RA_COND_BUDGET
+#define RA_COND_BUDGET 35000
+#endif
+
+/* Is s[i] a MemAddr group separator? rcheevos (trigger.c/condset.c) takes 'S'
+ * or 's' between conditions; right after "0x"/"0X" the same letter is a
+ * memory size (0xS = bit 6), consumed by rc_parse_memref instead. */
+static inline bool memaddr_is_group_sep(const char *s, size_t i) {
+    return (s[i] == 'S' || s[i] == 's') && (i == 0 || (s[i - 1] != 'x' && s[i - 1] != 'X'));
+}
+
+/* rcheevos conditions in a MemAddr: '_' separates conditions, 'S'/'s'
+ * separates alt groups. */
+static uint32_t memaddr_cond_count(const char *s, size_t n) {
+    if (n == 0) return 0;
+    uint32_t conds = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '_' || memaddr_is_group_sep(s, i)) conds++;
+    }
+    return conds;
+}
+
+/* First occurrence of pat inside [from, to) — bounded (a missing field must
+ * not strstr through megabytes of the rest of the payload). */
+static long json_find_in(const char *data, size_t from, size_t to, const char *pat) {
+    size_t plen = strlen(pat);
+    for (size_t i = from; i + plen <= to; i++)
+        if (data[i] == pat[0] && memcmp(data + i, pat, plen) == 0) return (long)i;
+    return -1;
+}
+
+/* End of the JSON string whose opening quote is at q (index of the closing
+ * quote), escape-aware; to if unterminated. */
+static size_t json_string_end(const char *data, size_t q, size_t to) {
+    for (size_t i = q + 1; i < to; i++) {
+        if (data[i] == '\\') i++;
+        else if (data[i] == '"') return i;
+    }
+    return to;
+}
+
+struct cb_ach_t {
+    uint32_t start, end;    /* object span, inclusive braces */
+    uint32_t conds;
+    uint32_t id;
+    uint32_t title;         /* offset of the title text (0 = none) */
+    uint16_t title_len;
+    uint16_t arr;           /* index of the Achievements array it belongs to */
+    uint8_t  prot;          /* progression / win_condition */
+    uint8_t  drop;
+};
+struct cb_arr_t { uint32_t open, close; };   /* '[' and ']' of one Achievements array */
+
+/* qsort context — plain qsort (newlib's qsort_r signature varies by version);
+ * only httpTask runs the trim, so a static is race-free. */
+static const cb_ach_t *cb_sort_ctx;
+static int cb_cmp_cost_desc(const void *a, const void *b) {
+    uint32_t ca = cb_sort_ctx[*(const uint16_t *)a].conds;
+    uint32_t cb = cb_sort_ctx[*(const uint16_t *)b].conds;
+    return (ca < cb) - (ca > cb);
+}
+
+/* Returns the number of achievements dropped. Expects whitespace stripped. */
+static unsigned json_trim_achievements_to_cond_budget(PsramStream &buf, uint32_t budget) {
+    char  *data = buf.data();
+    size_t len  = buf.length();
+    const size_t MAX_ACH = 4096, MAX_ARR = 16;
+    cb_ach_t *ach = (cb_ach_t *)ps_malloc(MAX_ACH * sizeof(cb_ach_t));
+    cb_arr_t  arr[MAX_ARR];
+    uint16_t *order = (uint16_t *)ps_malloc(MAX_ACH * sizeof(uint16_t));
+    unsigned n = 0, n_arr = 0, dropped = 0;
+    bool incomplete = false;   /* an object/array we could not record — never compact */
+    if (!ach || !order) {
+        LOG_ERR("ERROR=CondBudget: scratch alloc failed — skipped\r\n");
+        free(ach); free(order);
+        return 0;
+    }
+
+    /* 1. Collect every achievement object of every Achievements array. */
+    static const char KEY[] = "\"Achievements\":[";
+    size_t pos = 0;
+    long k;
+    while ((k = json_find_in(data, pos, len, KEY)) >= 0) {
+        if (n_arr >= MAX_ARR) { incomplete = true; break; }
+        size_t i = (size_t)k + sizeof(KEY) - 1;          /* just past '[' */
+        cb_arr_t *A = &arr[n_arr];
+        A->open = (uint32_t)(i - 1);
+        for (;;) {
+            while (i < len && data[i] != '{' && data[i] != ']') i++;
+            if (i >= len) break;
+            if (data[i] == ']') break;
+            size_t s = i;                                /* bracket-match the object */
+            int depth = 0;
+            for (; i < len; i++) {
+                char c = data[i];
+                if (c == '"') { i = json_string_end(data, i, len); continue; }
+                if (c == '{') depth++;
+                else if (c == '}' && --depth == 0) break;
+            }
+            if (i >= len) break;                         /* truncated: leave it alone */
+            size_t e = i++;
+            if (n >= MAX_ACH) { incomplete = true; continue; }
+            {
+                cb_ach_t *a = &ach[n];
+                memset(a, 0, sizeof(*a));
+                a->start = (uint32_t)s; a->end = (uint32_t)e; a->arr = (uint16_t)n_arr;
+                long m = json_find_in(data, s, e, "\"MemAddr\":\"");
+                if (m >= 0) {
+                    size_t v0 = (size_t)m + 11, v1 = json_string_end(data, v0 - 1, e);
+                    a->conds = memaddr_cond_count(data + v0, v1 - v0);
+                }
+                long id = json_find_in(data, s, e, "\"ID\":");
+                if (id >= 0) a->id = (uint32_t)strtoul(data + id + 5, NULL, 10);
+                long t = json_find_in(data, s, e, "\"Title\":\"");
+                if (t >= 0) {
+                    size_t t0 = (size_t)t + 9, t1 = json_string_end(data, t0 - 1, e);
+                    a->title = (uint32_t)t0;
+                    a->title_len = (uint16_t)((t1 - t0) > 60 ? 60 : (t1 - t0));
+                }
+                a->prot = json_find_in(data, s, e, "\"Type\":\"progression\"") >= 0 ||
+                          json_find_in(data, s, e, "\"Type\":\"win_condition\"") >= 0;
+                n++;
+            }
+        }
+        if (i >= len) { incomplete = true; break; }      /* malformed: no ']' */
+        A->close = (uint32_t)i;
+        n_arr++;
+        pos = i + 1;
+    }
+
+    uint32_t total = 0;
+    for (unsigned i = 0; i < n; i++) total += ach[i].conds;
+    LOG_DBG("DEBUG=CondBudget: %u achievements, ~%u conditions (budget %u)\r\n",
+            n, (unsigned)total, (unsigned)budget);
+    if (incomplete) {
+        LOG_ERR("DEBUG=CondBudget: payload not fully parsed (malformed or >%u achievements) — trim skipped\r\n",
+                (unsigned)MAX_ACH);
+        free(ach); free(order);
+        return 0;
+    }
+
+    /* 2. Mark the most expensive unprotected ones until the total fits. */
+    if (total > budget && n > 0) {
+        for (unsigned i = 0; i < n; i++) order[i] = (uint16_t)i;
+        cb_sort_ctx = ach;
+        qsort(order, n, sizeof(uint16_t), cb_cmp_cost_desc);
+        uint32_t freed = 0;
+        for (unsigned j = 0; j < n && total - freed > budget; j++) {
+            cb_ach_t *a = &ach[order[j]];
+            if (a->prot || a->conds == 0) continue;
+            a->drop = 1;
+            freed += a->conds;
+            dropped++;
+            LOG_DBG("DEBUG=CondBudget drop ID=%u conds=%u \"%.*s\"\r\n",
+                    (unsigned)a->id, (unsigned)a->conds,
+                    (int)a->title_len, a->title ? data + a->title : "");
+        }
+        if (total - freed > budget)
+            LOG_ERR("DEBUG=CondBudget: still ~%u conditions — only protected achievements left\r\n",
+                    (unsigned)(total - freed));
+        LOG_DBG("DEBUG=CondBudget: dropped %u achievements (-%u conditions) -> ~%u\r\n",
+                dropped, (unsigned)freed, (unsigned)(total - freed));
+    }
+
+    /* 3. One in-place compaction pass: each array is rewritten with its kept
+     * objects joined by ','. Only drops, so the write cursor never passes the
+     * read cursor and memmove is safe. */
+    if (dropped) {
+        size_t r = 0, w = 0;
+        unsigned oi = 0;
+        for (unsigned ai = 0; ai < n_arr; ai++) {
+            size_t upto = arr[ai].open + 1;              /* copy through '[' */
+            memmove(data + w, data + r, upto - r);
+            w += upto - r;
+            bool first = true;
+            for (; oi < n && ach[oi].arr == ai; oi++) {
+                if (ach[oi].drop) continue;
+                size_t sz = ach[oi].end - ach[oi].start + 1;
+                if (!first) data[w++] = ',';
+                memmove(data + w, data + ach[oi].start, sz);
+                w += sz;
+                first = false;
+            }
+            r = arr[ai].close;                           /* ']' goes with the next segment */
+        }
+        memmove(data + w, data + r, len - r);
+        w += len - r;
+        buf.setLength(w);
+    }
+    free(ach);
+    free(order);
+    return dropped;
+}
+
+/* ---- Region-alt pruning (2026-09-26) --------------------------------------
+ * Multi-region Wii/GC sets duplicate every achievement's logic once per disc
+ * version: each alt group opens with a disc-ID guard on RA address 0 (the
+ * disc header — MKW: "0xX0=<RMCP|RMCE|RMCJ|RMCK>" or
+ * "P:0xX0!=<region>"), followed by that version's own pointer chains. On a
+ * given disc ~75% of the set (MKW: 25.3K of 33.9K conditions, 7.3K of 9.8K
+ * chain links) belongs to OTHER regions: it can never fire, yet its chains are
+ * resolved every frame (upd, Phase C table, watchlist, PSRAM) and the garbage
+ * they read keeps every achievement "dirty" for dirty-eval.
+ * The disc ID is known before the patch is parsed (LOAD_GAME), so those alts
+ * are dropped from the MemAddr strings — only when provably equivalent:
+ *  - PauseIf guard TRUE ("P:<disc-id> != other"): the group pauses on its
+ *    first condition every frame (pause is evaluated first), i.e. it is the
+ *    neutral element of every alt combination (OR of truth/primed, AND of
+ *    paused) and never reaches reset/hits/measured -> removed.
+ *  - Plain guard FALSE ("<disc-id> = other"): never true; with RC_SHORT_CIRCUIT
+ *    nothing after it runs. Removed only if the group has no PauseIf/ResetIf/
+ *    hit-target/Measured/Trigger/AddHits (those run BEFORE the "other"
+ *    category and have side effects). A dead plain alt is never paused, which
+ *    keeps "all alts paused" false -> an "S0=1" placeholder preserves that.
+ *  - If no alt is left, "SP:1=1" (always-paused) keeps "core AND no-alt-true"
+ *    semantics — the achievement stays unobtainable on this disc, as before.
+ * The core group is never touched. RA_REGION_PRUNE 0 = off. */
+#ifndef RA_REGION_PRUNE
+#define RA_REGION_PRUNE 1
+#endif
+
+/* 6-byte disc ID from the console's LOAD_GAME (RA address 0..5), e.g. "RMCE01". */
+static char g_disc_id[RA_GAME_ID_LEN + 1] = {0};
+
+static inline int rp_hexval(char c) {
+    return (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+         : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+}
+
+/* Guard evaluation for one condition [c, ce): 1 = guard true, 0 = false,
+ * -1 = not a plain disc-ID comparison (leave the group alone). *pause = it
+ * carries the PauseIf flag. Mirrors rc_parse_memref / rc_parse_operand for the
+ * forms accepted: "[P:]0x<size><hex><cmp><const>", size H/space/X/W/G/I/J or
+ * legacy 16-bit, const decimal or h-hex, no hit target / modifier. */
+static int rp_eval_disc_guard(const char *c, const char *ce, const uint8_t *disc, bool *pause) {
+    *pause = false;
+    if (ce - c >= 2 && c[1] == ':') {
+        if (c[0] != 'P' && c[0] != 'p') return -1;
+        *pause = true;
+        c += 2;
+    }
+    if (ce - c < 4 || c[0] != '0' || (c[1] != 'x' && c[1] != 'X')) return -1;
+    const char *p = c + 2;
+    int bytes; bool be = false;
+    switch (*p) {
+        case 'h': case 'H': bytes = 1; p++; break;
+        case ' ':           bytes = 2; p++; break;
+        case 'x': case 'X': bytes = 4; p++; break;
+        case 'w': case 'W': bytes = 3; p++; break;
+        case 'g': case 'G': bytes = 4; be = true; p++; break;
+        case 'i': case 'I': bytes = 2; be = true; p++; break;
+        case 'j': case 'J': bytes = 3; be = true; p++; break;
+        default:
+            if (rp_hexval(*p) < 0) return -1;   /* bit/nibble/bitcount sizes: not handled */
+            bytes = 2;                          /* legacy: no size char = 16-bit */
+            break;
+    }
+    uint64_t addr = 0;
+    const char *d = p;
+    while (p < ce && rp_hexval(*p) >= 0) {
+        addr = addr * 16 + (uint64_t)rp_hexval(*p++);
+        if (addr > 0xFFFFFFFFull) return -1;
+    }
+    if (p == d || addr + (uint64_t)bytes > RA_GAME_ID_LEN) return -1;   /* not inside the disc ID */
+
+    int op;   /* 0 =, 1 !=, 2 <, 3 <=, 4 >, 5 >= */
+    if (ce - p >= 2 && p[0] == '!' && p[1] == '=')      { op = 1; p += 2; }
+    else if (ce - p >= 2 && p[0] == '<' && p[1] == '=') { op = 3; p += 2; }
+    else if (ce - p >= 2 && p[0] == '>' && p[1] == '=') { op = 5; p += 2; }
+    else if (ce - p >= 2 && p[0] == '=' && p[1] == '=') { op = 0; p += 2; }
+    else if (p < ce && p[0] == '=')                     { op = 0; p += 1; }
+    else if (p < ce && p[0] == '<')                     { op = 2; p += 1; }
+    else if (p < ce && p[0] == '>')                     { op = 4; p += 1; }
+    else return -1;
+
+    uint64_t k = 0;
+    if (p < ce && (*p == 'h' || *p == 'H')) {
+        d = ++p;
+        while (p < ce && rp_hexval(*p) >= 0) {
+            k = k * 16 + (uint64_t)rp_hexval(*p++);
+            if (k > 0xFFFFFFFFull) return -1;
+        }
+    } else if (p < ce && *p >= '0' && *p <= '9') {
+        if (*p == '0' && p + 1 < ce && (p[1] == 'x' || p[1] == 'X')) return -1;   /* memref, not const */
+        d = p;
+        while (p < ce && *p >= '0' && *p <= '9') {
+            k = k * 10 + (uint64_t)(*p++ - '0');
+            if (k > 0xFFFFFFFFull) return -1;
+        }
+    } else {
+        return -1;
+    }
+    if (p == d || p != ce) return -1;           /* trailing hit target / modifier */
+
+    uint32_t v = 0;
+    for (int i = 0; i < bytes; i++) {
+        uint32_t byte = disc[addr + i];
+        v |= be ? byte << (8 * (bytes - 1 - i)) : byte << (8 * i);
+    }
+    bool t;
+    switch (op) {
+        case 0:  t = v == (uint32_t)k; break;
+        case 1:  t = v != (uint32_t)k; break;
+        case 2:  t = v <  (uint32_t)k; break;
+        case 3:  t = v <= (uint32_t)k; break;
+        case 4:  t = v >  (uint32_t)k; break;
+        default: t = v >= (uint32_t)k; break;
+    }
+    return t ? 1 : 0;
+}
+
+/* A group whose conditions only use flags without evaluation side effects
+ * (none, AddAddress/AddSource/SubSource/Remember, AndNext/OrNext) and no hit
+ * target: when its first condition is false, nothing else in it can run. */
+static bool rp_group_side_effect_free(const char *g, const char *ge) {
+    const char *c = g;
+    while (c < ge) {
+        const char *e = c;
+        while (e < ge && *e != '_') e++;
+        if (e - c >= 2 && c[1] == ':') {
+            char f = (char)toupper((unsigned char)c[0]);
+            if (f != 'I' && f != 'A' && f != 'B' && f != 'K' && f != 'N' && f != 'O') return false;
+        }
+        if (e > c && e[-1] == '.') return false;   /* ".N." hit target */
+        c = e + 1;
+    }
+    return true;
+}
+
+/* Does the group carry a Measured / Measured% flag? (The trigger's progress
+ * target is parsed from those — pruning must not make it disappear.) */
+static bool rp_group_has_measured(const char *g, const char *ge) {
+    const char *c = g;
+    while (c < ge) {
+        const char *e = c;
+        while (e < ge && *e != '_') e++;
+        if (e - c >= 2 && c[1] == ':' &&
+            (c[0] == 'M' || c[0] == 'm' || c[0] == 'G' || c[0] == 'g')) return true;
+        c = e + 1;
+    }
+    return false;
+}
+
+struct rp_stats_t {
+    unsigned groups, live, dead_plain, dead_paused, kept_unsafe, unobtainable, kept_measured;
+    uint32_t conds_before, conds_after;
+};
+
+/* Rewrite one MemAddr value src[0..n) into dst (dst <= src, may overlap —
+ * the output is a subsequence of the input plus a shorter placeholder).
+ * Returns the new length. */
+static size_t rp_rewrite_memaddr(const char *src, size_t n, char *dst, const uint8_t *disc,
+                                 rp_stats_t *st) {
+    enum { MAX_GROUPS = 64 };
+    size_t gs[MAX_GROUPS], ge[MAX_GROUPS];
+    uint8_t keep[MAX_GROUPS];
+    unsigned ng = 0;
+    size_t s = 0;
+    bool plain_removed = false, verbatim = false;
+
+    for (size_t i = 0; i < n; i++) {
+        if (src[i] == '\\') { verbatim = true; break; }   /* JSON escape: don't touch */
+        if (memaddr_is_group_sep(src, i)) {
+            if (ng >= MAX_GROUPS - 1) { verbatim = true; break; }
+            gs[ng] = s; ge[ng] = i; ng++;
+            s = i + 1;
+        }
+    }
+    if (!verbatim) { gs[ng] = s; ge[ng] = n; ng++; }
+
+    st->conds_before += memaddr_cond_count(src, n);
+    unsigned live_alts = 0, removed = 0, n_live = 0, n_plain = 0, n_paused = 0, n_unsafe = 0;
+    bool removed_measured = false, kept_measured = false;
+    if (!verbatim) {
+        keep[0] = 1;                                       /* core: never touched */
+        kept_measured = rp_group_has_measured(src + gs[0], src + ge[0]);
+        for (unsigned g = 1; g < ng; g++) {
+            const char *a = src + gs[g], *ae = src + ge[g];
+            const char *c1 = a;
+            while (c1 < ae && *c1 != '_') c1++;              /* first condition [a, c1) */
+            bool pause;
+            int t = rp_eval_disc_guard(a, c1, disc, &pause);
+            keep[g] = 1;
+            if (t < 0) {                                     /* no disc guard: keep */
+                live_alts++;
+            } else if (pause && t == 1) {                    /* permanently paused */
+                keep[g] = 0; removed++; n_paused++;
+            } else if (!pause && t == 0) {                   /* never true */
+                if (rp_group_side_effect_free(a, ae)) {
+                    keep[g] = 0; plain_removed = true; removed++; n_plain++;
+                } else {
+                    n_unsafe++; live_alts++;
+                }
+            } else {
+                n_live++; live_alts++;
+            }
+            if (keep[g]) kept_measured    |= rp_group_has_measured(a, ae);
+            else         removed_measured |= rp_group_has_measured(a, ae);
+        }
+        st->groups += ng - 1;
+        st->live += n_live;
+        st->kept_unsafe += n_unsafe;
+    }
+    /* Keep the string intact (exactness over savings) when:
+     *  - no alt would survive: the achievement is unobtainable on this disc
+     *    anyway, and pruning everything would drop its progress target;
+     *  - a removed alt carries Measured and nothing kept does: the trigger's
+     *    progress target is parsed from those conditions. */
+    if (!verbatim && removed > 0 && live_alts == 0) { st->unobtainable++; verbatim = true; }
+    if (!verbatim && removed > 0 && removed_measured && !kept_measured) { st->kept_measured++; verbatim = true; }
+    if (verbatim || removed == 0) {
+        memmove(dst, src, n);
+        st->conds_after += memaddr_cond_count(src, n);
+        return n;
+    }
+    st->dead_plain  += n_plain;
+    st->dead_paused += n_paused;
+
+    size_t w = 0;
+    for (unsigned g = 0; g < ng; g++) {
+        if (!keep[g]) continue;
+        size_t len = ge[g] - gs[g];
+        if (g > 0) dst[w++] = 'S';
+        memmove(dst + w, src + gs[g], len);
+        w += len;
+    }
+    if (plain_removed) { memcpy(dst + w, "S0=1", 4); w += 4; }   /* never-paused, never-true */
+    st->conds_after += memaddr_cond_count(dst, w);
+    return w;
+}
+
+/* Prune every achievement's MemAddr for the current disc. Expects whitespace
+ * stripped. Leaderboards ("Mem") are not touched (yet). */
+static void json_prune_region_alts(PsramStream &buf) {
+    uint8_t disc[RA_GAME_ID_LEN];
+    for (int i = 0; i < RA_GAME_ID_LEN; i++) {
+        char ch = g_disc_id[i];
+        if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) {
+            LOG_ERR("DEBUG=RegionPrune: no valid disc ID (\"%.6s\") — skipped\r\n", g_disc_id);
+            return;
+        }
+        disc[i] = (uint8_t)ch;
+    }
+
+    char  *data = buf.data();
+    size_t len  = buf.length();
+    static const char KEY[] = "\"MemAddr\":\"";
+    rp_stats_t st;
+    memset(&st, 0, sizeof(st));
+    size_t r = 0, w = 0;
+    long k;
+    while ((k = json_find_in(data, r, len, KEY)) >= 0) {
+        size_t v0 = (size_t)k + sizeof(KEY) - 1;        /* first char of the value */
+        size_t v1 = json_string_end(data, v0 - 1, len); /* closing quote */
+        if (v1 >= len) break;                           /* unterminated: leave the rest */
+        memmove(data + w, data + r, v0 - r);
+        w += v0 - r;
+        w += rp_rewrite_memaddr(data + v0, v1 - v0, data + w, disc, &st);
+        r = v1;                                         /* the quote goes with the next copy */
+    }
+    memmove(data + w, data + r, len - r);
+    w += len - r;
+    buf.setLength(w);
+
+    LOG_DBG("DEBUG=RegionPrune: disc=%.6s alts=%u live=%u removed=%u (plain %u, paused %u) kept: unsafe=%u unobtainable=%u measured=%u | conditions %u -> %u, %u -> %u bytes\r\n",
+            g_disc_id, st.groups, st.live, st.dead_plain + st.dead_paused, st.dead_plain,
+            st.dead_paused, st.kept_unsafe, st.unobtainable, st.kept_measured,
+            (unsigned)st.conds_before, (unsigned)st.conds_after, (unsigned)len, (unsigned)w);
+}
+
 static void json_keep_first_set(PsramStream &buf) {
     json_remove_whitespace(buf);
     char* data = buf.data();
@@ -2261,16 +2800,17 @@ static QueueHandle_t http_req_q  = NULL;
 static QueueHandle_t http_done_q = NULL;
 static volatile uint32_t http_gen = 0;
 
-/* Hand a finished response body to the done-queue (called by httpTask). */
-static void http_finish(const http_job_t *job, const char *body, size_t body_len, int status) {
+/* Client-side error texts delivered as the response body with
+ * RC_API_SERVER_RESPONSE_CLIENT_ERROR; on_game_loaded() matches them to report
+ * a game-load error (0xE2) instead of "no internet" (0xE0). */
+static const char HTTP_ERR_TOO_LARGE[] = "achievement data too large for the adapter";
+static const char HTTP_ERR_NO_MEMORY[] = "adapter out of memory for the response";
+
+/* Queue a response whose body the done-queue now OWNS (http_drain frees it
+ * after the callback). body must be NUL-terminated at body_len. */
+static void http_finish_owned(const http_job_t *job, char *body, size_t body_len, int status) {
     http_done_t done;
-    done.body = (char *)ps_malloc(body_len + 1);
-    if (!done.body) {
-        LOG_ERR("ERROR=http_finish: ps_malloc(%u) failed\r\n", (unsigned)body_len + 1);
-        return;
-    }
-    memcpy(done.body, body, body_len);
-    done.body[body_len] = '\0';
+    done.body          = body;
     done.body_len      = body_len;
     done.status        = status;
     done.callback      = job->callback;
@@ -2280,6 +2820,25 @@ static void http_finish(const http_job_t *job, const char *body, size_t body_len
         LOG_ERR("ERROR=http_finish: done queue full, response dropped\r\n");
         free(done.body);
     }
+}
+
+/* Hand a copy of a finished response body to the done-queue (httpTask). */
+static void http_finish(const http_job_t *job, const char *body, size_t body_len, int status) {
+    char *copy = (char *)ps_malloc(body_len + 1);
+    if (!copy) {
+        LOG_ERR("ERROR=http_finish: ps_malloc(%u) failed\r\n", (unsigned)body_len + 1);
+        /* Never drop the callback (v0.36.0 rule 3): a dropped load callback
+         * leaves state stuck at LOADING_GAME forever (field 2026-09-25, MKW).
+         * The short error text fits where the body didn't. */
+        copy = strdup(HTTP_ERR_NO_MEMORY);
+        if (!copy) return;
+        body_len = strlen(copy);
+        status   = RC_API_SERVER_RESPONSE_CLIENT_ERROR;
+    } else {
+        memcpy(copy, body, body_len);
+        copy[body_len] = '\0';
+    }
+    http_finish_owned(job, copy, body_len, status);
 }
 
 /* ---- v0.36.0 HTTP resilience ----------------------------------------------
@@ -2373,6 +2932,11 @@ static size_t http_dechunk_in_place(char *buf, size_t len, bool *terminal) {
  * the done-queue (success OR a server-spoken HTTP error status — rc_client's
  * error handling knows best), -1 on a transport-level failure worth retrying
  * on a fresh socket (connect/TLS failure, mid-body drop, truncated framing). */
+/* server_call_attempt() result besides 0 (delivered) / -1 (transport failure,
+ * retryable): the patch outgrew the PSRAM patch buffer or the parse budget —
+ * deterministic, never retried; delivered as HTTP_ERR_TOO_LARGE. */
+#define HTTP_ATTEMPT_TOO_LARGE (-2)
+
 static int server_call_attempt(const http_job_t *job, bool is_patch) {
     client.setInsecure();
     https.begin(client, String(job->url));
@@ -2448,10 +3012,33 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
         // Large response: allocate in PSRAM, read fully, strip, callback
         // ----------------------------------------------------------------
         /* Wii patch responses are bigger than GameCube/NES — SMG and similar games
-         * exceed 800KB. Allocate generously from PSRAM (8MB total, ~7.5MB free here),
-         * and cap at 3MB which is still well within budget. */
-        size_t buf_size = (contentLen > 0) ? (size_t)(contentLen + 4096) : 2UL * 1024 * 1024;
-        if (buf_size > 3UL * 1024 * 1024) buf_size = 3UL * 1024 * 1024;
+         * exceed 800KB, and Mario Kart Wii's raw achievementsets (every set, every
+         * leaderboard, before the strip below) is over 2MB. Field report
+         * 2026-09-25: the old fixed 2MB chunked buffer filled up at the same
+         * byte on all 3 retries, the missing terminal 0-chunk was read as a
+         * "TLS drop", and WiiFlow showed "no internet connection" (the MKW
+         * payload is 4.2MB raw).
+         * Growing by realloc does NOT work here: PSRAM is 8MB and a copying
+         * realloc needs old + new at once, so 4MB -> 5MB already failed in HW
+         * (psram-free 3.8MB). Instead a chunked body gets ONE buffer as big as
+         * the largest free PSRAM block allows (minus headroom for mbedTLS
+         * records and the other tasks), ~7MB here. Every strip below works in
+         * place, and ps.shrink() hands the slack back before http_finish's copy
+         * and rc_client's parse — download big, then strip. */
+        const size_t PATCH_BUF_HEADROOM = 512UL * 1024;
+        size_t psram_blk = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        size_t patch_limit = (psram_blk > PATCH_BUF_HEADROOM + 1) ? psram_blk - PATCH_BUF_HEADROOM - 1 : 0;
+        if (contentLen > 0 && (size_t)contentLen > patch_limit) {
+            LOG_ERR("DEBUG=HTTP patch too large: content-length=%d > limit %u\r\n",
+                    contentLen, (unsigned)patch_limit);
+            https.end();
+            client.stop();
+            return HTTP_ATTEMPT_TOO_LARGE;
+        }
+        size_t buf_size = (contentLen > 0) ? (size_t)(contentLen + 4096) : patch_limit;
+        if (buf_size > patch_limit) buf_size = patch_limit;
+        LOG_DBG("DEBUG=HTTP patch buffer %u bytes (psram largest block %u)\r\n",
+                (unsigned)buf_size, (unsigned)psram_blk);
 
         PsramStream ps;
         if (!ps.reserve(buf_size)) {
@@ -2472,6 +3059,9 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
                                          (contentLen > 0) ? contentLen : -1,
                                          DL_STALL_MS, millis() + 120000UL, &aborted);
         ps.setLength(written);
+        /* Buffer filled without a Content-Length: judged below by the framing;
+         * if the chunked terminator is missing too, the body didn't fit. */
+        bool buf_full = !aborted && contentLen <= 0 && written >= ps.capacity();
 
         bool complete_body;
         if (contentLen > 0) {
@@ -2488,6 +3078,15 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
             /* Close-delimited identity body: close == end, nothing to check
              * beyond "we got something" (can't tell a drop from EOF here). */
             complete_body = !aborted && written > 0 && written < ps.capacity();
+        }
+        if (!complete_body && buf_full) {
+            /* Deterministic: a retry would hit the same wall, and it is not
+             * a connectivity problem — report it as such (see caller). */
+            LOG_ERR("DEBUG=HTTP patch too large: exceeded %u-byte buffer\r\n",
+                    (unsigned)ps.capacity());
+            client.stop();
+            https.end();
+            return HTTP_ATTEMPT_TOO_LARGE;
         }
         if (!complete_body) {
             LOG_ERR("DEBUG=HTTP patch truncated after %u bytes (TLS drop mid-download?); heap=%u rssi=%d wifi=%d\r\n",
@@ -2544,15 +3143,77 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
         vTaskDelay(1); json_remove_field(ps,      "RarityHardcore");
         vTaskDelay(1); json_remove_field(ps,      "Author");
         vTaskDelay(1); json_remove_flags5_achievements(ps);
+        /* Before the census and the condition budget, so both see only the
+         * logic that can run on THIS disc (MKW: 44.2K -> ~11K conditions). */
+        #if RA_REGION_PRUNE
+        vTaskDelay(1); json_prune_region_alts(ps);
+        #endif
 
 
         // print ths shrinked ps
         LOG_DBG("DEBUG=Patch after stripping fields: size=%u bytes\r\n", (unsigned)ps.length());
 
+        /* Census — what the payload is made of (MKW 2026-09-25: 4.4MB after
+         * the strip, composition unknown). MemAddr = achievement logic,
+         * Mem = leaderboard logic. */
+        {
+            unsigned n_ach, n_lb, n_ma, n_mem, n_rp;
+            size_t b_ach = json_field_value_bytes(ps, "Achievements", &n_ach);      vTaskDelay(1);
+            size_t b_ma  = json_field_value_bytes(ps, "MemAddr", &n_ma);            vTaskDelay(1);
+            size_t b_lb  = json_field_value_bytes(ps, "Leaderboards", &n_lb);       vTaskDelay(1);
+            size_t b_mem = json_field_value_bytes(ps, "Mem", &n_mem);               vTaskDelay(1);
+            size_t b_rp  = json_field_value_bytes(ps, "RichPresencePatch", &n_rp);  vTaskDelay(1);
+            LOG_DBG("DEBUG=Patch census: Achievements=%uKB (MemAddr x%u %uKB) Leaderboards=%uKB (Mem x%u %uKB) RichPresence=%uKB\r\n",
+                    (unsigned)(b_ach / 1024), n_ma, (unsigned)(b_ma / 1024),
+                    (unsigned)(b_lb / 1024), n_mem, (unsigned)(b_mem / 1024),
+                    (unsigned)(b_rp / 1024));
+        }
+
+        /* Condition budget — per-frame CPU (see RA_COND_BUDGET). Runs before
+         * the parse budget so that one sees the trimmed size. */
+        #if RA_COND_BUDGET > 0
+        vTaskDelay(1); json_trim_achievements_to_cond_budget(ps, RA_COND_BUDGET);
+        #endif
+
+        /* Give back the slack of the multi-MB download buffer. */
+        ps.shrink(ps.length());
+
+        /* Parse budget. rc_json copies every string into an rc_buffer and
+         * rc_buffer_reserve() returning NULL is NOT checked by
+         * rc_json_get_string — running out of PSRAM mid-parse is a crash, not
+         * an error. Peak ≈ the body (held until the callback returns) + its
+         * string copies (≤ 1x body) + the resident set (measured 2.24x body:
+         * 763KB SMG → +1709KB PSRAM), plus margin for what game-loaded
+         * allocates next (watchlist, Phase C, caches). Over budget: drop the
+         * leaderboards (achievements are the point); still over: refuse
+         * cleanly (0xE2) instead of crashing inside the parse. */
+        const size_t PARSE_MARGIN = 1024UL * 1024;
+        auto parse_need = [&]() { return ps.length() / 4 * 13 + PARSE_MARGIN; };  /* 3.25x + margin */
+        size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (parse_need() > psram_free) {
+            LOG_ERR("DEBUG=Patch over parse budget (need ~%uKB, psram-free %uKB) — dropping leaderboards\r\n",
+                    (unsigned)(parse_need() / 1024), (unsigned)(psram_free / 1024));
+            vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
+            ps.shrink(ps.length());
+            psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            LOG_DBG("DEBUG=Patch without leaderboards: size=%u bytes\r\n", (unsigned)ps.length());
+            if (parse_need() > psram_free) {
+                LOG_ERR("DEBUG=Patch still over parse budget (need ~%uKB, psram-free %uKB) — refusing\r\n",
+                        (unsigned)(parse_need() / 1024), (unsigned)(psram_free / 1024));
+                https.end();
+                client.stop();
+                return HTTP_ATTEMPT_TOO_LARGE;
+            }
+        }
+        LOG_DBG("DEBUG=Patch buffer shrunk: psram-free=%u largest=%u\r\n",
+                (unsigned)psram_free,
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
         /* Hand off to the done-queue — the rc_client callback runs on the
-         * loop task (Core 1), not here. ps destructor frees its PSRAM. */
-        http_finish(job, ps.c_str(), ps.length(), httpCode);
+         * loop task (Core 1), not here. The buffer itself changes owner (no
+         * body-sized copy: 2026-09-25 a 4.4MB copy failed with 3.6MB free). */
+        size_t patch_len = ps.length();
+        http_finish_owned(job, ps.detach(), patch_len, httpCode);
     } else {
         // ----------------------------------------------------------------
         // Small response (login, startsession, award, etc.)
@@ -2607,6 +3268,39 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
     return 0;
 }
 
+/* Copy a URL / form body for logging with credential values masked: the
+ * password (p=) and the session token (t=). Users paste these logs into
+ * public bug reports — 2026-09-25 one arrived with a plaintext RA password. */
+static const char *redact_creds(const char *in, char *out, size_t out_sz) {
+    if (!in) return "(null)";
+    size_t o = 0;
+    bool key_start = true;   /* at the beginning of a key=value pair */
+    while (*in && o + 1 < out_sz) {
+        if (key_start && (in[0] == 'p' || in[0] == 't') && in[1] == '=') {
+            const char *mask = "=***";
+            out[o++] = *in;
+            for (const char *m = mask; *m && o + 1 < out_sz; m++) out[o++] = *m;
+            in += 2;
+            while (*in && *in != '&') in++;   /* skip the secret */
+            key_start = false;
+            continue;
+        }
+        key_start = (*in == '&' || *in == '?');
+        out[o++] = *in++;
+    }
+    out[o] = '\0';
+    return out;
+}
+
+/* noinline: keeps the redaction scratch off httpTask's stack for the rest of
+ * server_call_blocking (TLS handshake + download run below it on 12KB). */
+static void __attribute__((noinline)) log_server_call(const http_job_t *job, bool is_patch) {
+    char url_log[256], data_log[384];
+    LOG_DBG("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch,
+            redact_creds(job->url, url_log, sizeof(url_log)),
+            redact_creds(job->post_data, data_log, sizeof(data_log)));
+}
+
 static void server_call_blocking(const http_job_t *job) {
     // Large responses: rcheevos 11.x uses r=patch, 12.x uses r=achievementsets.
     // Both can be ~500-700KB for games like SSBM.
@@ -2615,7 +3309,7 @@ static void server_call_blocking(const http_job_t *job) {
                     (strstr(job->url, "r=achievementsets")  != nullptr) ||
                     (job->post_data && strstr(job->post_data, "r=patch")           != nullptr) ||
                     (job->post_data && strstr(job->post_data, "r=achievementsets") != nullptr);
-    LOG_DBG("DEBUG=server_call is_patch=%d url=%s data=%s\r\n", (int)is_patch, job->url, job->post_data);
+    log_server_call(job, is_patch);
 
     /* Transport failures (TLS record corruption, connection drop, truncated
      * body) are transient link noise — retry on a fresh socket before
@@ -2630,7 +3324,15 @@ static void server_call_blocking(const http_job_t *job) {
                     attempt, HTTP_MAX_ATTEMPTS, job->url);
         }
         if (WiFi.status() != WL_CONNECTED) break;  /* loop()'s reconnect owns this — fail now */
-        if (server_call_attempt(job, is_patch) == 0) return;
+        int rc = server_call_attempt(job, is_patch);
+        if (rc == 0) return;
+        if (rc == HTTP_ATTEMPT_TOO_LARGE) {
+            /* Not a link problem and a retry can't help: non-retryable client
+             * error, with a message on_game_loaded() maps to 0xE2. */
+            http_finish(job, HTTP_ERR_TOO_LARGE, strlen(HTTP_ERR_TOO_LARGE),
+                        RC_API_SERVER_RESPONSE_CLIENT_ERROR);
+            return;
+        }
     }
 
     /* Every attempt failed at the transport level (or WiFi is down). Deliver
@@ -3361,7 +4063,7 @@ static uint16_t collect_missing_addresses(void) {
              * still land here, and asking ra-module to Swi_MLoad an invalid
              * address can hang the Starlet thread. */
             if (!((byte_addr <= 0x017FFFFF)
-                  || (byte_addr >= 0x10000000 && byte_addr <= 0x137FFFFF  /* IOS-reserved top of MEM2 excluded (read-fault guard) */))) continue;
+                  || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */))) continue;
 
             /* In static watchlist? O(1) hash lookup. */
             if (hash_lookup(byte_addr) >= 0) continue;
@@ -3656,6 +4358,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             memcpy(gid, p, RA_GAME_ID_LEN);
             gid[RA_GAME_ID_LEN] = '\0';
             LOG_INFO("DEBUG=EXI: LOAD_GAME id=%s rx_len=%u\r\n", gid, (unsigned)rx_len);
+            /* Region-alt pruning needs the disc ID when the patch arrives
+             * (httpTask, after login) — RA address 0..5 holds these bytes. */
+            memcpy(g_disc_id, gid, sizeof(g_disc_id));
 
             uint8_t has_hash = 0;
             char console_hash[RA_HASH_LEN + 1];
@@ -5009,10 +5714,15 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
          * the user WHY the load failed instead of a generic error:
          *   RC_NO_GAME_LOADED — the hash isn't in the RA database (bad dump /
          *                       unsupported version);
-         *   RC_NO_RESPONSE    — HTTP never got an answer (no internet). */
+         *   RC_NO_RESPONSE    — HTTP never got an answer (no internet), EXCEPT
+         *                       when httpTask gave up because the patch
+         *                       outgrew the adapter's memory: that is a game
+         *                       load error, not a connectivity one. */
+        bool too_large = error_message && (strcmp(error_message, HTTP_ERR_TOO_LARGE) == 0 ||
+                                           strcmp(error_message, HTTP_ERR_NO_MEMORY) == 0);
         if (result == RC_NO_GAME_LOADED)
             state = STATE_ERROR_UNKNOWN_GAME;
-        else if (result == RC_NO_RESPONSE)
+        else if (result == RC_NO_RESPONSE && !too_large)
             state = STATE_ERROR_WIFI;
         else
             state = STATE_ERROR;
@@ -5128,7 +5838,10 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
      * emitter's stricter edge-size/immediate rules) — expect ≈ indirect -
      * (elig+eligMmod) + eligMmod; a big excess = edge shapes to look at. */
     {
-        enum { PHASEC_NODE_CAP = 4096 };
+        /* Emit against the CONSOLE's cap: chains past it are refused one by
+         * one (legacy path) instead of the table overflowing it and
+         * GET_CHAIN_CHUNK serving nothing (MKW 2026-09-25: 3084 > 3072). */
+        enum { PHASEC_NODE_CAP = RA_MAX_CHAIN_NODES };
         /* Disarm the authoritative hooks FIRST (a do_frame may run between
          * games), then free per-game state. */
         g_phasec_auth = false;
@@ -5155,10 +5868,14 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         const void** keys =
             (const void**)ps_malloc(PHASEC_NODE_CAP * sizeof(void*));
         if (nodes && keys) {
-            uint32_t blob = 0, shipped = 0, refused = 0;
+            uint32_t blob = 0, shipped = 0, refused = 0, cap_refused = 0;
             uint32_t n = rc_memrefs_phasec_emit(rc_client_get_memrefs(client),
                                                 nodes, keys, PHASEC_NODE_CAP,
-                                                &blob, &shipped, &refused);
+                                                &blob, &shipped, &refused,
+                                                &cap_refused);
+            if (cap_refused)
+                LOG_ERR("DEBUG=PhaseC: %u chains over the console cap %u — kept on the legacy path\r\n",
+                        (unsigned)cap_refused, (unsigned)PHASEC_NODE_CAP);
             if (n == 0xFFFFFFFFu) {
                 LOG_ERR("ERROR=PhaseC emit: node cap %u overflow — Phase C OFF this game\r\n",
                         (unsigned)PHASEC_NODE_CAP);
@@ -5632,27 +6349,123 @@ String read_ra_pass_from_eeprom() {
 // ============================================================================
 // WiFiManager setup (reused from fpga-ra-adapter with renamed AP)
 // ============================================================================
-const char head[] = "<style>#l,#i,#z{text-align:center}button{background-color:#0000FF;}</style>";
-const char html_p1[] = "<p id='z'>Enter RetroAchievements credentials:</p>";
+/* Captive-portal page, ported from the NES adapter (2026-09-27):
+ *  - head: styles + tiny DOM helpers, and a redirect from the root
+ *    ("http://192.168.1.1/", WiFiManager's button menu, useless here) straight
+ *    to /wifi, where the network list and every field live;
+ *  - p1/p2/p3: instructions + one label per RA field (the params themselves
+ *    have no label);
+ *  - html_s (runs last, after the "up" input exists): page title, a "choose
+ *    the network" line above the scan list, SSID made required, and a
+ *    "show password" checkbox for the RA password. On the Wii there is no
+ *    screen to explain a failed attempt (the NES has a TFT), so html_s also
+ *    carries the reason of the last failure right under the title.
+ * WiFiManager keeps the POINTERS and re-renders them on every page load. */
+const char head[] = "<style>#l,#i,#z{text-align:center}#i,#z{margin:15px auto}button{background-color:#0000FF;}#l{margin:0 auto;width:100%; font-size: 28px;}p{margin-bottom:-5px}[type='checkbox']{height: 20px;width: 20px;}#x{color:#f66;text-align:center;margin:15px auto;width:80%}</style>"
+                    "<script>var w=window,d=document,e='password';function cc(){z=gE(this.w);z.type!=e?z.type=e:z.type='text';z.focus();}function iB(a,b,c){a.insertBefore(b,c)}function gE(a){return d.getElementById(a)}function cE(a){return d.createElement(a)};'http://192.168.1.1/'==w.location.href&&(w.location.href+='wifi');</script>";
+const char html_p1[] = "<p id='z' style='width: 80%;'>Enter the RetroAchievements credentials below:</p>";
+const char html_p2[] = "<p>&#8226; RetroAchievements user name: </p>";
+const char html_p3[] = "<p>&#8226; RetroAchievements user password: </p>";
+static char html_s[1024];
+
+/* (Re)build the end-of-form script; err = reason of the last failed attempt
+ * shown under the title, or NULL. err must not contain single quotes. */
+static void portal_set_error(const char *err) {
+    char errjs[256] = "";
+    if (err)
+        snprintf(errjs, sizeof(errjs), "x=cE('p');x.id='x',x.innerHTML='%s',iB(m,x,m.childNodes[1]);", err);
+    snprintf(html_s, sizeof(html_s),
+             "<script>gE('s').required=!0;l=cE('div');l.innerHTML='Wii RetroAchievements Adapter',l.id='l';"
+             "m=d.body.childNodes[0];iB(m,l,m.childNodes[0]);"
+             "p=cE('p');p.id='i',p.innerHTML='Choose the network you want to connect with:',iB(m,p,m.childNodes[1]);"
+             "%s"
+             "a=d.createTextNode(' show '+e),sp=(s=gE('up').nextSibling).parentNode,"
+             "(c1=cE('input')).type='checkbox',c1.onclick=cc,c1.w='up',iB(sp,c1,s),iB(sp,a,s);</script>",
+             errjs);
+}
+
 WiFiManagerParameter custom_p1(html_p1);
-WiFiManagerParameter custom_user("un", "RA Username", "", 24, " required");
-WiFiManagerParameter custom_pass("up", "RA Password", "", 14, " type='password' required");
+WiFiManagerParameter custom_p2(html_p2);
+WiFiManagerParameter custom_p3(html_p3);
+WiFiManagerParameter custom_s(html_s);
+/* Field lengths = the <input maxlength> the browser enforces (it silently cuts
+ * typed/pasted text) AND the value buffer. The password was 14 until
+ * 2026-09-26: a longer (new, stronger) password was truncated, RA rejected
+ * it, nothing was saved and the portal reopened forever ("no credentials" on
+ * the Wii). RA usernames are <= 20 chars; 255 matches the NES adapter and the
+ * 1-byte lengths of the EEPROM layout. The username gets no auto-capitalize /
+ * autocorrect (phone keyboards capitalize the first letter). */
+WiFiManagerParameter custom_user("un", NULL, "", 32, " required autocomplete='off' autocapitalize='none' autocorrect='off'");
+WiFiManagerParameter custom_pass("up", NULL, "", 255, " type='password' required");
+
+/* Portal-time / boot-time credential check. Builds the SAME request the
+ * game's rc_client login sends (r=login2, POST, fields URL-encoded by
+ * rcheevos — the old hand-built GET put the raw password in the URL, so any
+ * '&', '#', '+', '%' or space broke it) and parses the reply with rcheevos.
+ * Transport errors and 5xx are retried x3 on a fresh socket (the first TLS
+ * right after a new association can fail fast: -80 in 36ms seen in the
+ * field); a server-spoken rejection is not. Never logs the password.
+ * Returns the API token or "null"; g_login_rejected tells a rejection from
+ * "RetroAchievements could not be reached". */
+static bool g_login_rejected = false;
 
 String try_login_RA(String user, String pass) {
-    String path = "r=login&u=" + user + "&p=" + pass;
-    client.setInsecure();
-    https.begin(client, base_url + path);
-    https.setUserAgent("WII_RA_ADAPTER/0.1");
-    int code = https.GET();
-    if (code != HTTP_CODE_OK) { https.end(); return "null"; }
-    String resp = https.getString();
-    https.end();
-    // Extract token
-    int start = resp.indexOf("\"Token\":\"");
-    if (start == -1) return "null";
-    start += 9;
-    int end = resp.indexOf("\"", start);
-    return resp.substring(start, end);
+    g_login_rejected = false;
+    rc_api_login_request_t params;
+    memset(&params, 0, sizeof(params));
+    params.username = user.c_str();
+    params.password = pass.c_str();
+    rc_api_request_t req;
+    if (rc_api_init_login_request(&req, &params) != RC_OK) {
+        LOG_ERR("DEBUG=RA login check: could not build the request (user len %u)\r\n",
+                (unsigned)user.length());
+        return "null";
+    }
+
+    String token = "null";
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) delay(750);   /* let lwIP/WiFi settle */
+        uint32_t t0 = millis();
+        client.setInsecure();
+        https.begin(client, req.url);
+        https.setUserAgent("WII_RA_ADAPTER/0.1");
+        https.setTimeout(15000);
+        https.addHeader("Content-Type", req.content_type ? req.content_type
+                                                          : "application/x-www-form-urlencoded");
+        int code = https.POST((uint8_t *)req.post_data, strlen(req.post_data));
+        if (code <= 0 || code >= 500) {
+            LOG_ERR("DEBUG=RA login check %d/3: %s %d elapsed=%lums rssi=%d\r\n", attempt,
+                    code <= 0 ? "transport error" : "server error HTTP", code,
+                    (unsigned long)(millis() - t0), (int)WiFi.RSSI());
+            https.end();
+            client.stop();
+            continue;
+        }
+        String body = https.getString();
+        https.end();
+
+        rc_api_server_response_t sr;
+        memset(&sr, 0, sizeof(sr));
+        sr.body = body.c_str();
+        sr.body_length = body.length();
+        sr.http_status_code = code;
+        rc_api_login_response_t resp;
+        int r = rc_api_process_login_server_response(&resp, &sr);
+        if (r == RC_OK && resp.response.succeeded && resp.api_token && resp.api_token[0]) {
+            token = resp.api_token;
+            LOG_DBG("DEBUG=RA login check OK (%s) elapsed=%lums\r\n",
+                    resp.username ? resp.username : "?", (unsigned long)(millis() - t0));
+        } else {
+            g_login_rejected = true;
+            LOG_ERR("DEBUG=RA login check rejected: HTTP %d, %s (user len %u, password len %u)\r\n",
+                    code, resp.response.error_message ? resp.response.error_message : rc_error_str(r),
+                    (unsigned)user.length(), (unsigned)pass.length());
+        }
+        rc_api_destroy_login_response(&resp);
+        break;
+    }
+    rc_api_destroy_request(&req);
+    return token;
 }
 
 // ============================================================================
@@ -6221,11 +7034,21 @@ void setup() {
         wm->setDebugOutput(false);
         wm->setCustomHeadElement(head);
         wm->setDarkMode(true);
+        portal_set_error(NULL);
         wm->addParameter(&custom_p1);
+        wm->addParameter(&custom_p2);
         wm->addParameter(&custom_user);
+        wm->addParameter(&custom_p3);
         wm->addParameter(&custom_pass);
+        wm->addParameter(&custom_s);     /* last: its script needs the "up" input */
         wm->setAPStaticIPConfig(IPAddress(192,168,1,1), IPAddress(192,168,1,1), IPAddress(255,255,255,0));
-        
+        /* No "Update" (OTA) entry: the single-app partition table has no OTA
+         * slot, so a browser upload always failed (field report 2026-09-26).
+         * Firmware updates go through esptool. */
+        std::vector<const char *> portal_menu = {"wifi", "info", "exit"};
+        wm->setMenu(portal_menu);
+        wm->setShowInfoUpdate(false);
+
         while (!isConfigured()) {
             LOG_DBG("DEBUG=Connect to 'WII_RA_ADAPTER' WiFi, open http://192.168.1.1\r\n");
             snd_request(SND_ATTENTION);
@@ -6235,7 +7058,17 @@ void setup() {
                     snd_request(SND_SUCCESS);
                     save_configuration_info_eeprom(custom_user.getValue(), custom_pass.getValue());
                 } else {
-                    snd_request(SND_ERROR);   // wifi up but RA rejected the credentials
+                    /* WiFi is up but the RA check failed: nothing is saved and
+                     * the portal reopens — say why under its title. The
+                     * password field is cleared: WiFiManager re-renders the
+                     * previous value raw inside value='...', so a password with
+                     * ' or an &...; sequence would come back mangled and a
+                     * plain "Save" would resend the wrong one. */
+                    snd_request(SND_ERROR);
+                    portal_set_error(g_login_rejected
+                        ? "RetroAchievements rejected the username or password. Check them and try again."
+                        : "Could not reach RetroAchievements (WiFi connected, no answer). Check the network and try again.");
+                    custom_pass.setValue("", 255);
                 }
             }
         }

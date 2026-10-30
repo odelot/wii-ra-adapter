@@ -1,0 +1,54 @@
+menu "Wii RA adapter"
+
+config RA_LINK_USB
+    bool "Console link over USB (TinyUSB vendor device) instead of EXI"
+    default n
+    help
+        Build the adapter for the USB cable instead of the memory-card slot.
+        The RA protocol is unchanged: ra_usb_link.cpp implements the
+        exi_spi_slave.h API over a bulk vendor interface (VID:PID 303A:4052),
+        so main.cpp handles requests exactly as on EXI. Needs the matching
+        console side (d2x RAMOD built with USB=1, WiiFlow with USB support).
+
+        The native USB pins (GPIO19/20) go to the console, so the log is on
+        UART0 only (DevKitC "UART" port) and the USB-Serial-JTAG secondary
+        console must be off (CONFIG_ESP_CONSOLE_SECONDARY_NONE) or the device
+        never enumerates. Build with sdkconfig.usb.defaults (see README).
+
+config RA_KEEP_ONLY_FIRST_SET
+    bool "Load only the game's core achievement set (drop subsets/bonus sets)"
+    default y
+    help
+        v0.27.6 cap: keep the first set of the patch, drop the rest (SMG:
+        270 -> 161 achievements, ~40% less do_frame). Turn off to monitor
+        every set (sdkconfig.allsets.defaults).
+
+config RA_HARDCORE
+    bool "Hardcore mode (leaderboards are only evaluated/submitted in hardcore)"
+    default n
+    help
+        rc_client activates leaderboards ONLY in hardcore. Off (softcore), the
+        leaderboards load but never run, so their per-frame cost is absent
+        from any benchmark. The adapter is not an RA-approved client: use a
+        test account (sdkconfig.hardcore.defaults).
+
+config RA_LB_PROBE_ID
+    int "Leaderboard probe: log this leaderboard's conditions (0 = off)"
+    default 0
+    help
+        Diagnostic. After every evaluated frame, logs "LBP" lines with the
+        leaderboard's state and, for each START alt and VALUE clause, every
+        condition's current operand value, truth bit and hit count — on change
+        (at most every 250ms) plus a 2s heartbeat. Use it when a leaderboard
+        never starts/submits to tell wrong memory reads from unmet conditions.
+
+config RA_COND_BUDGET
+    int "Condition budget (0 = no cap)"
+    default 35000
+    help
+        When the set's estimated trigger-condition count exceeds this, the
+        most expensive achievements are dropped until it fits (never
+        progression / win_condition ones), each drop logged. 0 disables the
+        trim and loads everything.
+
+endmenu

@@ -58,6 +58,13 @@ volatile int g_par_upd_enabled = 1;        /* runtime A/B toggle */
 volatile uint32_t g_upd_a_us = 0;          /* core-1 (do_frame) Phase-2 time */
 volatile uint32_t g_upd_b_us = 0;          /* core-0 worker Phase-2 time (summed over depths) */
 
+/* 2026-10-13 — parallel leaderboard eval (same worker + work-stealing cursor as
+ * the achievements; see rc_client_do_frame_process_leaderboards). lpa/lpb = the
+ * two cores' eval time (0 when serial / below RC_PAR_MIN_LBOARDS). */
+volatile int g_rc_par_lb_enabled = 1;      /* runtime A/B toggle */
+volatile uint32_t g_par_lb_a_us = 0;       /* core-1 (do_frame) share */
+volatile uint32_t g_par_lb_b_us = 0;       /* core-0 worker share */
+
 #define RC_CLIENT_UNKNOWN_GAME_ID (uint32_t)-1
 #define RC_CLIENT_RECENT_UNLOCK_DELAY_SECONDS (10 * 60) /* ten minutes */
 #define RC_CLIENT_ACHIEVEMENT_WARNING_ID 101000001
@@ -6319,6 +6326,17 @@ static struct {
 } g_par_job;
 static volatile uint32_t g_par_next = 0;   /* work-stealing chunk cursor (shared, atomic) */
 #define RC_PAR_CHUNK 4                      /* achievements per steal — bounds last-chunk imbalance vs atomic overhead */
+
+/* Leaderboard eval job (g_par_kind == 2). Below RC_PAR_MIN_LBOARDS the
+ * handshake costs more than the split saves. */
+#define RC_PAR_MIN_LBOARDS 16
+static struct {
+  rc_client_t* client;
+  rc_client_leaderboard_info_t* base;
+  uint32_t n;
+} g_par_lb_job;
+static void rc_client_eval_leaderboard_range(rc_client_t* client,
+    rc_client_leaderboard_info_t* leaderboard, rc_client_leaderboard_info_t* stop);
 static SemaphoreHandle_t g_par_start = NULL;
 static SemaphoreHandle_t g_par_done = NULL;
 static TaskHandle_t g_par_task = NULL;
@@ -6332,6 +6350,21 @@ static void rc_par_worker(void* arg) {
     rc_client_achievement_info_t* base;
     xSemaphoreTake(g_par_start, portMAX_DELAY);
     _b0 = esp_timer_get_time();
+    if (g_par_kind == 2) {
+      /* leaderboard eval phase: work-steal lboard chunks; the transitions are
+       * applied serially by the do_frame core after the barrier. */
+      rc_client_t* lcl = g_par_lb_job.client;
+      rc_client_leaderboard_info_t* lbase = g_par_lb_job.base;
+      uint32_t ln = g_par_lb_job.n;
+      while ((c = (uint32_t)__atomic_fetch_add(&g_par_next, RC_PAR_CHUNK, __ATOMIC_RELAXED)) < ln) {
+        uint32_t end = c + RC_PAR_CHUNK; if (end > ln) end = ln;
+        rc_client_eval_leaderboard_range(lcl, lbase + c, lbase + end);
+      }
+      g_par_lb_b_us = (uint32_t)(esp_timer_get_time() - _b0);
+      ++g_par_runs;
+      xSemaphoreGive(g_par_done);
+      continue;
+    }
 #ifdef RC_PARALLEL_UPD
     if (g_par_kind == 1) {
       /* upd Phase-2 Pass A: work-steal chunks of the INDEPENDENT chain list (neither
@@ -6718,14 +6751,23 @@ static void rc_client_raise_mastery_event(rc_client_t* client, rc_client_subset_
   client->callbacks.event_handler(&client_event, client);
 }
 
-static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_client_subset_info_t* subset)
+/* Leaderboard frame, 2 phases (2026-10-13: MKW's 240 live leaderboards were
+ * ~12ms SERIAL on the do_frame core while core 0 idled).
+ *  - EVAL (parallel-safe, work-stolen across both cores like the achievements):
+ *    the lb-dirty gate + rc_evaluate_lboard. Writes only this leaderboard's own
+ *    state (lboard/trigger/condition hits, value, eval_next, par_*) and reads
+ *    the shared memrefs, which were all written earlier by the sequential
+ *    update (has_memrefs=0 for rc_client lboards -> no memref writes here).
+ *  - APPLY (serial, do_frame core, index order = the old event order): the
+ *    state transitions, whose tracker alloc/update/release and pending events
+ *    touch game/subset-shared state. */
+static void rc_client_eval_leaderboard_range(rc_client_t* client,
+    rc_client_leaderboard_info_t* leaderboard, rc_client_leaderboard_info_t* stop)
 {
-  rc_client_leaderboard_info_t* leaderboard = subset->leaderboards;
-  rc_client_leaderboard_info_t* stop = leaderboard + subset->public_.num_leaderboards;
-
   for (; leaderboard < stop; ++leaderboard) {
     rc_lboard_t* lboard = leaderboard->lboard;
-    int old_state, new_state;
+
+    leaderboard->par_evaluated = 0;
 
     switch (leaderboard->public_.state) {
       case RC_CLIENT_LEADERBOARD_STATE_INACTIVE:
@@ -6763,48 +6805,32 @@ static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_clie
         if (dep_changed_now || leaderboard->eval_next) {
           leaderboard->eval_next = dep_changed_now;   /* settle next frame too */
         } else {
-          ++g_rc_lb_skipped;
+          __atomic_fetch_add(&g_rc_lb_skipped, 1, __ATOMIC_RELAXED);
           continue;
         }
       }
     }
-    ++g_rc_lb_evaled;
+    __atomic_fetch_add(&g_rc_lb_evaled, 1, __ATOMIC_RELAXED);
 #endif
 
-#ifdef RC_DIRTY_EVAL
-    /* lb dirty-eval v2 (state-scoped): rc_evaluate_lboard tests the 3
-     * TRIGGERS every frame in every state (their hits block skips always),
-     * but the VALUE only runs while STARTED and is reset at start — so in
-     * ACTIVE (the 47-lb bulk) only the trigger deps/hits matter. Hard
-     * exclusions: hit accrual in scope (time-measuring values tick per
-     * frame while STARTED) and the Delta-settle frame after a dep change. */
-    if (g_rc_dirty_eval_enabled && g_rc_lb_dirty_enabled &&
-        leaderboard->dep_memrefs && leaderboard->no_hits_trig &&
-        (lboard->state == RC_LBOARD_STATE_ACTIVE ||
-         (lboard->state == RC_LBOARD_STATE_STARTED && leaderboard->no_hits_value))) {
-      uint16_t di;
-      uint16_t dn = (lboard->state == RC_LBOARD_STATE_ACTIVE)
-                    ? leaderboard->dep_trig_count : leaderboard->dep_count;
-      if (dn > 0) {   /* dn==0 = all-const triggers (e.g. "1=1" dev start):
-                       * truth doesn't hinge on memory — NEVER skip, the
-                       * state transition must be allowed to fire. */
-        uint8_t dep_changed_now = 0;
-        for (di = 0; di < dn; ++di) {
-          if (leaderboard->dep_memrefs[di]->changed) { dep_changed_now = 1; break; }
-        }
-        if (dep_changed_now || leaderboard->eval_next) {
-          leaderboard->eval_next = dep_changed_now;   /* settle next frame too */
-        } else {
-          ++g_rc_lb_skipped;
-          continue;
-        }
-      }
-    }
-    ++g_rc_lb_evaled;
-#endif
+    leaderboard->par_old_state = lboard->state;
+    leaderboard->par_new_state = (uint8_t)rc_evaluate_lboard(lboard, &leaderboard->value,
+                                                             client->state.legacy_peek, client, NULL);
+    leaderboard->par_evaluated = 1;
+  }
+}
 
-    old_state = lboard->state;
-    new_state = rc_evaluate_lboard(lboard, &leaderboard->value, client->state.legacy_peek, client, NULL);
+static void rc_client_apply_leaderboard_range(rc_client_t* client, rc_client_subset_info_t* subset,
+    rc_client_leaderboard_info_t* leaderboard, rc_client_leaderboard_info_t* stop)
+{
+  for (; leaderboard < stop; ++leaderboard) {
+    int old_state, new_state;
+
+    if (!leaderboard->par_evaluated)
+      continue;
+
+    old_state = leaderboard->par_old_state;
+    new_state = leaderboard->par_new_state;
 
     switch (new_state) {
       case RC_LBOARD_STATE_STARTED: /* leaderboard is running */
@@ -6844,6 +6870,39 @@ static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_clie
     if (leaderboard->pending_events)
       subset->pending_events |= RC_CLIENT_SUBSET_PENDING_EVENT_LEADERBOARD;
   }
+}
+
+static void rc_client_do_frame_process_leaderboards(rc_client_t* client, rc_client_subset_info_t* subset)
+{
+  rc_client_leaderboard_info_t* base = subset->leaderboards;
+  uint32_t n = subset->public_.num_leaderboards;
+
+#if RC_PARALLEL_EVAL
+  if (g_rc_par_lb_enabled && n >= RC_PAR_MIN_LBOARDS && rc_par_init()) {
+    g_par_lb_job.client = client;
+    g_par_lb_job.base   = base;
+    g_par_lb_job.n      = n;
+    g_par_kind = 2;   /* leaderboard eval job */
+    __atomic_store_n(&g_par_next, 0, __ATOMIC_RELAXED);
+    xSemaphoreGive(g_par_start);
+
+    { int64_t _a0 = esp_timer_get_time();
+      uint32_t c;
+      while ((c = (uint32_t)__atomic_fetch_add(&g_par_next, RC_PAR_CHUNK, __ATOMIC_RELAXED)) < n) {
+        uint32_t end = c + RC_PAR_CHUNK; if (end > n) end = n;
+        rc_client_eval_leaderboard_range(client, base + c, base + end);
+      }
+      g_par_lb_a_us = (uint32_t)(esp_timer_get_time() - _a0); }
+
+    xSemaphoreTake(g_par_done, portMAX_DELAY);   /* barrier: every lboard evaluated */
+  }
+  else
+#endif
+  {
+    rc_client_eval_leaderboard_range(client, base, base + n);
+  }
+
+  rc_client_apply_leaderboard_range(client, subset, base, base + n);
 }
 
 static void rc_client_raise_leaderboard_tracker_events(rc_client_t* client, rc_client_game_info_t* game)
@@ -7027,6 +7086,83 @@ uint32_t rc_client_modified_memref_count(const rc_client_t* client) {
   mml = &client->game->runtime.memrefs->modified_memrefs;
   if (mml->count) { do { n += mml->count; mml = mml->next; } while (mml); }
   return n;
+}
+
+/* Leaderboard probe (2026-10-13: the MKW Luigi Circuit time trial finished
+ * without a submission). Formats what rcheevos currently sees for one
+ * leaderboard: lboard state, then for every START alt and every VALUE clause
+ * the evaluated conditions in stored (category) order — AddAddress links are
+ * skipped — as <flag><operand-1 value>[*][h<cur>/<req>]: '*' = true at the
+ * last evaluation, the value is the resolved leaf for indirect reads (floats
+ * printed truncated). *sig changes whenever a truth bit, a hit count or the
+ * state changes, so the caller can log on change. Must run on the do_frame
+ * thread. Returns 0 if the id isn't loaded. */
+static size_t rc_lb_probe_condset(const rc_condset_t* cs, char* buf, size_t n, uint32_t* sig) {
+  static const char flag_ch[] = " PRQTMABIKCDZNO";
+  const rc_condition_t* c;
+  uint32_t i, cnt;
+  size_t off = 0;
+  if (!cs || !cs->conditions)
+    return 0;
+  c = RC_GET_TRAILING(cs, rc_condset_with_trailing_conditions_t, rc_condition_t, conditions);
+  cnt = (uint32_t)cs->num_pause_conditions + cs->num_reset_conditions +
+        cs->num_hittarget_conditions + cs->num_measured_conditions + cs->num_other_conditions;
+  for (i = 0; i < cnt && off + 24 < n; ++i, ++c) {
+    char vb[16];
+    if (rc_operand_is_memref(&c->operand1) && c->operand1.value.memref) {
+      const rc_memref_value_t* mv = &c->operand1.value.memref->value;
+      if (mv->type == RC_VALUE_TYPE_FLOAT) {
+        float f;
+        memcpy(&f, &mv->value, sizeof f);
+        snprintf(vb, sizeof vb, "%df", (int)f);
+      }
+      else {
+        snprintf(vb, sizeof vb, "%lx", (unsigned long)mv->value);
+      }
+    }
+    else {
+      snprintf(vb, sizeof vb, "k%lx", (unsigned long)c->operand1.value.num);
+    }
+    off += snprintf(buf + off, n - off, " %c%s%s", c->type < sizeof flag_ch - 1 ? flag_ch[c->type] : '?',
+                    vb, c->is_true ? "*" : "");
+    if (c->required_hits)
+      off += snprintf(buf + off, n - off, "h%lu/%lu", (unsigned long)c->current_hits, (unsigned long)c->required_hits);
+    *sig = (*sig ^ (uint32_t)(c->is_true | (c->current_hits << 1))) * 16777619u;
+  }
+  return off;
+}
+
+int rc_client_lb_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig) {
+  const rc_client_subset_info_t* subset;
+  if (!client || !client->game || !buf || n < 64)
+    return 0;
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    const rc_client_leaderboard_info_t* lb = subset->leaderboards;
+    const rc_client_leaderboard_info_t* stop = lb + subset->public_.num_leaderboards;
+    for (; lb < stop; ++lb) {
+      const rc_lboard_t* l;
+      const rc_condset_t* cs;
+      size_t off;
+      unsigned k;
+      if (lb->public_.id != id)
+        continue;
+      l = lb->lboard;
+      *sig = 2166136261u ^ (l ? l->state : 0xFF) ^ ((uint32_t)lb->public_.state << 8);
+      off = (size_t)snprintf(buf, n, "st=%u/%u", l ? (unsigned)l->state : 99u, (unsigned)lb->public_.state);
+      if (!l)
+        return 1;
+      for (k = 0, cs = l->start.alternative; cs && off + 32 < n; cs = cs->next, ++k) {
+        off += snprintf(buf + off, n - off, " |a%u%s", k, cs->is_paused ? "P" : "");
+        off += rc_lb_probe_condset(cs, buf + off, n - off, sig);
+      }
+      for (k = 0, cs = l->value.conditions; cs && off + 32 < n; cs = cs->next, ++k) {
+        off += snprintf(buf + off, n - off, " |v%u", k);
+        off += rc_lb_probe_condset(cs, buf + off, n - off, sig);
+      }
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* Snapshot / restore every memref value struct, in the SAME order as

@@ -1,9 +1,22 @@
 # Main component — the sketch (main.cpp) + its .cpp siblings.
 # arduino / WiFiManager / rcheevos are components (managed + local).
+#
+# Console link: EXI (memory-card slot, exi_spi_slave.cpp) by default, or USB
+# (ra_usb_link.cpp, same exi_spi_slave.h API) when CONFIG_RA_LINK_USB is set —
+# see Kconfig.projbuild and sdkconfig.usb.defaults. CONFIG_ values exist only
+# in the real configure pass; SRCS is ignored in the early requirements pass,
+# so selecting the source here is safe. esp_tinyusb is a dependency of BOTH
+# builds (idf_component.yml): the EXI build compiles it but never starts it.
+if(CONFIG_RA_LINK_USB)
+    set(ra_link_src "ra_usb_link.cpp")
+else()
+    set(ra_link_src "exi_spi_slave.cpp")
+endif()
+
 idf_component_register(
     SRCS
         "main.cpp"
-        "exi_spi_slave.cpp"
+        "${ra_link_src}"
         "loop_stack.cpp"
         "ra_web.cpp"
     INCLUDE_DIRS "."

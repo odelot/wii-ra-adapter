@@ -28,7 +28,7 @@
 
 /* >>> SELECT THE TARGET BOARD HERE <<< */
 #ifndef BOARD_VARIANT
-#define BOARD_VARIANT  BOARD_XIAO
+#define BOARD_VARIANT  BOARD_DEV
 #endif
 
 /* ---------------------------------------------------------------------------

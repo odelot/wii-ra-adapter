@@ -199,6 +199,11 @@ typedef struct rc_client_leaderboard_info_t {
   uint8_t no_hits_trig;     /* 1 => start/submit/cancel carry no hit accrual */
   uint8_t no_hits_value;    /* 1 => value condsets carry no hit accrual */
 #endif
+  /* 2-phase leaderboard frame (2026-10-13): the eval phase (parallel across both
+   * cores) records the transition here; the serial apply phase consumes it. */
+  uint8_t par_evaluated;
+  uint8_t par_old_state;
+  uint8_t par_new_state;
 } rc_client_leaderboard_info_t;
 
 struct rc_client_leaderboard_list_info_t;

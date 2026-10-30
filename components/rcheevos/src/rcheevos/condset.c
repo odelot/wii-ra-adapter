@@ -900,9 +900,23 @@ int rc_test_condset(rc_condset_t* self, rc_eval_state_t* eval_state) {
 
 void rc_reset_condset(rc_condset_t* self) {
   rc_condition_t* condition;
+  rc_condition_t* end;
 
-  for (condition = self->conditions; condition != 0; condition = condition->next) {
-    condition->current_hits = 0;
+  /* 2026-10-13 (MKW, 240 live leaderboards): a ResetIf that stays true resets
+   * its trigger EVERY frame, and the old walk over the ->next list touched every
+   * condition — ~75% of them AddAddress/AddSource links in the INDIRECT tail of
+   * the array, which the eval never tallies (their current_hits is always 0) —
+   * and stored a 0 into each, dirtying every PSRAM cache line: ~650KB of
+   * read+write-back per frame, ~12ms. Same result: clear only the evaluated
+   * prefix [pause|reset|hittarget|measured|other], and only where non-zero. */
+  condition = rc_condset_get_conditions(self);
+  if (condition) {
+    end = condition + self->num_pause_conditions + self->num_reset_conditions +
+          self->num_hittarget_conditions + self->num_measured_conditions + self->num_other_conditions;
+    for (; condition < end; ++condition) {
+      if (condition->current_hits)
+        condition->current_hits = 0;
+    }
   }
 
 #ifdef RC_EVAL_PLAN

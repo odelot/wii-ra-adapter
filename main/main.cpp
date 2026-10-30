@@ -97,6 +97,8 @@ extern "C" {
   /* v0.29.1 — parallel-eval diag: a=core-1 half, b=core-0 worker half, runs=worker fires. */
   extern volatile uint32_t g_par_a_us;
   extern volatile uint32_t g_par_b_us;
+  extern volatile uint32_t g_par_lb_a_us;   /* leaderboard eval, core-1 share */
+  extern volatile uint32_t g_par_lb_b_us;   /* leaderboard eval, core-0 worker share */
   extern volatile uint32_t g_par_runs;
   /* v0.32 cache-primed do_frame gate (resolver/evaluator divergence cure).
    * rc_client_do_frame runs the memref UPDATE, then calls g_rc_doframe_primed_cb;
@@ -104,6 +106,7 @@ extern "C" {
    * g_rc_doframe_deferred=1 WITHOUT evaluating any condition. */
   uint32_t rc_client_memref_count(const rc_client_t* client);
   uint32_t rc_client_modified_memref_count(const rc_client_t* client);   /* U1 sizing */
+  int rc_client_lb_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig);
   extern int (*g_rc_doframe_primed_cb)(void);
   extern rc_memref_value_t* g_rc_doframe_save_buf;
   extern uint32_t g_rc_doframe_save_cap;
@@ -515,6 +518,16 @@ uint16_t watch_count = 0;
 uint8_t *memory_data = NULL;          // Current values for each watched address
 volatile bool new_snapshot = false;    // Flag: new snapshot received from GC
 volatile uint32_t frame_counter = 0;
+
+/* RA addresses 0..5 = the disc ID (game ID + maker), constant while the disc
+ * runs. Reads of those bytes are served from the LOAD_GAME ID instead of the
+ * console snapshot: with the USB d2x build (2026-10-13, MKW) the console
+ * started delivering 00 00 00 00 there a few seconds into the game, which
+ * pauses every region-guarded alt (all of MKW's achievements and
+ * leaderboards). The mismatch is still logged (DISCID lines) to chase the
+ * console-side cause. */
+static uint8_t g_disc_id_mem[RA_GAME_ID_LEN];
+static volatile bool g_disc_id_mem_ok = false;
 // Set by the RA_CMD_RESET_CREDENTIALS handler; loop() wipes WiFi + RA creds and reboots.
 volatile bool g_factory_reset_pending = false;
 
@@ -743,6 +756,7 @@ static void tomb_clear(void) {
  * memory. Clean start, ~10s after boot, all invisible to the player. */
 static bool     g_warmup_active = false;
 static uint32_t g_warmup_end_frame = 0;
+static uint32_t g_warmup_snaps = 0;   /* snapshots evaluated in the window (stuck-clock fallback) */
 #define WARMUP_GAME_FRAMES 600u   /* ~10s at 60fps */
 
 static uint16_t wl_seq = 0;       /* last mutation seq applied locally (ESP) */
@@ -1727,6 +1741,25 @@ static void event_handler(const rc_client_event_t *event, rc_client_t *client) {
                     event->leaderboard ? (unsigned long)event->leaderboard->id : 0UL,
                     event->leaderboard ? event->leaderboard->title : "?");
             break;
+        case RC_CLIENT_EVENT_LEADERBOARD_SCOREBOARD: {
+            /* the server's verdict on a submission: rank among N entries and
+             * the account's best. An unapproved client may be accepted (200)
+             * yet never ranked — this is where that shows. */
+            const rc_client_leaderboard_scoreboard_t *sb = event->leaderboard_scoreboard;
+            if (sb)
+                LOG_INFO("DEBUG=event: LBOARD_SCOREBOARD id=%lu submitted=%s best=%s rank=%lu/%lu top=%lu\r\n",
+                         (unsigned long)sb->leaderboard_id, sb->submitted_score, sb->best_score,
+                         (unsigned long)sb->new_rank, (unsigned long)sb->num_entries,
+                         (unsigned long)sb->num_top_entries);
+            break;
+        }
+        case RC_CLIENT_EVENT_SERVER_ERROR:
+            if (event->server_error)
+                LOG_INFO("DEBUG=event: SERVER_ERROR api=%s related_id=%lu result=%d \"%s\"\r\n",
+                         event->server_error->api ? event->server_error->api : "?",
+                         (unsigned long)event->server_error->related_id, event->server_error->result,
+                         event->server_error->error_message ? event->server_error->error_message : "");
+            break;
         case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_SHOW:
         case RC_CLIENT_EVENT_LEADERBOARD_TRACKER_HIDE:
             LOG_INFO("DEBUG=event: LBTRK_%s id=%lu %s\r\n",
@@ -1837,6 +1870,11 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
         uint32_t byte_addr = address + j;
         bool got = false;
 
+        if (byte_addr < RA_GAME_ID_LEN && g_disc_id_mem_ok) {
+            buffer[j] = g_disc_id_mem[byte_addr];
+            continue;
+        }
+
         int32_t widx = hash_lookup(byte_addr);
         if (widx >= 0) {
             buffer[j] = memory_data[widx];
@@ -1901,6 +1939,11 @@ static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *u
     for (uint32_t j = 0; j < num_bytes && j < 4; j++) {
         uint32_t byte_addr = address + j;
         bool got = false;
+
+        if (byte_addr < RA_GAME_ID_LEN && g_disc_id_mem_ok) {
+            buf[j] = g_disc_id_mem[byte_addr];
+            continue;
+        }
 
         /* Static watchlist: O(1) hash lookup. Hash table maps addr →
          * watch_index; memory_data[watch_index] is the cached value.
@@ -2245,7 +2288,11 @@ static size_t json_field_value_bytes(const PsramStream &buf, const char *key, un
  * NEVER "progression" / "win_condition" ones (the game must stay beatable),
  * and log every drop. RA_COND_BUDGET 0 = feature off. */
 #ifndef RA_COND_BUDGET
+#ifdef CONFIG_RA_COND_BUDGET
+#define RA_COND_BUDGET CONFIG_RA_COND_BUDGET   /* Kconfig; 0 = no cap */
+#else
 #define RA_COND_BUDGET 35000
+#endif
 #endif
 
 /* Is s[i] a MemAddr group separator? rcheevos (trigger.c/condset.c) takes 'S'
@@ -2474,15 +2521,18 @@ static inline int rp_hexval(char c) {
 }
 
 /* Guard evaluation for one condition [c, ce): 1 = guard true, 0 = false,
- * -1 = not a plain disc-ID comparison (leave the group alone). *pause = it
- * carries the PauseIf flag. Mirrors rc_parse_memref / rc_parse_operand for the
- * forms accepted: "[P:]0x<size><hex><cmp><const>", size H/space/X/W/G/I/J or
- * legacy 16-bit, const decimal or h-hex, no hit target / modifier. */
-static int rp_eval_disc_guard(const char *c, const char *ce, const uint8_t *disc, bool *pause) {
-    *pause = false;
+ * -1 = not a disc-ID comparison (leave the group alone). *flag = the
+ * condition's flag: 0 (none), 'P' (PauseIf) or 'Q' (MeasuredIf — only the
+ * leaderboard VALUE pruner uses it); any other flag = -1. Mirrors
+ * rc_parse_memref / rc_parse_operand for the forms accepted:
+ * "[P:|Q:]0x<size><hex><cmp><const>", size H/space/X/W/G/I/J or legacy
+ * 16-bit, const decimal or h-hex, no hit target / modifier. */
+static int rp_eval_disc_guard(const char *c, const char *ce, const uint8_t *disc, char *flag) {
+    *flag = 0;
     if (ce - c >= 2 && c[1] == ':') {
-        if (c[0] != 'P' && c[0] != 'p') return -1;
-        *pause = true;
+        char f = (char)toupper((unsigned char)c[0]);
+        if (f != 'P' && f != 'Q') return -1;
+        *flag = f;
         c += 2;
     }
     if (ce - c < 4 || c[0] != '0' || (c[1] != 'x' && c[1] != 'X')) return -1;
@@ -2592,11 +2642,71 @@ struct rp_stats_t {
     uint32_t conds_before, conds_after;
 };
 
+/* Pointer-chain ROOTS of a leaderboard's triggers, split by region: the
+ * absolute address read by the FIRST AddAddress ("I:") of every chain. A
+ * root seen in a group this disc runs (core, unguarded alt, guard says this
+ * disc) is LIVE; one seen only in groups the guard rules out is DEAD. Feeds
+ * the VALUE inference in rp_rewrite_value. */
+struct rp_roots_t {
+    enum { MAX = 64 };
+    uint32_t live[MAX], dead[MAX];
+    unsigned n_live, n_dead;
+    bool overflow;
+};
+
+/* "0x[size]<hex>" -> address (size chars of rcheevos memrefs; legacy = none). */
+static bool rp_parse_mem_addr(const char *p, const char *pe, uint32_t *addr) {
+    if (pe - p < 3 || p[0] != '0' || (p[1] != 'x' && p[1] != 'X')) return false;
+    p += 2;
+    if (rp_hexval(*p) < 0) {
+        char c = (char)toupper((unsigned char)*p);
+        if (!strchr("HXWGIJLUMNOPQRSTK ", c)) return false;
+        p++;
+    }
+    const char *d = p;
+    uint64_t a = 0;
+    while (p < pe && rp_hexval(*p) >= 0) {
+        a = a * 16 + (uint64_t)rp_hexval(*p++);
+        if (a > 0xFFFFFFFFull) return false;
+    }
+    if (p == d) return false;
+    *addr = (uint32_t)a;
+    return true;
+}
+
+static bool rp_root_in(const uint32_t *arr, unsigned n, uint32_t a) {
+    for (unsigned i = 0; i < n; i++) if (arr[i] == a) return true;
+    return false;
+}
+
+/* Collect the chain roots of the condition list [g, ge). */
+static void rp_collect_roots(const char *g, const char *ge, rp_roots_t *rt, bool live) {
+    const char *c = g;
+    bool prev_I = false;
+    while (c < ge) {
+        const char *e = c;
+        while (e < ge && *e != '_') e++;
+        bool is_I = (e - c >= 2 && c[1] == ':' && (c[0] == 'I' || c[0] == 'i'));
+        uint32_t a;
+        if (is_I && !prev_I && rp_parse_mem_addr(c + 2, e, &a)) {
+            uint32_t *arr = live ? rt->live : rt->dead;
+            unsigned *n = live ? &rt->n_live : &rt->n_dead;
+            if (!rp_root_in(arr, *n, a)) {
+                if (*n < rp_roots_t::MAX) arr[(*n)++] = a;
+                else rt->overflow = true;
+            }
+        }
+        prev_I = is_I;
+        c = e + 1;
+    }
+}
+
 /* Rewrite one MemAddr value src[0..n) into dst (dst <= src, may overlap —
  * the output is a subsequence of the input plus a shorter placeholder).
- * Returns the new length. */
+ * Returns the new length. rt (leaderboard triggers only, else NULL): collects
+ * the chain roots per region for the VALUE inference. */
 static size_t rp_rewrite_memaddr(const char *src, size_t n, char *dst, const uint8_t *disc,
-                                 rp_stats_t *st) {
+                                 rp_stats_t *st, rp_roots_t *rt = NULL) {
     enum { MAX_GROUPS = 64 };
     size_t gs[MAX_GROUPS], ge[MAX_GROUPS];
     uint8_t keep[MAX_GROUPS];
@@ -2605,7 +2715,12 @@ static size_t rp_rewrite_memaddr(const char *src, size_t n, char *dst, const uin
     bool plain_removed = false, verbatim = false;
 
     for (size_t i = 0; i < n; i++) {
-        if (src[i] == '\\') { verbatim = true; break; }   /* JSON escape: don't touch */
+        if (src[i] == '\\') {
+            /* "\/" is how RA's JSON encodes '/' (the division operator): not a
+             * separator, safe to carry along. Any other escape: don't touch. */
+            if (i + 1 < n && src[i + 1] == '/') { i++; continue; }
+            verbatim = true; break;
+        }
         if (memaddr_is_group_sep(src, i)) {
             if (ng >= MAX_GROUPS - 1) { verbatim = true; break; }
             gs[ng] = s; ge[ng] = i; ng++;
@@ -2620,12 +2735,17 @@ static size_t rp_rewrite_memaddr(const char *src, size_t n, char *dst, const uin
     if (!verbatim) {
         keep[0] = 1;                                       /* core: never touched */
         kept_measured = rp_group_has_measured(src + gs[0], src + ge[0]);
+        if (rt) rp_collect_roots(src + gs[0], src + ge[0], rt, true);
         for (unsigned g = 1; g < ng; g++) {
             const char *a = src + gs[g], *ae = src + ge[g];
             const char *c1 = a;
             while (c1 < ae && *c1 != '_') c1++;              /* first condition [a, c1) */
-            bool pause;
-            int t = rp_eval_disc_guard(a, c1, disc, &pause);
+            char flag;
+            int t = rp_eval_disc_guard(a, c1, disc, &flag);
+            bool pause = (flag == 'P');
+            if (flag == 'Q') t = -1;                         /* MeasuredIf: values only */
+            if (rt)   /* this disc = guard keeps the group running; unguarded = shared */
+                rp_collect_roots(a, ae, rt, t < 0 || (pause && t == 0) || (!pause && t == 1));
             keep[g] = 1;
             if (t < 0) {                                     /* no disc guard: keep */
                 live_alts++;
@@ -2675,18 +2795,26 @@ static size_t rp_rewrite_memaddr(const char *src, size_t n, char *dst, const uin
     return w;
 }
 
-/* Prune every achievement's MemAddr for the current disc. Expects whitespace
- * stripped. Leaderboards ("Mem") are not touched (yet). */
-static void json_prune_region_alts(PsramStream &buf) {
-    uint8_t disc[RA_GAME_ID_LEN];
+/* The console's disc ID as the 6 bytes at RA address 0. false = no valid ID
+ * (never prune blind). */
+static bool rp_disc_bytes(uint8_t *disc, const char *who) {
     for (int i = 0; i < RA_GAME_ID_LEN; i++) {
         char ch = g_disc_id[i];
         if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) {
-            LOG_ERR("DEBUG=RegionPrune: no valid disc ID (\"%.6s\") — skipped\r\n", g_disc_id);
-            return;
+            LOG_ERR("DEBUG=%s: no valid disc ID (\"%.6s\") — skipped\r\n", who, g_disc_id);
+            return false;
         }
         disc[i] = (uint8_t)ch;
     }
+    return true;
+}
+
+/* Prune every achievement's MemAddr for the current disc. Expects whitespace
+ * stripped. Leaderboards ("Mem") go through json_prune_region_alts_lboards. */
+static void json_prune_region_alts(PsramStream &buf) {
+    uint8_t disc[RA_GAME_ID_LEN];
+    if (!rp_disc_bytes(disc, "RegionPrune"))
+        return;
 
     char  *data = buf.data();
     size_t len  = buf.length();
@@ -2712,6 +2840,303 @@ static void json_prune_region_alts(PsramStream &buf) {
             g_disc_id, st.groups, st.live, st.dead_plain + st.dead_paused, st.dead_plain,
             st.dead_paused, st.kept_unsafe, st.unobtainable, st.kept_measured,
             (unsigned)st.conds_before, (unsigned)st.conds_after, (unsigned)len, (unsigned)w);
+}
+
+/* ---- Region-alt pruning for LEADERBOARDS (2026-10-13) ----------------------
+ * MKW ships 240 leaderboards = 3.35 MB of "Mem" — too big to parse in 8 MB
+ * PSRAM next to the patch buffer, so the parse guard dropped them all. They
+ * carry the same per-region duplication as the achievements. A "Mem" is
+ * "STA:<trigger>::CAN:<trigger>::SUB:<trigger>::VAL:<value>[::PRO:<value>]":
+ *  - STA/CAN/SUB are triggers (rc_parse_trigger_internal, same evaluation as
+ *    an achievement) -> rp_rewrite_memaddr, the exact same rules;
+ *  - VAL/PRO are values: no 'S' alt groups, but '$'-separated MAX-of clauses
+ *    (rc_parse_cond_value / rc_evaluate_value_typed) -> rp_rewrite_value. */
+
+/* Leaderboard VALUE inference — NOT provably exact (everything else in the
+ * region pruner is). Sets like MKW write VAL as a MAX over per-region clauses
+ * with NO disc guard at all: each clause is a pointer chain from that region's
+ * static root, and the set relies on the other regions' chains coming out
+ * smaller on a given disc. With this on, a clause whose chain roots ALL appear
+ * only in trigger alts the disc guard rules out (rp_roots_t DEAD, never LIVE)
+ * is dropped as "another region's". Equivalent whenever the set works as its
+ * author intends (a foreign chain that won the MAX would already be a broken
+ * leaderboard on every client); counted separately in the log. 0 = exact only. */
+#ifndef RA_REGION_PRUNE_LB_INFER
+#define RA_REGION_PRUNE_LB_INFER 1
+#endif
+
+struct rp_val_stats_t {
+    unsigned clauses, paused_removed, zeroed, verbatim, inferred;
+    /* diagnostic: first condition of each clause — disc guard P/Q/plain,
+     * else its flag I/A/B/M/K/other, else no flag */
+    unsigned open_guard[3], open_flag[6], open_noflag;
+};
+
+/* Does the condition list [g, ge) carry flag `want` (upper case)? */
+static bool rp_has_flag(const char *g, const char *ge, char want) {
+    const char *c = g;
+    while (c < ge) {
+        const char *e = c;
+        while (e < ge && *e != '_') e++;
+        if (e - c >= 2 && c[1] == ':' && toupper((unsigned char)c[0]) == want) return true;
+        c = e + 1;
+    }
+    return false;
+}
+
+/* Rewrite one VALUE/PROGRESS src[0..n) into dst (dst <= src, may overlap; the
+ * output never outgrows the input clause by clause). rc_evaluate_value_typed:
+ * a PAUSED clause is skipped; a non-paused clause whose MeasuredIf is false
+ * yields exactly an unsigned 0; the result is the MAX over the rest (order-
+ * independent). So, for a clause whose FIRST condition is a disc-ID guard:
+ *  - "P:<guard>" TRUE -> paused every frame -> removed;
+ *  - "Q:<guard>" FALSE with no PauseIf in the clause -> always 0 -> all such
+ *    clauses collapse into one "Q:<guard>_M:0xH0" (the guard is false, so it
+ *    is still exactly 0: same MAX, same validity).
+ * Legacy (flag-less) values, escapes, and the "nothing would remain" case
+ * stay verbatim. */
+static size_t rp_rewrite_value(const char *src, size_t n, char *dst, const uint8_t *disc,
+                               rp_val_stats_t *st, const rp_roots_t *rt = NULL) {
+    enum { MAX_CL = 64 };
+    static const char ZERO_TAIL[] = "_M:0xH0";
+    const size_t ZT = sizeof(ZERO_TAIL) - 1;
+    size_t cs[MAX_CL], cend[MAX_CL], glen[MAX_CL];
+    uint8_t act[MAX_CL];   /* 0 keep, 1 remove, 2 collapse to zero */
+    unsigned nc = 0, n_keep = 0, n_rm = 0, n_zero = 0, n_inf = 0;
+    bool ok = (n >= 2 && src[1] == ':');      /* rc_parse_value_internal's test */
+    size_t s = 0;
+
+    for (size_t i = 0; ok && i < n; i++) {
+        if (src[i] == '\\') {
+            if (i + 1 < n && src[i + 1] == '/') i++;   /* "\/" = '/', harmless */
+            else ok = false;
+        } else if (src[i] == '$') {
+            if (nc >= MAX_CL - 1) ok = false;
+            else { cs[nc] = s; cend[nc] = i; nc++; s = i + 1; }
+        }
+    }
+    if (ok) { cs[nc] = s; cend[nc] = n; nc++; }
+    if (ok) {
+        st->clauses += nc;
+        for (unsigned k = 0; k < nc; k++) {
+            const char *a = src + cs[k], *ae = src + cend[k];
+            const char *c1 = a;
+            while (c1 < ae && *c1 != '_') c1++;
+            char flag;
+            int t = rp_eval_disc_guard(a, c1, disc, &flag);
+            /* Diagnostic histogram: how do value clauses open? */
+            if (t >= 0)
+                st->open_guard[flag == 'P' ? 0 : flag == 'Q' ? 1 : 2]++;
+            else if (c1 - a >= 2 && a[1] == ':') {
+                char f = (char)toupper((unsigned char)a[0]);
+                st->open_flag[f == 'I' ? 0 : f == 'A' ? 1 : f == 'B' ? 2 : f == 'M' ? 3 :
+                              f == 'K' ? 4 : 5]++;
+            } else
+                st->open_noflag++;
+            glen[k] = (size_t)(c1 - a);
+            act[k] = 0;
+            if (flag == 'P' && t == 1)
+                act[k] = 1;
+            else if (flag == 'Q' && t == 0 && !rp_has_flag(c1, ae, 'P') &&
+                     cend[k] - cs[k] >= glen[k] + ZT)       /* replacement must not grow */
+                act[k] = 2;
+#if RA_REGION_PRUNE_LB_INFER
+            /* Inference (see RA_REGION_PRUNE_LB_INFER): an unguarded clause
+             * whose chain roots are ALL foreign-region roots of this
+             * leaderboard's triggers. */
+            if (act[k] == 0 && t < 0 && rt && !rt->overflow && rt->n_dead > 0) {
+                unsigned roots = 0;
+                bool foreign = true;
+                const char *c = a;
+                bool prev_I = false;
+                while (c < ae && foreign) {
+                    const char *e = c;
+                    while (e < ae && *e != '_') e++;
+                    bool is_I = (e - c >= 2 && c[1] == ':' && (c[0] == 'I' || c[0] == 'i'));
+                    uint32_t ra;
+                    if (is_I && !prev_I && rp_parse_mem_addr(c + 2, e, &ra)) {
+                        roots++;
+                        if (rp_root_in(rt->live, rt->n_live, ra) ||
+                            !rp_root_in(rt->dead, rt->n_dead, ra))
+                            foreign = false;
+                    }
+                    prev_I = is_I;
+                    c = e + 1;
+                }
+                if (roots > 0 && foreign) { act[k] = 1; n_inf++; }
+            }
+#endif
+            if (act[k] == 0) n_keep++; else if (act[k] == 1) n_rm++; else n_zero++;
+        }
+        if (n_keep == 0 && n_zero == 0) ok = false;   /* nothing would remain: leave intact */
+        if (n_rm == 0 && n_zero <= 1) ok = false;      /* nothing to gain */
+    }
+    if (!ok) {
+        st->verbatim++;
+        memmove(dst, src, n);
+        return n;
+    }
+    st->paused_removed += n_rm - n_inf;
+    st->inferred += n_inf;
+    st->zeroed += n_zero;
+
+    size_t w = 0;
+    bool first = true, zero_done = false;
+    for (unsigned k = 0; k < nc; k++) {
+        if (act[k] == 1) continue;
+        if (act[k] == 2) {
+            if (zero_done) continue;
+            zero_done = true;
+            if (!first) dst[w++] = '$';
+            memmove(dst + w, src + cs[k], glen[k]);
+            w += glen[k];
+            memcpy(dst + w, ZERO_TAIL, ZT);
+            w += ZT;
+        } else {
+            size_t len = cend[k] - cs[k];
+            if (!first) dst[w++] = '$';
+            memmove(dst + w, src + cs[k], len);
+            w += len;
+        }
+        first = false;
+    }
+    return w;
+}
+
+struct rp_lb_stats_t {
+    rp_stats_t     trig;
+    rp_val_stats_t val;
+    unsigned       lboards, escaped, roots_overflow;
+    uint32_t       trig_in, trig_out, val_in, val_out;   /* field body bytes */
+};
+
+/* Rewrite one leaderboard "Mem" src[0..n) into dst (dst <= src): field by
+ * field ("::"-separated), each field's body through the trigger or value
+ * rewriter; unknown fields verbatim. */
+static size_t rp_rewrite_lboard(const char *src, size_t n, char *dst, const uint8_t *disc,
+                                rp_lb_stats_t *st) {
+    st->lboards++;
+    for (size_t i = 0; i < n; i++) {
+        if (src[i] != '\\') continue;
+        if (i + 1 < n && src[i + 1] == '/') { i++; continue; }   /* "\/" = '/' */
+        st->escaped++; memmove(dst, src, n); return n;
+    }
+    /* Chain roots per region, from this leaderboard's triggers (STA/CAN/SUB
+     * come before VAL in the string, so VAL sees them). Static: ~520 B, the
+     * patch is processed by a single task. */
+    static rp_roots_t roots;
+    memset(&roots, 0, sizeof(roots));
+    size_t r = 0, w = 0;
+    bool first = true;
+    while (r < n) {
+        size_t e = r;
+        while (e + 1 < n && !(src[e] == ':' && src[e + 1] == ':')) e++;
+        if (e + 1 >= n) e = n;                       /* last field */
+        size_t flen = e - r;
+        if (!first) { dst[w++] = ':'; dst[w++] = ':'; }
+        first = false;
+        if (flen >= 4 && src[r + 3] == ':') {
+            char k0 = (char)toupper((unsigned char)src[r]);
+            char k1 = (char)toupper((unsigned char)src[r + 1]);
+            char k2 = (char)toupper((unsigned char)src[r + 2]);
+            const char *b = src + r + 4;
+            size_t bl = flen - 4;
+            memmove(dst + w, src + r, 4);
+            w += 4;
+            if ((k0 == 'S' && k1 == 'T' && k2 == 'A') || (k0 == 'C' && k1 == 'A' && k2 == 'N') ||
+                (k0 == 'S' && k1 == 'U' && k2 == 'B')) {
+                size_t o = rp_rewrite_memaddr(b, bl, dst + w, disc, &st->trig, &roots);
+                st->trig_in += bl; st->trig_out += o;
+                w += o;
+            } else if ((k0 == 'V' && k1 == 'A' && k2 == 'L') || (k0 == 'P' && k1 == 'R' && k2 == 'O')) {
+                size_t o = rp_rewrite_value(b, bl, dst + w, disc, &st->val, &roots);
+                if (roots.overflow) st->roots_overflow++;
+                st->val_in += bl; st->val_out += o;
+                w += o;
+            } else {
+                memmove(dst + w, b, bl);
+                w += bl;
+            }
+        } else {
+            memmove(dst + w, src + r, flen);
+            w += flen;
+        }
+        r = (e >= n) ? n : e + 2;
+    }
+    return w;
+}
+
+/* Diagnostic (one leaderboard per load): the head of its "Mem" and the head of
+ * every VALUE clause, so the log shows how a set writes its per-region
+ * values. Lines stay under ralog's 384-byte buffer. */
+static void rp_lb_sample(const char *m, size_t n) {
+    LOG_DBG("DEBUG=LBSAMPLE mem len=%u head: %.*s\r\n", (unsigned)n, (int)(n < 220 ? n : 220), m);
+    const char *v = NULL;
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if ((i == 0 || (m[i - 1] == ':' && i >= 2 && m[i - 2] == ':')) &&
+            toupper((unsigned char)m[i]) == 'V' && toupper((unsigned char)m[i + 1]) == 'A' &&
+            toupper((unsigned char)m[i + 2]) == 'L' && m[i + 3] == ':') { v = m + i + 4; break; }
+    }
+    if (!v) return;
+    const char *ve = v;
+    while (ve < m + n && !(ve + 1 < m + n && ve[0] == ':' && ve[1] == ':')) ve++;
+    LOG_DBG("DEBUG=LBSAMPLE VAL len=%u\r\n", (unsigned)(ve - v));
+    const char *c = v;
+    for (int k = 0; c < ve && k < 6; k++) {
+        const char *e = c;
+        while (e < ve && *e != '$') e++;
+        LOG_DBG("DEBUG=LBSAMPLE VAL clause %d len=%u: %.*s\r\n", k, (unsigned)(e - c),
+                (int)(e - c < 240 ? e - c : 240), c);
+        c = e + 1;
+    }
+}
+
+/* Prune every leaderboard's "Mem" for the current disc. Expects whitespace
+ * stripped; run with json_prune_region_alts (before the census, the
+ * condition budget and the parse guard). */
+static void json_prune_region_alts_lboards(PsramStream &buf) {
+    uint8_t disc[RA_GAME_ID_LEN];
+    if (!rp_disc_bytes(disc, "RegionPrune LB"))
+        return;
+
+    char  *data = buf.data();
+    size_t len  = buf.length();
+    static const char KEY[] = "\"Mem\":\"";
+    rp_lb_stats_t st;
+    memset(&st, 0, sizeof(st));
+    size_t r = 0, w = 0;
+    long k;
+    bool sampled = false;
+    while ((k = json_find_in(data, r, len, KEY)) >= 0) {
+        size_t v0 = (size_t)k + sizeof(KEY) - 1;
+        size_t v1 = json_string_end(data, v0 - 1, len);
+        if (v1 >= len) break;
+        if (!sampled && memchr(data + v0, '$', v1 - v0)) {   /* a multi-clause VALUE */
+            rp_lb_sample(data + v0, v1 - v0);
+            sampled = true;
+        }
+        memmove(data + w, data + r, v0 - r);
+        w += v0 - r;
+        w += rp_rewrite_lboard(data + v0, v1 - v0, data + w, disc, &st);
+        r = v1;
+    }
+    memmove(data + w, data + r, len - r);
+    w += len - r;
+    buf.setLength(w);
+
+    LOG_DBG("DEBUG=RegionPrune LB: disc=%.6s lboards=%u escaped=%u | triggers: alts=%u live=%u removed=%u (plain %u, paused %u) kept unsafe=%u unobtainable=%u, conditions %u -> %u, %u -> %u B | %u -> %u bytes\r\n",
+            g_disc_id, st.lboards, st.escaped,
+            st.trig.groups, st.trig.live, st.trig.dead_plain + st.trig.dead_paused,
+            st.trig.dead_plain, st.trig.dead_paused, st.trig.kept_unsafe, st.trig.unobtainable,
+            (unsigned)st.trig.conds_before, (unsigned)st.trig.conds_after,
+            (unsigned)st.trig_in, (unsigned)st.trig_out, (unsigned)len, (unsigned)w);
+    LOG_DBG("DEBUG=RegionPrune LB values: clauses=%u paused-removed=%u zeroed=%u INFERRED=%u (roots overflow %u) verbatim=%u, %u -> %u B | clause opens: guard P/Q/plain=%u/%u/%u flag I/A/B/M/K/other=%u/%u/%u/%u/%u/%u noflag=%u\r\n",
+            st.val.clauses, st.val.paused_removed, st.val.zeroed, st.val.inferred,
+            st.roots_overflow, st.val.verbatim,
+            (unsigned)st.val_in, (unsigned)st.val_out,
+            st.val.open_guard[0], st.val.open_guard[1], st.val.open_guard[2],
+            st.val.open_flag[0], st.val.open_flag[1], st.val.open_flag[2], st.val.open_flag[3],
+            st.val.open_flag[4], st.val.open_flag[5], st.val.open_noflag);
 }
 
 static void json_keep_first_set(PsramStream &buf) {
@@ -3104,7 +3529,11 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
          * SMG do_frame ~40% (270→161 achievements) → df/s toward 60, the
          * timer fix. Set KEEP_ONLY_FIRST_SET to 0 to monitor every set. */
         #ifndef KEEP_ONLY_FIRST_SET
-        #define KEEP_ONLY_FIRST_SET 1
+        #if defined(CONFIG_RA_KEEP_ONLY_FIRST_SET) || !defined(CONFIG_RA_COND_BUDGET)
+        #define KEEP_ONLY_FIRST_SET 1   /* Kconfig default (or pre-Kconfig sdkconfig) */
+        #else
+        #define KEEP_ONLY_FIRST_SET 0   /* sdkconfig.allsets.defaults */
+        #endif
         #endif
         #if KEEP_ONLY_FIRST_SET
         vTaskDelay(1); json_keep_first_set(ps);
@@ -3147,6 +3576,7 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
          * logic that can run on THIS disc (MKW: 44.2K -> ~11K conditions). */
         #if RA_REGION_PRUNE
         vTaskDelay(1); json_prune_region_alts(ps);
+        vTaskDelay(1); json_prune_region_alts_lboards(ps);   /* MKW: 3.35 MB of LB "Mem" */
         #endif
 
 
@@ -3173,6 +3603,10 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
          * the parse budget so that one sees the trimmed size. */
         #if RA_COND_BUDGET > 0
         vTaskDelay(1); json_trim_achievements_to_cond_budget(ps, RA_COND_BUDGET);
+        #else
+        /* No cap: same pass with an unreachable budget — it still logs the
+         * "CondBudget: N achievements, ~C conditions" census, drops nothing. */
+        vTaskDelay(1); json_trim_achievements_to_cond_budget(ps, 0xFFFFFFFFu);
         #endif
 
         /* Give back the slack of the multi-MB download buffer. */
@@ -4361,6 +4795,16 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             /* Region-alt pruning needs the disc ID when the patch arrives
              * (httpTask, after login) — RA address 0..5 holds these bytes. */
             memcpy(g_disc_id, gid, sizeof(g_disc_id));
+            {   /* serve RA 0..5 from this ID (see g_disc_id_mem) — only a sane one */
+                bool ok = true;
+                for (int i = 0; i < RA_GAME_ID_LEN; i++) {
+                    char ch = gid[i];
+                    if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) { ok = false; break; }
+                }
+                g_disc_id_mem_ok = false;
+                memcpy(g_disc_id_mem, gid, RA_GAME_ID_LEN);
+                g_disc_id_mem_ok = ok;
+            }
 
             uint8_t has_hash = 0;
             char console_hash[RA_HASH_LEN + 1];
@@ -5731,6 +6175,32 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
     }
     LOG_DBG("DEBUG=Game loaded, building initial watchlist...\r\n");
 
+    /* Leaderboard roster: per-bucket counts (UNSUPPORTED = a "Mem" that failed
+     * to parse — e.g. a RegionPrune bug) and every leaderboard's id + title +
+     * description, so a test knows which game mode starts which board. */
+    {
+        rc_client_leaderboard_list_t *ll =
+            rc_client_create_leaderboard_list(client, RC_CLIENT_LEADERBOARD_LIST_GROUPING_NONE);
+        if (ll) {
+            for (uint32_t b = 0; b < ll->num_buckets; b++) {
+                const rc_client_leaderboard_bucket_t *bk = &ll->buckets[b];
+                LOG_DBG("DEBUG=LBLIST bucket type=%u \"%s\" n=%u\r\n", (unsigned)bk->bucket_type,
+                        bk->label ? bk->label : "?", (unsigned)bk->num_leaderboards);
+                for (uint32_t i = 0; i < bk->num_leaderboards; i++) {
+                    const rc_client_leaderboard_t *lb = bk->leaderboards[i];
+                    LOG_DBG("DEBUG=LBLIST %u st=%u %.90s | %.150s\r\n", (unsigned)lb->id,
+                            (unsigned)lb->state, lb->title ? lb->title : "",
+                            lb->description ? lb->description : "");
+                    /* 8 KB log ring drained at 250 kbaud (~25 B/ms): pace
+                     * ~1.6 KB per 70 ms so no line is dropped (MKW: 240
+                     * boards ≈ 2 s added to the load, diagnostic only). */
+                    if ((i & 7) == 7) vTaskDelay(pdMS_TO_TICKS(70));
+                }
+            }
+            rc_client_destroy_leaderboard_list(ll);
+        }
+    }
+
     const rc_memrefs_t *memrefs = rc_client_get_memrefs(client);
     uint32_t n = 0;
     if (memrefs)
@@ -6207,6 +6677,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
     rc_client_set_spectator_mode_enabled(client, 1);
     g_warmup_active = true;
     g_warmup_end_frame = 0;
+    g_warmup_snaps = 0;
 
     /* Transition to GAME_LOADED so WiiFlow sees status 0x06 (RA_STATUS_GAME_LOADED)
      * and knows it can proceed with the IOS reload + game boot.
@@ -6282,7 +6753,11 @@ void loadGame(const char *hash) {
      * test. RA_HARDCORE_MODE 0 restores softcore. Must be set BEFORE
      * begin_load_game (lb activation happens at load). */
     #ifndef RA_HARDCORE_MODE
+    #ifdef CONFIG_RA_HARDCORE
+    #define RA_HARDCORE_MODE 1   /* Kconfig (sdkconfig.hardcore.defaults) */
+    #else
     #define RA_HARDCORE_MODE 0
+    #endif
     #endif
     rc_client_set_hardcore_enabled(g_client, RA_HARDCORE_MODE);
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);
@@ -6487,7 +6962,13 @@ void processSnapshot() {
         new_snapshot = false;
         process_one_frame();
     }
-    while (!snapq_empty()) {
+    /* Bounded drain: under SUSTAINED overload (do_frame > 16.7ms — MKW race
+     * with live leaderboards, 2026-10-13) the producer refills the ring as
+     * fast as we drain it, so an unbounded loop never returned and loop()
+     * never ran http_drain_done(): every rc_client server callback (the
+     * submitlbentry results, unlock confirmations) sat in the queue for the
+     * whole race. The ring persists; the rest is drained on the next tick. */
+    for (uint8_t drained = 0; !snapq_empty() && drained < SNAPQ_N; drained++) {
         /* OVERLOAD collapse (wii8 lesson): a (near-)full ring means SUSTAINED
          * over-budget do_frames — draining 7 old entries one by one keeps us
          * permanently ~8 frames behind while the producer drops the NEWEST
@@ -6561,7 +7042,15 @@ static void process_one_frame() {
             g_warmup_end_frame = frame_counter + WARMUP_GAME_FRAMES;
             LOG_DBG("DEBUG=warmup: spectator until game frame %lu\r\n",
                      (unsigned long)g_warmup_end_frame);
-        } else if (frame_counter >= g_warmup_end_frame) {
+        } else if (frame_counter >= g_warmup_end_frame ||
+                   ++g_warmup_snaps >= WARMUP_GAME_FRAMES) {
+            /* 2026-10-19: also end by snapshots received. The Simpsons: Road
+             * Rage (Nintendont) froze the console's game-frame counter at 0 for
+             * the whole session, so the frame test never passed and every
+             * unlock stayed spectated (fired locally, never submitted). */
+            if (frame_counter < g_warmup_end_frame)
+                LOG_INFO("DEBUG=warmup: game-frame counter stuck at %lu after %lu snapshots - going live anyway\r\n",
+                         (unsigned long)frame_counter, (unsigned long)g_warmup_snaps);
             rc_client_reset(g_client);
             rc_client_set_spectator_mode_enabled(g_client, 0);
             g_warmup_active = false;
@@ -6648,6 +7137,52 @@ static void process_one_frame() {
                 this_df_us = (uint32_t)esp_timer_get_time() - t0;
                 g_df_us += this_df_us;
                 g_df_n  += 1;   /* exactly one do_frame ran (catch-up loop disabled) */
+                /* Disc-ID watch: once a second, compare what the console
+                 * delivers at RA 0..5 with the LOAD_GAME ID (which the reads
+                 * are served from). Logs each match<->mismatch transition. */
+                {
+                    static uint32_t did_frame = 0;
+                    static int8_t did_state = -1;   /* -1 unknown, 0 match, 1 mismatch */
+                    if (g_disc_id_mem_ok && memory_data && frame_counter - did_frame >= 60) {
+                        did_frame = frame_counter;
+                        uint8_t got[RA_GAME_ID_LEN];
+                        int32_t w0 = hash_lookup(0);
+                        bool all_in = true, same = true;
+                        for (uint32_t b = 0; b < RA_GAME_ID_LEN; b++) {
+                            int32_t w = hash_lookup(b);
+                            if (w < 0) { all_in = false; got[b] = 0; continue; }
+                            got[b] = memory_data[w];
+                            if (got[b] != g_disc_id_mem[b]) same = false;
+                        }
+                        int8_t st = same ? 0 : 1;
+                        if (st != did_state) {
+                            did_state = st;
+                            LOG_INFO("DEBUG=DISCID %s at frame %lu: console=%02X %02X %02X %02X %02X %02X%s (widx0=%ld) load=%.6s\r\n",
+                                     same ? "console matches" : "console MISMATCH (serving the LOAD_GAME ID)",
+                                     (unsigned long)frame_counter, got[0], got[1], got[2], got[3], got[4], got[5],
+                                     all_in ? "" : " [some bytes not watched]", (long)w0, (const char *)g_disc_id_mem);
+                        }
+                    }
+                }
+#if CONFIG_RA_LB_PROBE_ID
+                /* Leaderboard probe: log the probed LB's conditions whenever a
+                 * truth bit / hit count / state changes (≥250ms apart) plus a
+                 * 2s heartbeat; chunked to fit the 384-char log line. */
+                static uint32_t probe_sig = 0, probe_ms = 0;
+                static char probe_buf[1200];
+                uint32_t sig = 0;
+                if (rc_client_lb_probe(g_client, CONFIG_RA_LB_PROBE_ID, probe_buf, sizeof(probe_buf), &sig)) {
+                    uint32_t now = millis();
+                    if ((sig != probe_sig && now - probe_ms >= 250) || now - probe_ms >= 2000) {
+                        probe_sig = sig;
+                        probe_ms = now;
+                        size_t len = strlen(probe_buf);
+                        for (size_t off = 0, part = 0; off < len; off += 300, part++)
+                            LOG_DBG("DEBUG=LBP %u f=%lu %u: %.300s\r\n", (unsigned)CONFIG_RA_LB_PROBE_ID,
+                                    (unsigned long)frame_counter, (unsigned)part, probe_buf + off);
+                    }
+                }
+#endif
             }
         }
 
@@ -6698,7 +7233,7 @@ static void process_one_frame() {
          *                     skips/cache/parallel/EXI, l1h/l1m/urs/u1f/u1p).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu lbs=%lu lbe=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu lpa=%lu lpb=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu lbs=%lu lbe=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -6721,6 +7256,8 @@ static void process_one_frame() {
                   (unsigned long)g_cycle_us,
                   (unsigned long)g_par_a_us,
                   (unsigned long)g_par_b_us,
+                  (unsigned long)g_par_lb_a_us,
+                  (unsigned long)g_par_lb_b_us,
                   (unsigned long)g_par_runs,
                   de_sk, de_ev, de_rp,
                   (unsigned long)g_rc_lb_skipped, (unsigned long)g_rc_lb_evaled,
@@ -6766,7 +7303,8 @@ static void process_one_frame() {
         if (df_now - last_df_log >= 5000) {
             uint32_t dt = df_now - last_df_log;
             uint32_t gf = frame_counter - g_df_prev_gameframe;
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu q=%lu/%lu/%lu\r\n",
+            /* last frame's eval split: ach = achievements core1/core0, lb = leaderboards core1/core0 */
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu q=%lu/%lu/%lu | ach=%lu/%lu lb=%lu/%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -6777,7 +7315,9 @@ static void process_one_frame() {
                      (unsigned long)g_cm_n,
                      (unsigned long)g_cm_skipped,
                      (unsigned long)g_q_enq, (unsigned long)g_q_hwm,
-                     (unsigned long)g_q_drop);   /* q=enqueued/high-water/dropped */
+                     (unsigned long)g_q_drop,   /* q=enqueued/high-water/dropped */
+                     (unsigned long)g_par_a_us, (unsigned long)g_par_b_us,
+                     (unsigned long)g_par_lb_a_us, (unsigned long)g_par_lb_b_us);
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
@@ -6862,7 +7402,11 @@ void taskCore1(void *pvParameters) {
         uint32_t now = millis();
         if (now - last_heartbeat >= 5000) {
             last_heartbeat = now;
+#if CONFIG_RA_LINK_USB
+            int cs = -1;   /* no CS line on the USB link */
+#else
             int cs = gpio_get_level((gpio_num_t)EXI_PIN_CS);
+#endif
             LOG_DBG("DEBUG=Core1 alive | CS=%d | transactions=%lu | rx_bytes=%lu | state=%d | heap=%u maxblk=%u\n",
                     cs, (unsigned long)exi_spi_get_transaction_count(),
                     (unsigned long)exi_spi_get_total_bytes_rx(), (int)state,
@@ -6991,20 +7535,38 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    ralog_printf("WII-RA-ADAPTER v0.35.2-crc-%s (build %s %s)\n",
+    ralog_printf("WII-RA-ADAPTER v0.35.2-crc-%s-%s-psram%dM (build %s %s)\n",
                  (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
+#if CONFIG_RA_LINK_USB
+                 "usb",
+#else
+                 "exi",
+#endif
+                 (int)CONFIG_SPIRAM_SPEED,
                  __DATE__, __TIME__);
     /* lever B: arm the per-vblank collect walk budget from boot (also refreshed
      * each vblank). 0 = baseline; >0 = capped. Logged so the A/B run is labelled. */
     g_rc_collect_walk_budget = g_collect_walk_budget;
     ralog_printf("DEBUG=leverB: collect walk budget=%d (0=off)\n", g_collect_walk_budget);
+    /* Load caps in force — label every benchmark log with them. */
+#ifdef CONFIG_RA_HARDCORE
+    const char *ra_mode = "HARDCORE (leaderboards active)";
+#else
+    const char *ra_mode = "softcore (leaderboards loaded but NOT evaluated)";
+#endif
+#if defined(CONFIG_RA_KEEP_ONLY_FIRST_SET) || !defined(CONFIG_RA_COND_BUDGET)
+    ralog_printf("DEBUG=caps: sets=first-only cond_budget=%d mode=%s\n", (int)RA_COND_BUDGET, ra_mode);
+#else
+    ralog_printf("DEBUG=caps: sets=ALL cond_budget=%d (0=none) mode=%s\n", (int)RA_COND_BUDGET, ra_mode);
+#endif
 
-    // Initialize SPI slave for EXI
+    // Initialize the console link: SPI slave for EXI, or the TinyUSB vendor
+    // device (CONFIG_RA_LINK_USB — ra_usb_link.cpp, same API).
     if (!exi_spi_init(NULL)) {
-        LOG_ERR("ERROR=SPI init failed!\r\n");
+        LOG_ERR("ERROR=console link init failed!\r\n");
         while(1) yield();
     }
-    LOG_DBG("DEBUG=SPI slave initialized\r\n");
+    LOG_DBG("DEBUG=console link initialized\r\n");
 
     /* Start the EXI servicer BEFORE the WiFi/portal/login phase. Until v0.34
      * it was created after WiFi connected, so a Wii probing an adapter that

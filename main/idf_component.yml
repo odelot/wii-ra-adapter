@@ -3,8 +3,19 @@
 # 5.3.5 broke: arduino-esp32 3.1.3's source predates IDF 5.3.5's esp_adc
 # (adc_continuous_data_t) and i2c_ll changes, so its (too-loose 5.3.0-5.3.99)
 # version check passed but compilation failed. 3.2.x targets IDF 5.4 cleanly.
+#
+# esp_tinyusb + tinyusb: the USB console link (CONFIG_RA_LINK_USB,
+# ra_usb_link.cpp). Pulled in unconditionally so both builds share one lock
+# file; the EXI build never calls tinyusb_driver_install. No clash with
+# arduino-esp32's own TinyUSB glue: that is compiled only under
+# CONFIG_TINYUSB_ENABLED (arduino_tinyusb component), which is absent here.
+# Versions = the ones the USB spike was validated with (c:/dev/wii/usb-spike-esp).
 dependencies:
   idf:
     version: ">=5.4,<5.5"
   espressif/arduino-esp32:
     version: "~3.2.0"
+  espressif/esp_tinyusb:
+    version: "2.2.0"
+  espressif/tinyusb:
+    version: "0.19.0~3"

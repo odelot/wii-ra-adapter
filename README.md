@@ -63,7 +63,7 @@ An **ESP32-S3 dev board with 8 MB of octal PSRAM** and a **native USB port** —
 The DevKitC has two USB-C connectors: **`USB`** (the chip's native USB — this one goes to the Wii) and **`UART`** (a serial bridge, used for the debug log). Either can be used for flashing.
 
 <center>
-<img src="images/pcb-xiao.png" width="50%" alt="Compact XIAO ESP32S3 adapter PCB">
+<img src="images/esp32s3-devkit.png" width="50%" alt="Compact XIAO ESP32S3 adapter PCB">
 </center>
 
 Two firmware builds are provided, differing only in the PSRAM clock:

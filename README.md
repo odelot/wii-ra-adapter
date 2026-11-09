@@ -8,7 +8,7 @@ The wii-ra-adapter is an ESP32-S3 firmware. The board plugs into one of the Wii'
 
 This is the Wii/GameCube member of a family of adapters that started with the [nes-ra-adapter](https://github.com/odelot/nes-ra-adapter).
 
-> **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/baM7y3xbsA)) go a long way.
+> **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/6eYGq7NNfF)) go a long way.
 
 > **🆕 Wii U support (v0.0.5).** The adapter now also works on the **Wii U's vWii** (Wii mode), with its own release package. See [Wii U (vWii)](#wii-u-vwii).
 
@@ -245,7 +245,7 @@ To upgrade:
 - **A game identifies but has no achievements** — the game needs an achievement set on retroachievements.org, and your dump must match the RA database hash. For Wii games in particular, **scrubbed WBFS images hash incorrectly** — use accurate (unscrubbed) dumps.
 - **Live status** — while playing, open `http://wii-ra.local/` from any device on your network to watch the adapter in real time (see below).
 - **Adapter log without a cable** — on the dashboard, tap the game picture **10 times** to open the hidden diagnostics view: it shows why the board last restarted, the boot stage it reached and the adapter's log, which you can copy or download for an issue report.
-- **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/baM7y3xbsA) — the serial log (250000 baud, `UART` port) helps a lot.
+- **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/6eYGq7NNfF) — the serial log (250000 baud, `UART` port) helps a lot.
 
 ### Live web dashboard
 
@@ -312,7 +312,7 @@ The memory card version uses the `d2x-v999-test` cIOS build, and the memory card
 
 ## Support & community
 
-Questions about the installation, something not working as expected, or found a bug? Open an [issue](../../issues) or join the community on [Discord](https://discord.gg/baM7y3xbsA).
+Questions about the installation, something not working as expected, or found a bug? Open an [issue](../../issues) or join the community on [Discord](https://discord.gg/6eYGq7NNfF).
 
 ## Credits
 

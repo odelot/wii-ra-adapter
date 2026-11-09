@@ -1,6 +1,6 @@
 # wii-ra-adapter
 
-**RetroAchievements on original Wii hardware — for both Wii and GameCube games — with no PC, no emulator and no game patching.**
+**RetroAchievements on original Wii hardware — and on the Wii U in Wii mode — for both Wii and GameCube games, with no PC, no emulator and no game patching.**
 
 The wii-ra-adapter is an ESP32-S3 firmware. The board plugs into one of the Wii's **USB ports** with a plain USB cable. It connects to your Wi-Fi, logs into [RetroAchievements](https://retroachievements.org), and runs the official [rcheevos](https://github.com/RetroAchievements/rcheevos) client — while the Wii, ~60 times per second, streams snapshots of the running game's RAM to it over USB. Achievements pop on real hardware, on real discs/backups, in real time.
 
@@ -10,7 +10,9 @@ This is the Wii/GameCube member of a family of adapters that started with the [n
 
 > **⚠️ Early release** — this is a very early version of the project. It already works, and you can have a lot of fun with achievements popping on real hardware today, but occasional errors and rough edges are expected. We count on the community to help test it — if something breaks, a bit of patience and an [issue](../../issues) report (or a message on [Discord](https://discord.gg/6eYGq7NNfF)) go a long way.
 
-> **This repository is the distribution point**: releases here bundle the binaries of **all four projects** needed for a working setup (ESP32 firmware + WiiFlow Lite + d2x cIOS + Nintendont).
+> **🆕 Wii U support (v0.0.5).** The adapter now also works on the **Wii U's vWii** (Wii mode), with its own release package. See [Wii U (vWii)](#wii-u-vwii).
+
+> **This repository is the distribution point**: releases here bundle the binaries of **all four projects** needed for a working setup (ESP32 firmware + WiiFlow Lite + d2x cIOS + Nintendont), in **one package per console** (Wii or Wii U).
 
 ## The four projects
 
@@ -79,7 +81,9 @@ The **Seeed XIAO ESP32S3** (used by the memory card PCB) is **not distributed** 
 
 ## Getting Started
 
-The full path from a stock Wii to achievements popping on screen:
+The full path from a stock Wii to achievements popping on screen. **On a Wii U**, follow the same steps but read [Wii U (vWii)](#wii-u-vwii) first: steps 2 and 3 are different there.
+
+> **⚠️ Download the package for YOUR console.** Each release has two packages: **`wii-ra-adapter-vX.Y.Z-wii.zip`** for the original Wii and **`wii-ra-adapter-vX.Y.Z-wiiu.zip`** for the Wii U. They carry **different cIOS installers**: the Wii one builds the cIOS from Wii IOS files, the vWii one from vWii IOS files. [wii.hacks.guide](https://wii.hacks.guide/cios) warns that installing a Wii IOS on the vWii, or a vWii IOS on a Wii, *"will likely brick your console"*. Never copy the Wii package to a Wii U SD card, or the other way around.
 
 1. [What you need](#what-you-need)
 2. [Flash the ESP32-S3 firmware](#1-flash-the-esp32-s3-firmware)
@@ -91,7 +95,7 @@ The full path from a stock Wii to achievements popping on screen:
 
 ### What you need
 
-- An **original Wii (RVL-001)**. The Wii Family Edition (RVL-101) and vWii have USB ports but have not been tested yet.
+- An **original Wii (RVL-001)** or a **Wii U** (in Wii mode, see [Wii U (vWii)](#wii-u-vwii)). The Wii Family Edition (RVL-101) has USB ports too but has not been tested yet.
 - An SD card for the Wii.
 - An **ESP32-S3 dev board with 8 MB octal PSRAM and native USB**, e.g. ESP32-S3-DevKitC-1 N8R8 or N16R8 (see [Hardware](#hardware)).
 - A **USB cable** from the board's `USB` connector to a Wii USB port (USB-A to USB-C for the DevKitC).
@@ -100,7 +104,7 @@ The full path from a stock Wii to achievements popping on screen:
 
 ### 1. Flash the ESP32-S3 firmware
 
-1. Download the release zip from the [Releases](../../releases) section and open `firmware/esp32-s3-devkit-usb-psram120/` (the 120 MHz build).
+1. Download the package for your console from the [Releases](../../releases) section and open `firmware/esp32-s3-devkit-usb-psram120/` (the 120 MHz build). The firmware is the same in both packages.
 2. Install [esptool](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/installation.html) (already present if you use the Arduino IDE or ESP-IDF).
 3. Connect the board to your computer and identify its COM port (e.g. `COM11` on Windows, `/dev/ttyACM0` on Linux).
 4. From the folder with the three `.bin` files, run (adjust the port):
@@ -117,14 +121,16 @@ esptool --chip esp32s3 --port COM11 --baud 460800 --before default_reset --after
 
 ### 2. Softmod your Wii
 
-The adapter requires a softmodded Wii with the Homebrew Channel. If yours isn't modded yet, follow [wii.hacks.guide](https://wii.hacks.guide/) — it is the best, safest resource. If you already have the Homebrew Channel, you can skip this step.
+The adapter requires a softmodded Wii with the Homebrew Channel. If yours isn't modded yet, follow [wii.hacks.guide](https://wii.hacks.guide/) — it is the best, safest resource. If you already have the Homebrew Channel, you can skip this step. **Wii U:** see [Wii U (vWii)](#wii-u-vwii) instead.
 
 ### 3. Install the RA cIOS
+
+> **Wii U:** do not follow this step, it is for the original Wii only. Use the vWii installer as described in [Wii U (vWii)](#wii-u-vwii).
 
 Wii games need the custom d2x cIOS with the `ra-module`, in its **USB build: `d2x-v999-usb`**. This installs into slots **248–251** only; your stock IOS and system menu are untouched. (If you already use slots 248–251 for another cIOS setup, note that these will be overwritten — the bundled WiiFlow expects exactly these slots. If you installed `d2x-v999-test` for the memory card version before, reinstall over it.)
 
 1. Make a backup of the `apps` folder on your Wii SD card.
-2. Copy the contents of the release's `sd-card/` folder to the root of the SD card (this includes the `d2x-cios-installer` app used below, plus the loaders from step 4).
+2. Copy the contents of the `sd-card/` folder of the **Wii package** (`wii-ra-adapter-vX.Y.Z-wii.zip`) to the root of the SD card (this includes the `d2x-cios-installer` app used below, plus the loaders from step 4).
 3. Insert the SD card in the Wii, open the **Homebrew Channel** and launch **d2x-cios-installer**.
 4. Read the terms and press any button to continue.
 5. Install **four** cIOS, one for each row of this table, using: *Select cIOS:* `d2x-v999-usb`, *Select cIOS revision:* `65535`, and:
@@ -169,15 +175,77 @@ Then just launch a game. The loader shows the boot progress on screen (detecting
 
 Achievements are earned in **casual** mode for now: hardcore and leaderboard entries need the adapter to be recognized by the RetroAchievements team, which is in progress.
 
+### Games on a USB hard drive
+
+> **⚠️ Not validated yet.** SD card and disc are the tested paths. With the adapter on USB, games on a USB drive should list and boot, but achievements may not run: on cIOS base 58 the drive and the adapter cannot share the console's USB stack.
+
+WiiFlow picks its storage settings on its **first boot**. If the drive wasn't connected at that moment, or had no `wbfs` folder yet, WiiFlow stays on the SD card and your games don't show up. To set it up by hand:
+
+1. Plug the drive into one USB port and the adapter into the other.
+2. In **Settings → Startup Settings**, set **Mount SD only** to **No** and **USB Port** to the port the drive is in (0 or 1; if the list stays empty, try the other one). WiiFlow asks to reload.
+3. In **Settings → Game Partitions**, set **Wii Partition** and **GameCube Partition** to the drive (`USB1` is its first partition).
+4. Keep Wii games in the `wbfs` folder and GameCube games in the `games` folder at the root of that partition.
+
+Wii images must be full dumps: a **scrubbed `.wbfs`** usually fails the hash check, and WiiFlow cancels the boot with RetroAchievements on. To play those without achievements, turn RetroAchievements off in Settings.
+
+### Wii U (vWii)
+
+The adapter also runs on the Wii U in Wii mode (vWii). Everything happens inside vWii: the same WiiFlow, Nintendont and adapter firmware, and the same achievements. Only the softmod and the cIOS installer are different, and you need the **Wii U package**, `wii-ra-adapter-vX.Y.Z-wiiu.zip`.
+
+> **⚠️ Never use the Wii cIOS installer on a Wii U.** The `d2x-cios-installer` app in the Wii package builds the cIOS from Wii IOS files. [wii.hacks.guide](https://wii.hacks.guide/cios) warns: *"Do not attempt to install a Wii/Wii mini IOS or System Menu on the vWii. Doing so will likely brick your console."* On the Wii U, use only **`d2x-cios-installer-vwii`** ("d2x cIOS installer for vWii" in the Homebrew Channel), which is the one in the Wii U package. If an older SD card has the Wii installer in `apps/d2x-cios-installer`, delete that folder before you use the card on the Wii U.
+
+**1. Softmod.** Follow [wiiu.hacks.guide](https://wiiu.hacks.guide/) to install **Aroma** on the Wii U, then its vWii section to install the **Homebrew Channel** in Wii mode. You don't need to install cIOS from that guide: step 3 below does it.
+
+**2. Get the base IOS files.** The vWii installer does not download anything: it needs the four vWii base IOS as WAD files in the **root of the SD card**. They are Nintendo files, so they are not in the package. Download them with **NUSGet** exactly as the [wii.hacks.guide cIOS page](https://wii.hacks.guide/cios) describes in its vWii section: select the **vWii** platform, download **IOS 38 v4380**, **IOS 56 v5918**, **IOS 57 v6175** and **IOS 58 v6432**, and rename them to:
+
+```
+IOS38-64-v4380.wad
+IOS56-64-v5918.wad
+IOS57-64-v6175.wad
+IOS58-64-v6432.wad
+```
+
+**3. Install the RA cIOS.** Copy the contents of the Wii U package's `sd-card/` folder to the root of the SD card (with the WADs from step 2), put the card in the Wii U, open the **Homebrew Channel** in Wii mode and launch **d2x cIOS installer for vWii**. Install four cIOS with *Select cIOS:* **`d2x-v999-usb`** (not `d2x-v11-beta3-vWii`, which has no RetroAchievements module), using the same base and slot table as on the Wii:
+
+| Select cIOS base | Select cIOS slot |
+|---|---|
+| 38 | 248 |
+| 56 | 249 |
+| 57 | 250 |
+| 58 | 251 |
+
+If `d2x-v999-usb` is not in the list, exit with **B** and check that the SD card is not write-locked and that you launched the vWii installer.
+
+**4. Then continue with the normal guide**, from [step 5](#5-turn-the-adapter-on-for-the-first-time). The loaders are already on the SD card from step 3. The adapter goes in **any of the Wii U's USB ports**, front or back.
+
+**Things that are different on the Wii U:**
+
+- **Controllers.** The Wii U GamePad cannot be used as a controller for Wii software. In Wii mode it only shows the picture, and pressing its buttons gives you an error message. Use a **Wii Remote** for WiiFlow and Wii games. For GameCube games in Nintendont, use a Bluetooth controller: a **Wii Remote with a Classic Controller (Pro)** or a **Wii U Pro Controller**. The Wii U has no GameCube controller ports. Nintendont also supports some USB GameCube controller adapters, but none have been tested alongside the RA adapter, which also uses USB.
+- **Discs.** The Wii U drive reads Wii discs, but not GameCube discs. Play GameCube games from the SD card or a USB drive in Nintendont.
+- **Tested so far.** Wii games through WiiFlow and GameCube games through Nintendont, both from the SD card.
+
+### Upgrading from v0.0.4.x
+
+What changed in v0.0.5:
+
+- **cIOS and WiiFlow** now find the adapter even when WiiFlow has mounted no USB drive (its **Mount SD only** setting). Without that fix the adapter goes undetected on the Wii U.
+- **Firmware**: the web dashboard gains a hidden diagnostics view (see [Troubleshooting](#troubleshooting)), so you can read the adapter's log without a serial cable. Your Wi-Fi and RetroAchievements credentials survive the reflash.
+
+To upgrade:
+
+1. Reflash the firmware ([step 1](#1-flash-the-esp32-s3-firmware)), with the same build (120 or 80 MHz) that already works on your board.
+2. Copy the `sd-card/` folder of the package for your console to the SD card, overwriting the old files.
+3. Reinstall the cIOS: [step 3](#3-install-the-ra-cios) on the Wii, or [Wii U step 3](#wii-u-vwii) on the Wii U.
+
 ### Troubleshooting
 
 - **The board keeps rebooting after flashing** — your board's flash chip can't run the 120 MHz build; flash the 80 MHz one (step 1.5).
-- **"Adapter not detected"** — make sure the cable goes to the board's **`USB`** connector (not `UART`), that the board boots (serial log at 250000 baud), and that the cIOS you installed is **`d2x-v999-usb`**.
+- **"Adapter not detected"** — make sure the cable goes to the board's **`USB`** connector (not `UART`), that the board boots (serial log at 250000 baud), and that the cIOS you installed is **`d2x-v999-usb`** from **v0.0.5 or later**. Older versions don't find the adapter on the Wii U, and may not find it on a Wii with **Mount SD only** on.
 - **Login or download errors on boot** — the boot status line tells you which stage failed (Wi-Fi, login, game download). Wrong credentials? Reset them from WiiFlow's Settings and redo step 5.
 - **A game identifies but has no achievements** — the game needs an achievement set on retroachievements.org, and your dump must match the RA database hash. For Wii games in particular, **scrubbed WBFS images hash incorrectly** — use accurate (unscrubbed) dumps.
 - **Live status** — while playing, open `http://wii-ra.local/` from any device on your network to watch the adapter in real time (see below).
+- **Adapter log without a cable** — on the dashboard, tap the game picture **10 times** to open the hidden diagnostics view: it shows why the board last restarted, the boot stage it reached and the adapter's log, which you can copy or download for an issue report.
 - **Still stuck?** Open an [issue](../../issues) or ask in the [Discord community](https://discord.gg/6eYGq7NNfF) — the serial log (250000 baud, `UART` port) helps a lot.
-
 
 ### Live web dashboard
 
@@ -185,19 +253,28 @@ While a game is running, open **`http://wii-ra.local/`** from any device on the 
 
 ## Downloads
 
-Each release on this repository bundles everything from the [Getting Started](#getting-started) guide:
+Each release on this repository bundles everything from the [Getting Started](#getting-started) guide, in **two packages, one per console**. Download only the one for your console (see the [brick warning](#wii-u-vwii)):
+
+| Package | For | cIOS installer inside |
+|---|---|---|
+| `wii-ra-adapter-vX.Y.Z-wii.zip` | original Wii | `apps/d2x-cios-installer/` (Wii) |
+| `wii-ra-adapter-vX.Y.Z-wiiu.zip` | Wii U (vWii) | `apps/d2x-cios-installer-vwii/` (vWii) |
 
 ```
-wii-ra-adapter-vX.Y.Z.zip
-├─ firmware/
+wii-ra-adapter-vX.Y.Z-wii.zip / wii-ra-adapter-vX.Y.Z-wiiu.zip
+├─ READ-ME-FIRST.txt                 which console the package is for
+├─ firmware/                         same in both packages
 │  ├─ esp32-s3-devkit-usb-psram120/  bootloader.bin, partition-table.bin, wii-ra-adapter.bin  (try first)
 │  └─ esp32-s3-devkit-usb-psram80/   bootloader.bin, partition-table.bin, wii-ra-adapter.bin  (fallback)
-└─ sd-card/                          copy the contents to the root of your Wii SD card
+└─ sd-card/                          copy the contents to the root of the SD card
    └─ apps/
-      ├─ wiiflow/            WiiFlow Lite build with RA support (USB)
-      ├─ nintendont/         Nintendont build with RA support (USB)
-      └─ d2x-cios-installer/ installer for the d2x cIOS d2x-v999-usb (with the ra-module)
+      ├─ wiiflow/                    WiiFlow Lite build with RA support (USB), same in both
+      ├─ Nintendont/                 Nintendont build with RA support (USB), same in both
+      ├─ d2x-cios-installer/         Wii package only: Wii installer for d2x-v999-usb
+      └─ d2x-cios-installer-vwii/    Wii U package only: vWii installer for d2x-v999-usb
 ```
+
+The vWii installer needs the four base IOS WAD files on the SD card. They are Nintendo files and are not included, see [Wii U step 2](#wii-u-vwii).
 
 Sources for the console-side projects live in their own repositories (forks of [wiidev/d2x-cios](https://github.com/wiidev/d2x-cios), [WiiFlow Lite](https://github.com/Fledge68/WiiFlow_Lite) and [FIX94's Nintendont](https://github.com/FIX94/Nintendont)).
 

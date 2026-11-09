@@ -212,6 +212,9 @@ static void ralog_vprintf(const char *fmt, va_list ap) {
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (n <= 0) return;
     uint32_t len = (n < (int)sizeof(buf)) ? (uint32_t)n : (uint32_t)(sizeof(buf) - 1);
+#if RA_WEB_DASHBOARD
+    ra_web_log_tee(buf, len);                        /* hidden debug view (/api/log) */
+#endif
     if (g_log_async_ready) ralog_write(buf, len);
     else ralog_sink(buf, len);                       /* boot: no EXI yet, blocking ok */
 }
@@ -221,6 +224,45 @@ void ralog_printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     ralog_vprintf(fmt, ap);
     va_end(ap);
+}
+
+/* Field diagnostics surfaced by the dashboard's hidden debug view
+ * (web_diag_hook). Written from any task, read racily on Core 0 — fine for
+ * counters and a "last error" summary. */
+static char g_fw_version[48] = "?";
+static volatile uint32_t g_diag_http_errs = 0;      /* transport errors / truncated bodies */
+static volatile int      g_diag_http_last_code = 0;
+static volatile int      g_diag_http_last_rssi = 0;
+static volatile uint32_t g_diag_http_last_ms = 0;
+static const char *volatile g_diag_http_last_what = "";
+static volatile uint32_t g_diag_wifi_drops = 0;     /* STA disconnected events */
+static volatile int      g_diag_wifi_last_reason = 0;
+static volatile uint32_t g_diag_wifi_last_ms = 0;
+
+static void diag_note_http_err(const char *what, int code, int rssi) {
+    g_diag_http_last_what = what;
+    g_diag_http_last_code = code;
+    g_diag_http_last_rssi = rssi;
+    g_diag_http_last_ms = millis();
+    g_diag_http_errs++;
+}
+
+/* Brown-out workarounds behind the debug card (both off by default): the
+ * pre-Wi-Fi delay and a cap on the radio's TX power (peak current of each
+ * burst; costs some range — watch RSSI on the card). */
+#ifndef RA_WIFI_DELAY_MS
+#define RA_WIFI_DELAY_MS 3000
+#endif
+#ifndef RA_WIFI_TX_LIMIT
+#define RA_WIFI_TX_LIMIT WIFI_POWER_15dBm
+#endif
+static void apply_wifi_tx_limit(void) {
+#if RA_WEB_DASHBOARD
+    if (!ra_web_boot_settings()->tx_limit) return;
+    WiFi.setTxPower(RA_WIFI_TX_LIMIT);
+    ralog_printf("DEBUG=diag: Wi-Fi TX power capped (requested %d, now %d; units of 0.25 dBm)\r\n",
+             (int)RA_WIFI_TX_LIMIT, (int)WiFi.getTxPower());
+#endif
 }
 
 /* Drains the ring to Serial on Core 0. Lock held ONLY for the chunk copy, never
@@ -3397,6 +3439,7 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (int)WiFi.RSSI(), (int)WiFi.status());
+        diag_note_http_err("transport", httpCode, (int)WiFi.RSSI());
         https.end();
         client.stop();
         return -1;
@@ -3426,6 +3469,7 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
         LOG_ERR("DEBUG=HTTP status %d url=%s body=%u bytes elapsed=%lums\r\n",
                 httpCode, job->url, (unsigned)elen,
                 (unsigned long)(millis() - req_start_ms));
+        diag_note_http_err("http status", httpCode, (int)WiFi.RSSI());
         http_finish(job, err_body, elen, httpCode);
         https.end();
         client.stop();
@@ -3517,6 +3561,7 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
             LOG_ERR("DEBUG=HTTP patch truncated after %u bytes (TLS drop mid-download?); heap=%u rssi=%d wifi=%d\r\n",
                     (unsigned)ps.length(), (unsigned)ESP.getFreeHeap(),
                     (int)WiFi.RSSI(), (int)WiFi.status());
+            diag_note_http_err("patch truncated", 0, (int)WiFi.RSSI());
             client.stop();
             https.end();
             return -1;
@@ -3568,8 +3613,8 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
         vTaskDelay(1); json_remove_field(ps,      "BadgeLockedURL");
         vTaskDelay(1); json_remove_field(ps,      "BadgeURL");
         vTaskDelay(1); json_remove_field(ps,      "ImageIconURL");
-        vTaskDelay(1); json_remove_field(ps,      "Rarity");
-        vTaskDelay(1); json_remove_field(ps,      "RarityHardcore");
+        /* Rarity/RarityHardcore stay (~50 B per achievement): the dashboard
+         * shows them, and once stripped rcheevos defaults both to 100%. */
         vTaskDelay(1); json_remove_field(ps,      "Author");
         vTaskDelay(1); json_remove_flags5_achievements(ps);
         /* Before the census and the condition budget, so both see only the
@@ -4863,6 +4908,9 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             if (state == STATE_GAME_LOADED) {
                 state = STATE_ACTIVE;
                 g_roots_built = false;   /* rebuild chain-root gate for this game's memrefs */
+#if RA_WEB_DASHBOARD
+                ra_web_stage(RA_STAGE_IN_GAME);
+#endif
                 LOG_INFO("DEBUG=*** STATE 6 -> 7: first SNAPSHOT received from ra-module ***\r\n");
             }
             /* Dual-parse: legacy snapshot header is 8B (frame/count/seq); the
@@ -6054,7 +6102,8 @@ static size_t g_web_json_cap = 0;
 static const char *web_cat_name(uint8_t bucket_type) {
     switch (bucket_type) {
         case RC_CLIENT_ACHIEVEMENT_BUCKET_UNLOCKED:
-        case RC_CLIENT_ACHIEVEMENT_BUCKET_RECENTLY_UNLOCKED: return "unlocked";
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_RECENTLY_UNLOCKED:
+        case RC_CLIENT_ACHIEVEMENT_BUCKET_UNSYNCED:          return "unlocked";
         case RC_CLIENT_ACHIEVEMENT_BUCKET_ACTIVE_CHALLENGE:  return "challenge";
         case RC_CLIENT_ACHIEVEMENT_BUCKET_ALMOST_THERE:      return "progress";
         case RC_CLIENT_ACHIEVEMENT_BUCKET_UNSUPPORTED:       return "unsupported";
@@ -6073,21 +6122,61 @@ static size_t web_json_esc(char *buf, size_t cap, size_t o, const char *s) {
     return o;
 }
 
+/* Firmware half of /api/diag (ra_web adds reset/boot/heap/log position). Runs
+ * on the Core-0 httpd task: racy reads of counters only, never rc_client. */
+static long diag_ago_s(uint32_t ms) {
+    return ms ? (long)((millis() - ms) / 1000) : -1;
+}
+
+static unsigned web_diag_hook(char *out, unsigned cap) {
+    if (cap < 64) return 0;
+    char link[200];
+    exi_spi_rxdiag(link, sizeof(link));
+    String ssid = WiFi.SSID();
+    size_t o = (size_t)snprintf(out, cap,
+        "\"fw\":\"%s\",\"state\":%u,\"wifi_status\":%d,\"rssi\":%d,\"ch\":%d,\"ssid\":\"",
+        g_fw_version, (unsigned)state, (int)WiFi.status(), (int)WiFi.RSSI(), (int)WiFi.channel());
+    if (o >= cap) return 0;
+    o = web_json_esc(out, cap, o, ssid.c_str());
+    if (o + 320 >= cap) return 0;
+    o += (size_t)snprintf(out + o, cap - o,
+        "\",\"wifi_drops\":%lu,\"wifi_last_reason\":%d,\"wifi_last_ago_s\":%ld,"
+        "\"http_errs\":%lu,\"http_last\":\"%s\",\"http_last_code\":%d,"
+        "\"http_last_rssi\":%d,\"http_last_ago_s\":%ld,\"log_dropped\":%lu,\"link\":\"",
+        (unsigned long)g_diag_wifi_drops, g_diag_wifi_last_reason, diag_ago_s(g_diag_wifi_last_ms),
+        (unsigned long)g_diag_http_errs, g_diag_http_last_what, g_diag_http_last_code,
+        g_diag_http_last_rssi, diag_ago_s(g_diag_http_last_ms), (unsigned long)log_dropped);
+    if (o >= cap) return 0;
+    o = web_json_esc(out, cap, o, link);
+    if (o + 2 >= cap) return 0;
+    out[o++] = '"';
+    return (unsigned)o;
+}
+
 static void build_and_publish_web_json(void) {
     if (!g_client) return;
+    /* LOCK_STATE grouping, not PROGRESS: only its buckets are per-set (PROGRESS
+     * merges every set's challenge / recently-unlocked / almost-there into
+     * shared buckets with subset_id 0). The live category still comes from
+     * a->bucket, which the list creation refreshes per achievement. */
     rc_client_achievement_list_t *list = rc_client_create_achievement_list(
         g_client, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
-        RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_PROGRESS);
+        RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
     if (!list) return;
+    rc_client_subset_list_t *sets = rc_client_create_subset_list(g_client);
 
     uint32_t total = 0;
     for (uint32_t b = 0; b < list->num_buckets; b++)
         total += list->buckets[b].num_achievements;
 
-    size_t need = (size_t)total * 320 + 1024;   /* generous per-entry budget */
+    size_t need = (size_t)total * 420 + 2048;   /* generous per-entry budget */
     if (need > g_web_json_cap) {
         char *nb = (char *)heap_caps_realloc(g_web_json, need, MALLOC_CAP_SPIRAM);
-        if (!nb) { rc_client_destroy_achievement_list(list); return; }
+        if (!nb) {
+            rc_client_destroy_achievement_list(list);
+            if (sets) rc_client_destroy_subset_list(sets);
+            return;
+        }
         g_web_json = nb; g_web_json_cap = need;
     }
     char  *buf = g_web_json;
@@ -6109,17 +6198,34 @@ static void build_and_publish_web_json(void) {
     o = web_json_esc(buf, cap, o, (g && g->badge_url) ? g->badge_url : "");
     o += snprintf(buf + o, cap - o,
                   "\",\"total\":%lu,\"unlocked\":%lu,\"points_total\":%lu,"
-                  "\"points_unlocked\":%lu,\"achievements\":[",
+                  "\"points_unlocked\":%lu,\"sets\":[",
                   (unsigned long)s.num_core_achievements,
                   (unsigned long)s.num_unlocked_achievements,
                   (unsigned long)s.points_core, (unsigned long)s.points_unlocked);
 
+    /* Active sets, core first (RA multiset: SMG = base + bonus set). */
+    for (uint32_t i = 0; sets && i < sets->num_subsets && o + 600 < cap; i++) {
+        const rc_client_subset_t *ss = sets->subsets[i];
+        o += snprintf(buf + o, cap - o, "%s{\"id\":%lu,\"t\":\"", i ? "," : "",
+                      (unsigned long)ss->id);
+        o = web_json_esc(buf, cap, o, ss->title);
+        o += snprintf(buf + o, cap - o, "\",\"img\":\"");
+        o = web_json_esc(buf, cap, o, ss->badge_url ? ss->badge_url : "");
+        o += snprintf(buf + o, cap - o, "\"}");
+    }
+    o += snprintf(buf + o, cap - o, "],\"achievements\":[");
+
+    /* Rarity the RA site shows for the mode we play in. */
+    const bool hc = rc_client_get_hardcore_enabled(g_client) != 0;
+    const unsigned long core_id = g ? (unsigned long)g->id : 0;
     int first = 1;
     for (uint32_t b = 0; b < list->num_buckets; b++) {
         const rc_client_achievement_bucket_t *bk = &list->buckets[b];
+        /* subset_id is 0 when the game has a single set */
+        const unsigned long set_id = bk->subset_id ? (unsigned long)bk->subset_id : core_id;
         for (uint32_t i = 0; i < bk->num_achievements; i++) {
             const rc_client_achievement_t *a = bk->achievements[i];
-            if (o + 400 > cap) break;                /* safety: never overrun */
+            if (o + 600 > cap) break;                /* safety: never overrun */
             if (!first) buf[o++] = ',';
             first = 0;
             o += snprintf(buf + o, cap - o, "{\"id\":%lu,\"t\":\"", (unsigned long)a->id);
@@ -6131,12 +6237,19 @@ static void build_and_publish_web_json(void) {
                           a->badge_name, (unsigned long)a->points, (unsigned)a->state,
                           (int)a->measured_percent);
             o = web_json_esc(buf, cap, o, a->measured_progress);
-            o += snprintf(buf + o, cap - o, "\",\"cat\":\"%s\",\"rare\":%d}",
-                          web_cat_name(bk->bucket_type), (int)a->rarity);
+            /* rare10 = unlock rate in tenths of a percent; ut = unlock time
+             * (epoch s, 0 = locked); ty = standard/missable/progression/win. */
+            o += snprintf(buf + o, cap - o,
+                          "\",\"cat\":\"%s\",\"rare10\":%d,\"set\":%lu,\"ty\":%u,\"ut\":%lu}",
+                          web_cat_name(a->bucket),
+                          (int)((hc ? a->rarity_hardcore : a->rarity) * 10.0f + 0.5f),
+                          set_id, (unsigned)a->type,
+                          a->unlocked ? (unsigned long)a->unlock_time : 0UL);
         }
     }
     o += snprintf(buf + o, cap - o, "]}");
     rc_client_destroy_achievement_list(list);
+    if (sets) rc_client_destroy_subset_list(sets);
 
     ra_web_set_state_json(buf, (unsigned)o);
 }
@@ -6718,6 +6831,9 @@ static void login_then_load_cb(int result, const char *error_message, rc_client_
 }
 
 void loadGame(const char *hash) {
+#if RA_WEB_DASHBOARD
+    ra_web_stage(RA_STAGE_GAME_LOAD);
+#endif
     // Destroy previous client if any. Bump the HTTP generation so any
     // in-flight response addressed to the old client is discarded by
     // http_drain_done instead of calling into freed memory.
@@ -6759,7 +6875,20 @@ void loadGame(const char *hash) {
     #define RA_HARDCORE_MODE 0
     #endif
     #endif
+#if RA_WEB_DASHBOARD
+    /* The debug card can override the build default; read per game load, so a
+     * change applies to the next game without a reboot. */
+    {
+        const int hc_set = ra_web_hardcore_setting();
+        const int hc = hc_set < 0 ? RA_HARDCORE_MODE : hc_set;
+        rc_client_set_hardcore_enabled(g_client, hc);
+        ra_web_set_hardcore_info(RA_HARDCORE_MODE, hc);
+        LOG_INFO("DEBUG=hardcore %s for this game (%s)\r\n", hc ? "ON" : "off",
+                 hc_set < 0 ? "build default" : "debug-card override");
+    }
+#else
     rc_client_set_hardcore_enabled(g_client, RA_HARDCORE_MODE);
+#endif
     rc_client_set_get_time_millisecs_function(g_client, get_millisecs);
 
     /* v0.27.1: warm-up spectator is enabled in on_game_loaded, NOT here.
@@ -6912,6 +7041,7 @@ String try_login_RA(String user, String pass) {
             LOG_ERR("DEBUG=RA login check %d/3: %s %d elapsed=%lums rssi=%d\r\n", attempt,
                     code <= 0 ? "transport error" : "server error HTTP", code,
                     (unsigned long)(millis() - t0), (int)WiFi.RSSI());
+            diag_note_http_err("login check", code, (int)WiFi.RSSI());
             https.end();
             client.stop();
             continue;
@@ -7478,6 +7608,13 @@ void setup() {
      * ~50-60KB) + SMG bunny-chase A/B vs wii13/wii14 (expect unchanged). */
     heap_caps_malloc_extmem_enable(96);
 
+#if RA_WEB_DASHBOARD
+    /* Before any log line: reset reason + RTC boot counter + the PSRAM log
+     * tee behind the dashboard's hidden debug view (~40KB PSRAM). */
+    ra_web_diag_early_init();
+    ra_web_set_diag_hook(web_diag_hook);
+#endif
+
     /* Big working buffers — allocated AFTER the extmem threshold is set
      * so they land in PSRAM (all ≥256B, task-context-only, never ISR). */
     prefetch_addrs   = (uint32_t*)calloc(PREFETCH_MAX, sizeof(uint32_t));
@@ -7535,25 +7672,53 @@ void setup() {
     /* Bump on any meaningful change so the user can verify the flash actually
      * landed by looking at the serial log. Format: vMAJOR.MINOR.BUILDID where
      * BUILDID is __DATE__ __TIME__ from preprocessor. */
-    ralog_printf("WII-RA-ADAPTER v0.35.2-crc-%s-%s-psram%dM (build %s %s)\n",
-                 (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
+    snprintf(g_fw_version, sizeof(g_fw_version), "v0.35.2-crc-%s-%s-psram%dM",
+             (BOARD_VARIANT == BOARD_XIAO) ? "xiao" : "dev",
 #if CONFIG_RA_LINK_USB
-                 "usb",
+             "usb",
 #else
-                 "exi",
+             "exi",
 #endif
-                 (int)CONFIG_SPIRAM_SPEED,
-                 __DATE__, __TIME__);
+             (int)CONFIG_SPIRAM_SPEED);
+    ralog_printf("WII-RA-ADAPTER %s (build %s %s)\n", g_fw_version, __DATE__, __TIME__);
+#if RA_WEB_DASHBOARD
+    ralog_printf("DEBUG=diag: reset=%s boot#%u since power-on (brownouts=%u)\n",
+                 ra_web_reset_reason_str(), ra_web_boot_count(), ra_web_brownout_count());
+    if (ra_web_prev_stage() != RA_STAGE_NONE)
+        ralog_printf("DEBUG=diag: previous boot reset during %s (entered at %ums uptime)\n",
+                     ra_web_stage_name(ra_web_prev_stage()), ra_web_prev_stage_ms());
+    ralog_printf("DEBUG=diag: settings wifi_delay=%u tx_limit=%u cpu80_wifi=%u hardcore=%d (-1=build default) phy_max=%ddBm\n",
+                 ra_web_boot_settings()->wifi_delay, ra_web_boot_settings()->tx_limit,
+                 ra_web_boot_settings()->cpu80_wifi, ra_web_hardcore_setting(),
+                 (int)CONFIG_ESP_PHY_MAX_WIFI_TX_POWER);
+#endif
+    /* Wi-Fi drops are otherwise invisible without the UART: count them and log
+     * the 802.11 reason code (201 = AP not found, 15/204 = handshake/auth,
+     * 8/200 = left/beacon lost, ...). */
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        (void)event;
+        g_diag_wifi_last_reason = (int)info.wifi_sta_disconnected.reason;
+        g_diag_wifi_last_ms = millis();
+        g_diag_wifi_drops++;
+        LOG_ERR("DEBUG=WiFi disconnected: reason=%d (drop #%lu)\r\n",
+                g_diag_wifi_last_reason, (unsigned long)g_diag_wifi_drops);
+    }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     /* lever B: arm the per-vblank collect walk budget from boot (also refreshed
      * each vblank). 0 = baseline; >0 = capped. Logged so the A/B run is labelled. */
     g_rc_collect_walk_budget = g_collect_walk_budget;
     ralog_printf("DEBUG=leverB: collect walk budget=%d (0=off)\n", g_collect_walk_budget);
     /* Load caps in force — label every benchmark log with them. */
 #ifdef CONFIG_RA_HARDCORE
-    const char *ra_mode = "HARDCORE (leaderboards active)";
+    int ra_mode_hc = 1;
 #else
-    const char *ra_mode = "softcore (leaderboards loaded but NOT evaluated)";
+    int ra_mode_hc = 0;
 #endif
+#if RA_WEB_DASHBOARD
+    ra_web_set_hardcore_info(ra_mode_hc, -1);   /* build default, no game yet */
+    if (ra_web_hardcore_setting() >= 0) ra_mode_hc = ra_web_hardcore_setting();   /* debug-card override */
+#endif
+    const char *ra_mode = ra_mode_hc ? "HARDCORE (leaderboards active)"
+                                     : "softcore (leaderboards loaded but NOT evaluated)";
 #if defined(CONFIG_RA_KEEP_ONLY_FIRST_SET) || !defined(CONFIG_RA_COND_BUDGET)
     ralog_printf("DEBUG=caps: sets=first-only cond_budget=%d mode=%s\n", (int)RA_COND_BUDGET, ra_mode);
 #else
@@ -7562,6 +7727,9 @@ void setup() {
 
     // Initialize the console link: SPI slave for EXI, or the TinyUSB vendor
     // device (CONFIG_RA_LINK_USB — ra_usb_link.cpp, same API).
+#if RA_WEB_DASHBOARD
+    ra_web_stage(RA_STAGE_LINK);
+#endif
     if (!exi_spi_init(NULL)) {
         LOG_ERR("ERROR=console link init failed!\r\n");
         while(1) yield();
@@ -7585,6 +7753,34 @@ void setup() {
      * touch the Core 1 EXI path). Started BEFORE the WiFi block so the portal/
      * login sounds below already have a consumer. Prio 0 like LED_Task. */
     xTaskCreatePinnedToCore(soundTask, "SND_Task", 4096, nullptr, 0, nullptr, 0);
+#endif
+
+#if RA_WEB_DASHBOARD
+    /* Brown-out workaround (debug-card toggle, off by default): when the
+     * board was just powered — or browned out — from the Wii's USB port, let
+     * the console finish its own power-up before the radio's calibration and
+     * first TX bursts pull their peak current. */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (ra_web_boot_settings()->wifi_delay &&
+            (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT)) {
+            ra_web_stage(RA_STAGE_WIFI_WAIT);
+            LOG_INFO("DEBUG=diag: waiting %d ms before Wi-Fi (wifi_delay on)\r\n", RA_WIFI_DELAY_MS);
+            delay(RA_WIFI_DELAY_MS);
+        }
+    }
+    /* Brown-out workaround #3 (debug-card toggle, off by default): the boot
+     * dies in WIFI_START (radio calibration + first TX bursts). Run the CPU at
+     * 80 MHz while the radio comes up to shave its share of that peak; back to
+     * the build clock before READY. MSPI (PSRAM/flash) clocks come from the
+     * PLL, which stays at 480 MHz — only the CPU divider changes. */
+    const uint32_t cpu_mhz_build = getCpuFrequencyMhz();
+    if (ra_web_boot_settings()->cpu80_wifi) {
+        setCpuFrequencyMhz(80);
+        LOG_INFO("DEBUG=diag: CPU %lu -> %lu MHz while Wi-Fi starts (cpu80_wifi on)\r\n",
+                 (unsigned long)cpu_mhz_build, (unsigned long)getCpuFrequencyMhz());
+    }
+    ra_web_stage(RA_STAGE_WIFI_START);
 #endif
 
     // WiFi + RA login (same flow as fpga-ra-adapter)
@@ -7637,9 +7833,13 @@ void setup() {
     } else {
         state = STATE_WIFI_CONNECTING;
         WiFi.mode(WIFI_STA);
+        apply_wifi_tx_limit();
         WiFi.begin();
         while (WiFi.status() != WL_CONNECTED) yield();
         LOG_DBG("DEBUG=WiFi OK\r\n");
+#if RA_WEB_DASHBOARD
+        ra_web_stage(RA_STAGE_LOGIN);
+#endif
         state = STATE_LOGGING_IN;
         String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
         if (token != "null") {
@@ -7657,8 +7857,16 @@ void setup() {
      * (continuous traffic keeps the radio awake), then pings/awards fail
      * minutes later. Costs ~50mA — irrelevant, we're not on battery. */
     WiFi.setSleep(false);
+    apply_wifi_tx_limit();   /* portal path: WiFiManager set the mode itself */
 
     state = STATE_WAIT_GAME_ID;
+#if RA_WEB_DASHBOARD
+    if (getCpuFrequencyMhz() != cpu_mhz_build) {
+        setCpuFrequencyMhz(cpu_mhz_build);
+        LOG_INFO("DEBUG=diag: CPU back to %lu MHz\r\n", (unsigned long)getCpuFrequencyMhz());
+    }
+    ra_web_stage(RA_STAGE_READY);
+#endif
     LOG_INFO("DEBUG=Ready, waiting for Wii...\r\n");
 
     /* EXI task priority 19 (v0.24.2; was 1). Arduino-ESP32 leaves the

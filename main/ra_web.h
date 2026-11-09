@@ -76,6 +76,70 @@ void ra_web_push_rp(const char *msg);
 /* Game (re)loaded / changed — tells connected clients to re-fetch /api/state. */
 void ra_web_push_reload(void);
 
+/* ---- Hidden debug view (tap the game image 10x on the dashboard) -----------
+ * Field diagnosis without the UART cable: GET /api/diag (reset reason, boot
+ * counter, heap, plus whatever the firmware hook adds) and GET /api/log (the
+ * ralog stream, teed into PSRAM: a frozen copy of the first bytes since boot +
+ * a rolling tail). */
+
+/* Call FIRST in setup(), before any ralog line: reset reason + the boot
+ * counter kept in RTC memory (survives every reset except power-on), and the
+ * PSRAM log buffers. */
+void ra_web_diag_early_init(void);
+
+/* Copy one formatted log line into the diag buffers. Called from ralog on any
+ * task/core; spinlock + memcpy only, never blocks. No-op before early init. */
+void ra_web_log_tee(const char *buf, unsigned len);
+
+/* Firmware-specific /api/diag fields: the hook writes `"key":value,...` (no
+ * braces, no leading comma) into out and returns the length. Runs on the
+ * Core-0 httpd task, so it may only read state racily (counters, flags). */
+typedef unsigned (*ra_web_diag_hook_t)(char *out, unsigned cap);
+void ra_web_set_diag_hook(ra_web_diag_hook_t fn);
+
+/* Boot-stage marker, kept in RTC memory: after a brown-out / panic / WDT reset
+ * the next boot reports which stage the previous one died in. */
+enum {
+    RA_STAGE_NONE = 0,
+    RA_STAGE_SETUP,       /* setup() entered                         */
+    RA_STAGE_LINK,        /* console link (USB/EXI) init             */
+    RA_STAGE_WIFI_WAIT,   /* optional pre-Wi-Fi delay                */
+    RA_STAGE_WIFI_START,  /* radio on (PHY calibration) + associate  */
+    RA_STAGE_LOGIN,       /* associated; TLS login to RA             */
+    RA_STAGE_READY,       /* waiting for the Wii                     */
+    RA_STAGE_GAME_LOAD,   /* patch download + parse                  */
+    RA_STAGE_IN_GAME,     /* first snapshot received                 */
+    RA_STAGE_COUNT
+};
+void ra_web_stage(unsigned stage);
+const char *ra_web_stage_name(unsigned stage);
+/* Stage the previous boot was in when it reset (RA_STAGE_NONE after a clean
+ * power-on), and its uptime when it entered that stage. */
+unsigned ra_web_prev_stage(void);
+unsigned ra_web_prev_stage_ms(void);
+
+/* Debug-view settings, saved in NVS by the debug card (POST /api/settings).
+ * Read once at boot (ra_web_diag_early_init): the Wi-Fi options apply from
+ * the next boot; hardcore is re-read at every game load. */
+typedef struct {
+    uint8_t wifi_delay;   /* wait before Wi-Fi after a power-on / brown-out reset */
+    uint8_t tx_limit;     /* cap the Wi-Fi TX power                               */
+    uint8_t cpu80_wifi;   /* CPU at 80 MHz while Wi-Fi starts, back to 240 after  */
+    int8_t  hardcore;     /* -1 = build default, 0 = softcore, 1 = hardcore       */
+} ra_web_settings_t;
+const ra_web_settings_t *ra_web_boot_settings(void);   /* as read at boot */
+int ra_web_hardcore_setting(void);                     /* live: -1 / 0 / 1 */
+/* The firmware's build default and the mode the current game loaded with,
+ * shown next to the hardcore control. */
+void ra_web_set_hardcore_info(int build_default, int loaded);
+
+/* For the boot log line: "POWERON", "BROWNOUT", "PANIC", ... */
+const char *ra_web_reset_reason_str(void);
+/* Boots since the last power-on (1 = clean power-on), and how many of them
+ * were brown-out resets. */
+unsigned ra_web_boot_count(void);
+unsigned ra_web_brownout_count(void);
+
 #ifdef __cplusplus
 }
 #endif

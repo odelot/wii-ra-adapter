@@ -13,6 +13,10 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_system.h"
+#include "nvs.h"
+#include "sdkconfig.h"
 #include "mdns.h"
 
 static const char *TAG = "ra_web";
@@ -331,6 +335,344 @@ static void json_escape(const char *in, char *out, size_t out_sz)
     out[o] = '\0';
 }
 
+/* ---- Hidden debug view: /api/diag + /api/log ------------------------------ */
+
+/* RTC_NOINIT survives every reset except power-on (contents random then), so
+ * a magic word tells a real counter from garbage. Counts what the UART would
+ * show as a boot loop: boots since power-on and how many were brown-outs. */
+#define DIAG_MAGIC 0x52414447u   /* "RADG" */
+static RTC_NOINIT_ATTR uint32_t s_rtc_magic;
+static RTC_NOINIT_ATTR uint32_t s_rtc_boots;
+static RTC_NOINIT_ATTR uint32_t s_rtc_brownouts;
+static RTC_NOINIT_ATTR uint32_t s_rtc_stage;
+static RTC_NOINIT_ATTR uint32_t s_rtc_stage_ms;
+static esp_reset_reason_t s_reset_reason = ESP_RST_UNKNOWN;
+static uint32_t s_prev_stage = RA_STAGE_NONE, s_prev_stage_ms = 0;
+
+/* Settings: boot snapshot (what this boot applied) + what NVS holds now. */
+#define SETTINGS_NS "ra_diag"
+static ra_web_settings_t s_set_boot = { 0, 0, 0, -1 };
+static ra_web_settings_t s_set_saved = { 0, 0, 0, -1 };
+static volatile int s_hc_build = -1, s_hc_loaded = -1;
+
+/* Log tee, both in PSRAM: the first BOOT bytes since boot stay frozen (the
+ * boot is where field problems start, and the tail rolls over it within a
+ * minute at RA_LOG_LEVEL 2), the TAIL ring keeps the latest lines. Positions
+ * are absolute byte counts since boot, so a client polls incrementally. */
+#define DIAG_BOOT_CAP (8u * 1024u)
+#define DIAG_TAIL_CAP (32u * 1024u)
+static char             *s_log_boot = NULL;
+static char             *s_log_tail = NULL;
+static volatile uint32_t s_log_total = 0;
+static portMUX_TYPE      s_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static ra_web_diag_hook_t s_diag_hook = NULL;
+
+const char *ra_web_reset_reason_str(void)
+{
+    switch (s_reset_reason) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT_PIN";
+        case ESP_RST_SW:        return "SOFTWARE";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        case ESP_RST_USB:       return "USB";
+        case ESP_RST_JTAG:      return "JTAG";
+        default:                return "UNKNOWN";
+    }
+}
+
+unsigned ra_web_boot_count(void)     { return s_rtc_boots; }
+unsigned ra_web_brownout_count(void) { return s_rtc_brownouts; }
+
+void ra_web_set_diag_hook(ra_web_diag_hook_t fn) { s_diag_hook = fn; }
+
+static const char *const s_stage_names[RA_STAGE_COUNT] = {
+    "none", "SETUP", "LINK_INIT", "WIFI_WAIT", "WIFI_START",
+    "LOGIN", "READY", "GAME_LOAD", "IN_GAME",
+};
+
+const char *ra_web_stage_name(unsigned stage)
+{
+    return stage < RA_STAGE_COUNT ? s_stage_names[stage] : "?";
+}
+
+void ra_web_stage(unsigned stage)
+{
+    s_rtc_stage = stage;
+    s_rtc_stage_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+unsigned ra_web_prev_stage(void)    { return s_prev_stage; }
+unsigned ra_web_prev_stage_ms(void) { return s_prev_stage_ms; }
+
+const ra_web_settings_t *ra_web_boot_settings(void) { return &s_set_boot; }
+int ra_web_hardcore_setting(void) { return s_set_saved.hardcore; }
+
+void ra_web_set_hardcore_info(int build_default, int loaded)
+{
+    s_hc_build = build_default;
+    s_hc_loaded = loaded;
+}
+
+static void settings_load(ra_web_settings_t *s)
+{
+    nvs_handle_t h;
+    if (nvs_open(SETTINGS_NS, NVS_READONLY, &h) != ESP_OK) return;   /* never saved: defaults */
+    uint8_t u8;
+    int8_t i8;
+    if (nvs_get_u8(h, "wifi_delay", &u8) == ESP_OK) s->wifi_delay = u8 ? 1 : 0;
+    if (nvs_get_u8(h, "tx_limit", &u8) == ESP_OK)   s->tx_limit = u8 ? 1 : 0;
+    if (nvs_get_u8(h, "cpu80_wifi", &u8) == ESP_OK) s->cpu80_wifi = u8 ? 1 : 0;
+    if (nvs_get_i8(h, "hardcore", &i8) == ESP_OK)   s->hardcore = (i8 < 0) ? -1 : (i8 ? 1 : 0);
+    nvs_close(h);
+}
+
+static esp_err_t settings_save(const ra_web_settings_t *s)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SETTINGS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, "wifi_delay", s->wifi_delay);
+    if (err == ESP_OK) err = nvs_set_u8(h, "tx_limit", s->tx_limit);
+    if (err == ESP_OK) err = nvs_set_u8(h, "cpu80_wifi", s->cpu80_wifi);
+    if (err == ESP_OK) err = nvs_set_i8(h, "hardcore", s->hardcore);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+void ra_web_diag_early_init(void)
+{
+    s_reset_reason = esp_reset_reason();
+    if (s_reset_reason == ESP_RST_POWERON || s_rtc_magic != DIAG_MAGIC) {
+        s_rtc_magic = DIAG_MAGIC;
+        s_rtc_boots = 0;
+        s_rtc_brownouts = 0;
+        s_rtc_stage = RA_STAGE_NONE;
+        s_rtc_stage_ms = 0;
+    }
+    s_prev_stage = s_rtc_stage < RA_STAGE_COUNT ? s_rtc_stage : RA_STAGE_NONE;
+    s_prev_stage_ms = s_rtc_stage_ms;
+    ra_web_stage(RA_STAGE_SETUP);
+    s_rtc_boots++;
+    if (s_reset_reason == ESP_RST_BROWNOUT) s_rtc_brownouts++;
+
+    settings_load(&s_set_saved);
+    s_set_boot = s_set_saved;
+
+    if (!s_log_boot) s_log_boot = (char *)heap_caps_malloc(DIAG_BOOT_CAP, MALLOC_CAP_SPIRAM);
+    if (!s_log_tail) s_log_tail = (char *)heap_caps_malloc(DIAG_TAIL_CAP, MALLOC_CAP_SPIRAM);
+}
+
+void ra_web_log_tee(const char *buf, unsigned len)
+{
+    if (!s_log_tail || !buf || len == 0) return;
+    if (len > DIAG_TAIL_CAP) { buf += len - DIAG_TAIL_CAP; len = DIAG_TAIL_CAP; }
+    portENTER_CRITICAL(&s_log_mux);
+    uint32_t total = s_log_total;
+    if (s_log_boot && total < DIAG_BOOT_CAP) {
+        uint32_t n = DIAG_BOOT_CAP - total;
+        if (n > len) n = len;
+        memcpy(s_log_boot + total, buf, n);
+    }
+    uint32_t pos = total % DIAG_TAIL_CAP;
+    uint32_t first = DIAG_TAIL_CAP - pos;
+    if (first > len) first = len;
+    memcpy(s_log_tail + pos, buf, first);
+    if (len > first) memcpy(s_log_tail, buf + first, len - first);
+    s_log_total = total + len;
+    portEXIT_CRITICAL(&s_log_mux);
+}
+
+static esp_err_t diag_get(httpd_req_t *req)
+{
+    char *buf = (char *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+    if (!buf) return httpd_resp_send_500(req);
+    const unsigned cap = 2048;
+    unsigned o = (unsigned)snprintf(buf, cap,
+        "{\"up_s\":%lu,\"reset\":\"%s\",\"boots\":%u,\"brownouts\":%u,"
+        "\"stage\":\"%s\",\"prev_stage\":\"%s\",\"prev_stage_ms\":%u,"
+        "\"heap_int\":%u,\"heap_int_min\":%u,\"heap_int_blk\":%u,\"heap_psram\":%u,"
+        "\"log_pos\":%lu",
+        (unsigned long)(esp_timer_get_time() / 1000000), ra_web_reset_reason_str(),
+        ra_web_boot_count(), ra_web_brownout_count(),
+        ra_web_stage_name(s_rtc_stage), ra_web_stage_name(s_prev_stage), (unsigned)s_prev_stage_ms,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (unsigned long)s_log_total);
+    if (s_diag_hook && o + 2 < cap) {
+        buf[o++] = ',';
+        unsigned n = s_diag_hook(buf + o, cap - o - 2);
+        if (n == 0) o--;            /* hook wrote nothing: drop the comma */
+        else o += n;
+    }
+    buf[o++] = '}';
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t r = httpd_resp_send(req, buf, o);
+    free(buf);
+    return r;
+}
+
+/* GET /api/log?from=N → log bytes from absolute position N (clamped to what
+ * the tail still holds); X-Log-Start / X-Log-Pos give the range actually sent,
+ * so the client sees gaps (start > N) and reboots (pos < N). ?boot=1 → the
+ * frozen boot capture instead. The ring is copied out in small chunks so a
+ * Core-1 logger never spins on the lock for more than a few µs. */
+static esp_err_t log_get(httpd_req_t *req)
+{
+    uint32_t from = 0;
+    bool boot = false;
+    char q[48], v[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "from", v, sizeof(v)) == ESP_OK)
+            from = (uint32_t)strtoul(v, NULL, 10);
+        if (httpd_query_key_value(q, "boot", v, sizeof(v)) == ESP_OK)
+            boot = (v[0] == '1');
+    }
+    if (!s_log_tail || !s_log_boot) return httpd_resp_send_404(req);
+
+    char *out = (char *)heap_caps_malloc(DIAG_TAIL_CAP, MALLOC_CAP_SPIRAM);
+    if (!out) return httpd_resp_send_500(req);
+    uint32_t start, end, n = 0;
+
+    if (boot) {
+        portENTER_CRITICAL(&s_log_mux);
+        end = s_log_total < DIAG_BOOT_CAP ? s_log_total : DIAG_BOOT_CAP;
+        portEXIT_CRITICAL(&s_log_mux);
+        start = 0;
+        memcpy(out, s_log_boot, end);   /* bytes below end are never rewritten */
+        n = end;
+    } else {
+        portENTER_CRITICAL(&s_log_mux);
+        end = s_log_total;
+        portEXIT_CRITICAL(&s_log_mux);
+        if (from > end) from = 0;                    /* device rebooted */
+        uint32_t oldest = end > DIAG_TAIL_CAP ? end - DIAG_TAIL_CAP : 0;
+        start = from < oldest ? oldest : from;
+        uint32_t p = start;
+        while (p < end) {
+            uint32_t chunk = end - p;
+            if (chunk > 512) chunk = 512;
+            portENTER_CRITICAL(&s_log_mux);
+            uint32_t now_oldest = s_log_total > DIAG_TAIL_CAP ? s_log_total - DIAG_TAIL_CAP : 0;
+            bool lost = p < now_oldest;
+            if (!lost) {
+                uint32_t pos = p % DIAG_TAIL_CAP;
+                uint32_t first = DIAG_TAIL_CAP - pos;
+                if (first > chunk) first = chunk;
+                memcpy(out + n, s_log_tail + pos, first);
+                if (chunk > first) memcpy(out + n + first, s_log_tail, chunk - first);
+            }
+            portEXIT_CRITICAL(&s_log_mux);
+            if (lost) { n = 0; start = now_oldest; p = now_oldest; continue; }   /* overrun mid-copy: restart */
+            n += chunk;
+            p += chunk;
+        }
+    }
+
+    char hs[12], he[12];
+    snprintf(hs, sizeof(hs), "%lu", (unsigned long)start);
+    snprintf(he, sizeof(he), "%lu", (unsigned long)(start + n));
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-Log-Start", hs);
+    httpd_resp_set_hdr(req, "X-Log-Pos", he);
+    esp_err_t r = httpd_resp_send(req, out, n);
+    free(out);
+    return r;
+}
+
+static void settings_json(char *buf, size_t cap)
+{
+    snprintf(buf, cap,
+        "{\"saved\":{\"wifi_delay\":%u,\"tx_limit\":%u,\"cpu80_wifi\":%u,\"hardcore\":%d},"
+        "\"boot\":{\"wifi_delay\":%u,\"tx_limit\":%u,\"cpu80_wifi\":%u},"
+        "\"phy_max_dbm\":%d,\"hardcore_build\":%d,\"hardcore_loaded\":%d}",
+        (unsigned)s_set_saved.wifi_delay, (unsigned)s_set_saved.tx_limit,
+        (unsigned)s_set_saved.cpu80_wifi, (int)s_set_saved.hardcore,
+        (unsigned)s_set_boot.wifi_delay, (unsigned)s_set_boot.tx_limit, (unsigned)s_set_boot.cpu80_wifi,
+#ifdef CONFIG_ESP_PHY_MAX_WIFI_TX_POWER
+        (int)CONFIG_ESP_PHY_MAX_WIFI_TX_POWER,
+#else
+        -1,
+#endif
+        (int)s_hc_build, (int)s_hc_loaded);
+}
+
+static esp_err_t settings_get(httpd_req_t *req)
+{
+    char buf[320];
+    settings_json(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static void reboot_cb(void *arg)
+{
+    (void)arg;
+    esp_restart();
+}
+
+/* POST /api/settings, form body wifi_delay=0|1&tx_limit=0|1&hardcore=-1|0|1
+ * [&reboot=1]. Missing keys keep their saved value. The reboot fires from a
+ * timer so the reply reaches the browser first. */
+static esp_err_t settings_post(httpd_req_t *req)
+{
+    char body[128];
+    int len = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int got = 0;
+    while (got < len) {
+        int r = httpd_req_recv(req, body + got, len - got);
+        if (r <= 0) return httpd_resp_send_500(req);
+        got += r;
+    }
+    body[got] = '\0';
+
+    ra_web_settings_t s = s_set_saved;
+    bool reboot = false;
+    char v[8];
+    if (httpd_query_key_value(body, "wifi_delay", v, sizeof(v)) == ESP_OK) s.wifi_delay = (v[0] == '1');
+    if (httpd_query_key_value(body, "tx_limit", v, sizeof(v)) == ESP_OK)   s.tx_limit = (v[0] == '1');
+    if (httpd_query_key_value(body, "cpu80_wifi", v, sizeof(v)) == ESP_OK) s.cpu80_wifi = (v[0] == '1');
+    if (httpd_query_key_value(body, "hardcore", v, sizeof(v)) == ESP_OK) {
+        int hc = atoi(v);
+        s.hardcore = (int8_t)(hc < 0 ? -1 : (hc ? 1 : 0));
+    }
+    if (httpd_query_key_value(body, "reboot", v, sizeof(v)) == ESP_OK) reboot = (v[0] == '1');
+
+    if (settings_save(&s) != ESP_OK) return httpd_resp_send_500(req);
+    s_set_saved = s;
+    ESP_LOGI(TAG, "settings saved: wifi_delay=%u tx_limit=%u cpu80_wifi=%u hardcore=%d reboot=%d",
+             s.wifi_delay, s.tx_limit, s.cpu80_wifi, s.hardcore, (int)reboot);
+
+    char buf[320];
+    settings_json(buf, sizeof(buf));
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t r = httpd_resp_sendstr(req, buf);
+
+    if (reboot) {
+        static esp_timer_handle_t t = NULL;
+        if (!t) {
+            esp_timer_create_args_t a;
+            memset(&a, 0, sizeof(a));
+            a.callback = reboot_cb;
+            a.name = "ra_reboot";
+            esp_timer_create(&a, &t);
+        }
+        if (t) esp_timer_start_once(t, 700 * 1000);
+    }
+    return r;
+}
+
 static esp_err_t root_get(httpd_req_t *req)
 {
     s_last_fetch_ms = now_ms();   /* page loaded → a phone is watching */
@@ -410,6 +752,7 @@ void ra_web_init(void)
     config.task_priority   = 1;    /* below lwIP/httpTask; never preempts RT    */
     config.stack_size      = 4096; /* trimmed: /api/state copies a PSRAM buffer  */
     config.max_open_sockets = 4;
+    config.max_uri_handlers = 12;  /* 8 registered; default is exactly 8 */
     config.lru_purge_enable = true;
     config.server_port     = 80;
 
@@ -443,10 +786,38 @@ void ra_web_init(void)
     ws.handler = ws_get;
     ws.is_websocket = true;
 
+    httpd_uri_t dg;
+    memset(&dg, 0, sizeof(dg));
+    dg.uri = "/api/diag";
+    dg.method = HTTP_GET;
+    dg.handler = diag_get;
+
+    httpd_uri_t lg;
+    memset(&lg, 0, sizeof(lg));
+    lg.uri = "/api/log";
+    lg.method = HTTP_GET;
+    lg.handler = log_get;
+
     httpd_register_uri_handler(s_server, &root);
     httpd_register_uri_handler(s_server, &st);
     httpd_register_uri_handler(s_server, &snd);
     httpd_register_uri_handler(s_server, &ws);
+    httpd_uri_t sg;
+    memset(&sg, 0, sizeof(sg));
+    sg.uri = "/api/settings";
+    sg.method = HTTP_GET;
+    sg.handler = settings_get;
+
+    httpd_uri_t sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.uri = "/api/settings";
+    sp.method = HTTP_POST;
+    sp.handler = settings_post;
+
+    httpd_register_uri_handler(s_server, &dg);
+    httpd_register_uri_handler(s_server, &lg);
+    httpd_register_uri_handler(s_server, &sg);
+    httpd_register_uri_handler(s_server, &sp);
 
     /* Live-push plumbing: event queue (Core 1 → Core 0) + the sender task on
      * Core 0, beside the WiFi/lwIP + httpTask stack (never Core 1). The task

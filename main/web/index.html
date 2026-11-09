@@ -69,6 +69,53 @@
     #rp { font-size:12px; color:var(--accent); margin-top:6px; min-height:14px; opacity:.9;
       overflow-wrap:anywhere; }
 
+    /* ---- RA link, sets, beaten ---- */
+    /* RA link rides inline after the last word of the title */
+    .ralink { display:inline-block; margin-left:8px; padding:1px 6px; border-radius:6px;
+      font-size:11px; font-weight:800; letter-spacing:.4px; line-height:16px; vertical-align:4px;
+      text-decoration:none; color:var(--gold); border:1px solid #4a3f17; background:#2a230c; }
+    .ralink[hidden] { display:none; }
+    .sets { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    .sets .lbl { font-size:12px; opacity:.6; margin-right:2px; }
+    .set { width:38px; height:38px; padding:2px; border-radius:9px; border:2px solid transparent;
+      cursor:pointer; opacity:.55; background:#1b2230; }
+    .set img { width:100%; height:100%; border-radius:6px; display:block; }
+    .set.sel { border-color:var(--accent); opacity:1; }
+    .setname { font-size:15px; font-weight:700; margin-bottom:4px; }
+    .setsum { font-size:12px; opacity:.8; margin-bottom:12px; display:flex; gap:12px; flex-wrap:wrap; }
+    .setsum b { color:var(--gold); }
+    .setsum .beaten { color:var(--ok); font-weight:700; }
+    .ach .pill.prog { background:#13283a; color:var(--accent); }
+    .ach .pill.win  { background:#16301d; color:var(--ok); }
+    .ach .pill.miss { background:#3a1717; color:#ff9a9a; }
+
+    /* ---- hidden debug view (tap the game image 10x) ---- */
+    .hint { position:fixed; left:50%; top:18px; transform:translateX(-50%); z-index:1001;
+      background:#161b26ee; border:1px solid #2a3346; border-radius:20px; padding:8px 16px;
+      font-size:13px; animation:pop .25s ease-out; pointer-events:none; }
+    #dbg { display:none; }
+    #dbg.on { display:block; }
+    #dbg h2 { font-size:13px; margin:0 0 12px; letter-spacing:.6px; color:var(--accent); }
+    .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; }
+    .kv dt { opacity:.6; }
+    .kv dd { margin:0; font-family:ui-monospace,Consolas,monospace; overflow-wrap:anywhere; min-width:0; }
+    .kv dd.warn { color:var(--gold); }
+    .kv dd.bad  { color:var(--bad); }
+    .dbtns { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 10px; }
+    .dbtns .tab { font-size:12px; }
+    .opts { display:grid; gap:10px; margin:6px 0 4px; font-size:13px; }
+    .opt { display:flex; gap:10px; align-items:flex-start; }
+    .opt input[type=checkbox] { width:18px; height:18px; margin:1px 0 0; accent-color:var(--accent); flex:0 0 auto; }
+    .opt select { background:#1b2230; color:#e8edf5; border:1px solid #2a3346; border-radius:8px;
+      padding:4px 8px; font-size:13px; }
+    .opt small { display:block; font-size:11px; opacity:.6; margin-top:2px; }
+    .opt small.pend { color:var(--gold); opacity:1; }
+    .optmsg { font-size:12px; color:var(--gold); min-height:16px; }
+    #dbg h2.sub { margin-top:18px; }
+    pre.log { margin:0; background:#0a0e15; border:1px solid #222c3d; border-radius:10px;
+      padding:10px; height:50vh; overflow:auto; font-size:11px; line-height:1.4;
+      white-space:pre-wrap; overflow-wrap:anywhere; color:#c9d3e3; }
+
     /* ---- mobile fit (2026-07-02): kill the lateral scroll, never redesign ----
      * 1) hard guarantee: the page can never scroll sideways;
      * 2) fix the actual overflow sources: grid/flex children default to
@@ -111,7 +158,7 @@
     <div class="card game">
       <img class="gameimg" id="gimg" alt="" onerror="this.removeAttribute('src')">
       <div style="flex:1;min-width:0">
-        <div class="title" id="title">—</div>
+        <div class="title"><span id="title">—</span><a class="ralink" id="ralink" target="_blank" rel="noopener" title="Open on RetroAchievements" hidden>RA ↗</a></div>
         <div class="sub" id="sub">waiting for a game…</div>
         <div id="rp"></div>
         <div class="barrow"><div class="bar"><i id="barfill"></i></div><span class="barpct" id="barpct">0%</span></div>
@@ -123,8 +170,53 @@
       </div>
     </div>
     <div class="card">
+      <div class="sets" id="sets"></div>
+      <div class="setname" id="setname"></div>
+      <div class="setsum" id="setsum"></div>
       <div class="tabs" id="tabs"></div>
       <div class="grid" id="grid"></div>
+    </div>
+    <div class="card" id="dbg">
+      <h2>DEBUG</h2>
+      <dl class="kv" id="dbg-kv"></dl>
+      <h2 class="sub">SETTINGS</h2>
+      <div class="opts">
+        <label class="opt"><input type="checkbox" id="opt-delay">
+          <span>Wait 3 s before Wi-Fi after a power-on / brown-out
+            <small>brown-out workaround · takes effect on the next power-on</small>
+            <small class="pend" id="pend-delay"></small></span></label>
+        <label class="opt"><input type="checkbox" id="opt-tx">
+          <span>Limit Wi-Fi TX power to 15 dBm
+            <small>lower peak current, a bit less range (watch RSSI) · takes effect after a reboot</small>
+            <small class="pend" id="pend-tx"></small></span></label>
+        <label class="opt"><input type="checkbox" id="opt-cpu">
+          <span>CPU at 80 MHz while Wi-Fi starts
+            <small>back to full speed before "Ready" · takes effect after a reboot</small>
+            <small class="pend" id="pend-cpu"></small></span></label>
+        <div class="opt"><span id="phy-info" style="font-size:11px;opacity:.6"></span></div>
+        <div class="opt"><span>Hardcore</span>
+          <span><select id="opt-hc">
+              <option value="-1">Build default</option>
+              <option value="1">On</option>
+              <option value="0">Off</option>
+            </select>
+            <small id="hc-info"></small>
+            <small>applies from the next game load · unlocks earned in softcore show as locked in hardcore</small></span></div>
+      </div>
+      <div class="dbtns">
+        <div class="tab" id="opt-save">Save</div>
+        <div class="tab" id="opt-reboot">Save &amp; reboot</div>
+      </div>
+      <div class="optmsg" id="opt-msg"></div>
+      <h2 class="sub">LOG</h2>
+      <div class="dbtns">
+        <div class="tab sel" id="dbg-live">Live log</div>
+        <div class="tab" id="dbg-boot">Boot log</div>
+        <div class="tab" id="dbg-copy">Copy</div>
+        <div class="tab" id="dbg-save">Download</div>
+        <div class="tab" id="dbg-off">Turn off</div>
+      </div>
+      <pre class="log" id="dbg-log"></pre>
     </div>
   </main>
   <footer>Wii RA Adapter · live dashboard</footer>
@@ -151,38 +243,119 @@
     }
 
     const BADGE = 'https://media.retroachievements.org/Badge/';
+    const TY_PROG = 2, TY_WIN = 3, TY_MISS = 1;
     let filter = 'all';
-    let lastList = [];
+    let lastList = [];     /* every achievement, all sets */
+    let sets = [];         /* [{id,t,img}], core first */
+    let curSet = 0, gameId = 0;
 
+    const isUnl = a => a.st===2;
+    const isBeat = a => a.ty===TY_PROG || a.ty===TY_WIN;
     const FILTERS = [
       ['all',       'All',        a => true],
-      ['unlocked',  'Unlocked',   a => a.cat==='unlocked'],
+      ['unlocked',  'Unlocked',   a => isUnl(a)],
+      ['beaten',    'Beaten',     a => isBeat(a)],
       ['challenge', 'Challenges', a => a.cat==='challenge'],
-      ['progress',  'In progress',a => a.cat==='progress' || (a.pct>0 && a.pct<100 && a.st!==2)],
-      ['locked',    'Locked',     a => a.cat==='locked' && a.st!==2],
+      ['progress',  'In progress',a => a.cat==='progress' || (a.pct>0 && a.pct<100 && !isUnl(a))],
+      ['locked',    'Locked',     a => !isUnl(a)],
     ];
+
+    /* Unlocked first (newest first), then live challenges, then closest to
+       done, then the rest in set order. */
+    function rank(a){
+      if (isUnl(a)) return 0;
+      if (a.cat==='challenge') return 1;
+      if (a.cat==='progress' || a.pct>0) return 2;
+      if (a.cat==='unsupported') return 4;
+      return 3;
+    }
+    function sortList(list){
+      return list.map((a,i)=>[a,i]).sort((x,y)=>{
+        const a=x[0], b=y[0], r=rank(a)-rank(b);
+        if (r) return r;
+        if (rank(a)===0 && (b.ut||0)!==(a.ut||0)) return (b.ut||0)-(a.ut||0);
+        if (rank(a)===2 && b.pct!==a.pct) return b.pct-a.pct;
+        return x[1]-y[1];
+      }).map(p=>p[0]);
+    }
+
+    /* RA titles a bonus set "Game [Subset - Name]"; the core set is the game. */
+    function setName(s){
+      if (s.id===gameId) return 'Base Set';
+      const m = /\[Subset - (.+)\]/.exec(s.t||'');
+      return m ? m[1] : (s.t || ('Set '+s.id));
+    }
+    const setOf = a => a.set || gameId;
+    const inSet = () => lastList.filter(a => setOf(a)===curSet);
 
     function render(d){
       const total = d.total||0, unlocked = d.unlocked||0;
       const pct = total ? Math.round(unlocked*100/total) : 0;
       $('title').textContent = d.title && d.title.length ? d.title : 'No game loaded';
       $('sub').textContent = d.game_id ? ('Game ID '+d.game_id) : 'waiting for a game…';
+      const ra = $('ralink');
+      ra.hidden = !d.game_id;
+      if (d.game_id) ra.href = 'https://retroachievements.org/game/' + d.game_id;
       if (d.img && $('gimg').getAttribute('src') !== d.img) $('gimg').src = d.img;
       $('barfill').style.width = pct+'%';
       $('barpct').textContent = pct+'%';
       $('s-unlocked').textContent = unlocked+'/'+total;
       $('s-points').textContent = (d.points_unlocked||0)+'/'+(d.points_total||0);
       $('s-state').textContent = STATE[d.state] || d.state;
+      gameId = d.game_id || 0;
       lastList = d.achievements || [];
+      sets = (d.sets && d.sets.length) ? d.sets : [{id:gameId, t:d.title||'', img:d.img||''}];
+      if (!sets.some(s => s.id===curSet)) curSet = sets[0].id;
+      renderSets();
       renderTabs();
       renderList();
+    }
+
+    function renderSets(){
+      const box = $('sets');
+      box.innerHTML = sets.length > 1 ? '<span class="lbl">Sets:</span>' : '';
+      box.style.display = sets.length > 1 ? '' : 'none';
+      for (const s of sets){
+        const el = document.createElement('div');
+        el.className = 'set' + (s.id===curSet ? ' sel' : '');
+        el.title = setName(s);
+        el.innerHTML = s.img ? '<img src="'+esc(s.img)+'" alt="" onerror="this.style.visibility=\'hidden\'">' : '';
+        el.onclick = () => { curSet = s.id; renderSets(); renderTabs(); renderList(); };
+        box.appendChild(el);
+      }
+      /* Name only for a bonus set — the base set is the game in the header. */
+      const cur = sets.find(s=>s.id===curSet);
+      const nm = $('setname');
+      nm.textContent = cur && cur.id!==gameId ? setName(cur) : '';
+      nm.style.display = nm.textContent ? '' : 'none';
+
+      /* Summary of the selected set, with the RA "beaten" rule: every
+         progression achievement plus a win condition (when the set has one). */
+      const mine = inSet();
+      const pts = mine.reduce((n,a)=>n+(a.pts||0),0);
+      const ptsU = mine.filter(isUnl).reduce((n,a)=>n+(a.pts||0),0);
+      const prog = mine.filter(a=>a.ty===TY_PROG), win = mine.filter(a=>a.ty===TY_WIN);
+      let beat = '';
+      if (prog.length || win.length){
+        const done = prog.every(isUnl) && (!win.length || win.some(isUnl));
+        const have = prog.filter(isUnl).length + (win.some(isUnl) ? 1 : 0);
+        const need = prog.length + (win.length ? 1 : 0);
+        beat = done ? '<span class="beaten">✓ Beaten</span>'
+                    : '<span>beaten: <b>'+have+'/'+need+'</b></span>';
+      }
+      $('setsum').innerHTML =
+        '<span><b>'+mine.filter(isUnl).length+'/'+mine.length+'</b> achievements</span>'+
+        '<span><b>'+ptsU+'/'+pts+'</b> points</span>'+ beat;
     }
 
     function renderTabs(){
       const tabs = $('tabs');
       tabs.innerHTML = '';
+      const mine = inSet();
       for (const [key,label,fn] of FILTERS){
-        const n = lastList.filter(fn).length;
+        const sub = mine.filter(fn);
+        if (key==='beaten' && !sub.length) continue;   /* set without progression data */
+        const n = key==='beaten' ? sub.filter(isUnl).length+'/'+sub.length : sub.length;
         const el = document.createElement('div');
         el.className = 'tab' + (filter===key?' sel':'');
         el.innerHTML = label + '<span class="n">'+n+'</span>';
@@ -191,22 +364,29 @@
       }
     }
 
+    function rareTxt(a){
+      const r = a.rare10 != null ? a.rare10/10 : a.rare;
+      if (r == null) return '';
+      return (r >= 10 || r === 0 ? Math.round(r) : r.toFixed(1)) + '% unlock rate';
+    }
+
     function renderList(){
       const grid = $('grid');
       grid.innerHTML = '';
       const fn = (FILTERS.find(f=>f[0]===filter)||FILTERS[0])[2];
-      const items = lastList.filter(fn);
+      const items = sortList(inSet().filter(fn));
       if (!items.length){
         grid.innerHTML = '<div class="soon">No achievements here.</div>';
         return;
       }
       for (const a of items){
-        const unlocked = a.st===2;
+        const unlocked = isUnl(a);
         const isChal = a.cat==='challenge';
         const inProg = !unlocked && a.pct>0 && a.pct<100;
         const div = document.createElement('div');
         div.className = 'ach' + (unlocked?'':' locked') + (isChal?' challenge':'');
         const img = a.badge ? (BADGE + a.badge + (unlocked?'':'_lock') + '.png') : '';
+        const rt = rareTxt(a);
         div.innerHTML =
           '<img src="'+img+'" loading="lazy" onerror="this.style.visibility=\'hidden\'">'+
           '<div class="info">'+
@@ -215,7 +395,10 @@
             '<div class="meta">'+
               '<span class="badge-pts">'+ (a.pts||0) +' pts</span>'+
               (isChal ? '<span class="pill gold">CHALLENGE</span>' : '')+
-              (a.rare>0 ? '<span class="pill">'+a.rare+'% rare</span>' : '')+
+              (a.ty===TY_PROG ? '<span class="pill prog">Progression</span>' : '')+
+              (a.ty===TY_WIN  ? '<span class="pill win">Win condition</span>' : '')+
+              (a.ty===TY_MISS ? '<span class="pill miss">Missable</span>' : '')+
+              (rt ? '<span class="pill">'+rt+'</span>' : '')+
               (a.m ? '<span>'+esc(a.m)+'</span>' : '')+
             '</div>'+
             (inProg ? '<div class="pbar"><i style="width:'+a.pct+'%"></i></div>' : '')+
@@ -269,6 +452,200 @@
       ws.onclose = () => { wsOK = false; setConn(false); setTimeout(wsConnect, 3000); };
       ws.onerror = () => { try{ ws.close(); }catch(e){} };
     }
+
+    /* ---- hidden debug view: tap the game image 10x (Android-style) ---- */
+    const DBG_TAPS = 10;
+    let taps = 0, tapT = null, hintEl = null;
+    let dbgOn = false, dbgTimer = null, logView = 'live';
+    let livePos = 0, liveText = '', bootText = '';
+    const LIVE_MAX = 200000;   /* chars kept in the page */
+    const WIFI_REASON = {2:'auth expired',4:'assoc expired',8:'left AP',15:'4-way handshake timeout',
+      200:'beacon timeout',201:'AP not found',202:'auth failed',203:'assoc failed',
+      204:'handshake timeout',205:'connection failed'};
+
+    function hint(msg){
+      if (hintEl) hintEl.remove();
+      hintEl = document.createElement('div');
+      hintEl.className = 'hint';
+      hintEl.textContent = msg;
+      document.body.appendChild(hintEl);
+      const el = hintEl;
+      setTimeout(() => el.remove(), 1500);
+    }
+
+    $('gimg').addEventListener('click', () => {
+      clearTimeout(tapT);
+      tapT = setTimeout(() => { taps = 0; }, 1500);
+      if (dbgOn) { hint('Debug mode is already on'); return; }
+      taps++;
+      const left = DBG_TAPS - taps;
+      if (left <= 0) { taps = 0; setDbg(true); hint('Debug mode on'); }
+      else if (left <= 5) hint(left + (left === 1 ? ' tap' : ' taps') + ' away from debug mode');
+    });
+
+    function setDbg(on){
+      dbgOn = on;
+      try{ on ? localStorage.setItem('ra-dbg','1') : localStorage.removeItem('ra-dbg'); }catch(e){}
+      $('dbg').classList.toggle('on', on);
+      clearInterval(dbgTimer);
+      if (on) { loadSettings(); dbgTick(); dbgTimer = setInterval(dbgTick, 2000); }
+    }
+
+    function fmtUp(s){
+      const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+      return (h ? h+'h ' : '') + (h||m ? m+'m ' : '') + (s%60) + 's';
+    }
+    function ago(s){ return s < 0 ? 'never' : fmtUp(s) + ' ago'; }
+    function kb(b){ return (b/1024).toFixed(1) + ' KB'; }
+
+    function renderDiag(d){
+      const rssiCls = !d.rssi ? 'bad' : d.rssi < -80 ? 'bad' : d.rssi < -70 ? 'warn' : '';
+      const rssiTxt = !d.rssi ? 'no signal' : d.rssi + ' dBm (' +
+        (d.rssi >= -60 ? 'good' : d.rssi >= -70 ? 'ok' : d.rssi >= -80 ? 'weak' : 'bad') + ')';
+      const rows = [
+        ['firmware', d.fw],
+        ['uptime', fmtUp(d.up_s)],
+        ['last reset', d.reset, d.reset === 'BROWNOUT' || d.reset === 'PANIC' || /WDT/.test(d.reset) ? 'bad' : ''],
+        ['boots since power-on', d.boots + (d.brownouts ? ' (' + d.brownouts + ' brownout)' : ''),
+          d.brownouts ? 'bad' : d.boots > 1 ? 'warn' : ''],
+        ['boot stage', d.stage],
+        ['previous boot ended in', d.prev_stage === 'none' ? '—' : d.prev_stage + ' (entered at ' +
+          (d.prev_stage_ms/1000).toFixed(1) + ' s)',
+          d.prev_stage !== 'none' && /BROWNOUT|PANIC|WDT/.test(d.reset) ? 'bad' : ''],
+        ['fw state', (STATE[d.state] ? STATE[d.state] + ' ' : '') + '(' + d.state + ')'],
+        ['Wi-Fi', (d.ssid || '—') + ' · ch ' + d.ch + ' · status ' + d.wifi_status],
+        ['RSSI', rssiTxt, rssiCls],
+        ['Wi-Fi drops', d.wifi_drops ? d.wifi_drops + ' · last: ' + d.wifi_last_reason + ' ' +
+          (WIFI_REASON[d.wifi_last_reason] || '') + ' · ' + ago(d.wifi_last_ago_s) : '0',
+          d.wifi_drops ? 'warn' : ''],
+        ['HTTP errors', d.http_errs ? d.http_errs + ' · last: ' + d.http_last + ' ' + d.http_last_code +
+          ' · rssi ' + d.http_last_rssi + ' · ' + ago(d.http_last_ago_s) : '0',
+          d.http_errs ? 'warn' : ''],
+        ['console link', d.link],
+        ['internal heap', kb(d.heap_int) + ' (min ' + kb(d.heap_int_min) + ', blk ' + kb(d.heap_int_blk) + ')'],
+        ['PSRAM free', kb(d.heap_psram)],
+        ['log', kb(d.log_pos) + ' since boot' + (d.log_dropped ? ' · UART dropped ' + d.log_dropped + ' B' : '')],
+      ];
+      const kv = $('dbg-kv');
+      kv.innerHTML = '';
+      for (const [k, v, cls] of rows){
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = v == null ? '—' : v;
+        if (cls) dd.className = cls;
+        kv.append(dt, dd);
+      }
+    }
+
+    function showLog(){
+      const pre = $('dbg-log');
+      const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+      pre.textContent = logView === 'live' ? liveText : bootText;
+      if (logView === 'boot') return;
+      if (atEnd) pre.scrollTop = pre.scrollHeight;
+    }
+
+    async function dbgTick(){
+      if (document.hidden) return;
+      try{
+        const r = await fetch('/api/diag', {cache:'no-store'});
+        if (r.ok) renderDiag(await r.json());
+      }catch(e){}
+      try{
+        const r = await fetch('/api/log?from=' + livePos, {cache:'no-store'});
+        if (!r.ok) return;
+        const start = +r.headers.get('X-Log-Start'), pos = +r.headers.get('X-Log-Pos');
+        const txt = await r.text();
+        if (pos < livePos) liveText = '\n··· adapter rebooted ···\n';
+        else if (start > livePos && livePos === 0) liveText = '··· older lines rolled off (see Boot log) ···\n';
+        else if (start > livePos) liveText += '\n··· ' + (start - livePos) + ' bytes lost ···\n';
+        liveText += txt;
+        if (liveText.length > LIVE_MAX) liveText = liveText.slice(-LIVE_MAX);
+        livePos = pos;
+        if (logView === 'live') showLog();
+      }catch(e){}
+    }
+
+    async function loadBoot(){
+      try{
+        const r = await fetch('/api/log?boot=1', {cache:'no-store'});
+        if (r.ok) bootText = await r.text();
+      }catch(e){}
+    }
+
+    function selView(v){
+      logView = v;
+      $('dbg-live').classList.toggle('sel', v === 'live');
+      $('dbg-boot').classList.toggle('sel', v === 'boot');
+      showLog();
+    }
+
+    $('dbg-live').onclick = () => selView('live');
+    $('dbg-boot').onclick = async () => { await loadBoot(); selView('boot'); $('dbg-log').scrollTop = 0; };
+    $('dbg-copy').onclick = async () => {
+      const t = logView === 'live' ? liveText : bootText;
+      try{ await navigator.clipboard.writeText(t); hint('Log copied'); }
+      catch(e){
+        /* clipboard API needs https on most browsers: select the text instead */
+        const sel = window.getSelection(), rg = document.createRange();
+        rg.selectNodeContents($('dbg-log')); sel.removeAllRanges(); sel.addRange(rg);
+        hint('Log selected — copy it from the menu');
+      }
+    };
+    $('dbg-save').onclick = () => {
+      const t = logView === 'live' ? liveText : bootText;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([t], {type:'text/plain'}));
+      a.download = 'wii-ra-' + logView + '-log.txt';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    };
+    $('dbg-off').onclick = () => { setDbg(false); hint('Debug mode off'); };
+
+    /* ---- settings (saved on the adapter, NVS) ---- */
+    function renderSettings(s){
+      $('opt-delay').checked = !!s.saved.wifi_delay;
+      $('opt-tx').checked = !!s.saved.tx_limit;
+      $('opt-hc').value = String(s.saved.hardcore);
+      $('pend-delay').textContent = s.saved.wifi_delay !== s.boot.wifi_delay ? 'saved — active from the next boot' : '';
+      $('pend-tx').textContent = s.saved.tx_limit !== s.boot.tx_limit ? 'saved — active after a reboot' : '';
+      $('opt-cpu').checked = !!s.saved.cpu80_wifi;
+      $('pend-cpu').textContent = s.saved.cpu80_wifi !== s.boot.cpu80_wifi ? 'saved — active after a reboot' : '';
+      $('phy-info').textContent = s.phy_max_dbm > 0 ? 'Build radio cap: ' + s.phy_max_dbm + ' dBm from radio init' : '';
+      const mode = v => v === 1 ? 'hardcore' : v === 0 ? 'softcore' : '—';
+      $('opt-hc').options[0].textContent = 'Build default (' + mode(s.hardcore_build) + ')';
+      $('hc-info').textContent = 'current game: ' + (s.hardcore_loaded < 0 ? 'none loaded yet' : mode(s.hardcore_loaded));
+    }
+
+    async function loadSettings(){
+      try{
+        const r = await fetch('/api/settings', {cache:'no-store'});
+        if (r.ok) renderSettings(await r.json());
+      }catch(e){}
+    }
+
+    async function saveSettings(reboot){
+      const body = new URLSearchParams({
+        wifi_delay: $('opt-delay').checked ? '1' : '0',
+        tx_limit:   $('opt-tx').checked ? '1' : '0',
+        cpu80_wifi: $('opt-cpu').checked ? '1' : '0',
+        hardcore:   $('opt-hc').value,
+      });
+      if (reboot){
+        if (!confirm('Reboot the adapter now?\n\nDo it from WiiFlow, not mid-game: the RA session of a running game is lost.')) return;
+        body.set('reboot', '1');
+      }
+      try{
+        const r = await fetch('/api/settings', {method:'POST', body});
+        if (!r.ok) throw 0;
+        renderSettings(await r.json());
+        $('opt-msg').textContent = reboot ? 'Saved. Rebooting… the page reconnects by itself.' : 'Saved.';
+        if (reboot) setTimeout(loadSettings, 8000);
+      }catch(e){ $('opt-msg').textContent = 'Save failed.'; }
+    }
+    $('opt-save').onclick = () => saveSettings(false);
+    $('opt-reboot').onclick = () => saveSettings(true);
+
+    try{ if (localStorage.getItem('ra-dbg') === '1') setDbg(true); }catch(e){}
 
     poll();
     wsConnect();

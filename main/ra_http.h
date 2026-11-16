@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "rc_client.h"
 
 typedef struct {
@@ -31,8 +32,9 @@ typedef struct {
 } http_job_t;
 
 typedef struct {
-    char *body;                 /* ps_malloc'd; freed by the drain */
+    char *body;                 /* PSRAM or game arena; freed by the drain (rc_arena_free) */
     size_t body_len;
+    bool is_patch;              /* achievementsets: its callback runs in the arena window */
     int status;
     rc_client_server_callback_t callback;
     void *callback_data;

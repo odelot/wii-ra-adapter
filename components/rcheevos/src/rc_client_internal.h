@@ -104,6 +104,12 @@ typedef struct rc_client_achievement_info_t {
   rc_memref_value_t** dep_memrefs;
   uint16_t dep_count;
   uint8_t eval_next;   /* 1 => force one more eval next frame (Delta/Prior settle) */
+  /* dormant triggers (rc_trigger_find_dormant_guards): standalone core ResetIf
+   * guards; dm_settled = the last real eval ran with a guard true (every hit
+   * reset), so while a guard stays true the eval is a no-op and is skipped. */
+  rc_condition_t** dm_guards;
+  uint8_t dm_count;
+  uint8_t dm_settled;
 #endif
 } rc_client_achievement_info_t;
 

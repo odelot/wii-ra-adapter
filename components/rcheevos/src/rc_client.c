@@ -27,6 +27,10 @@
 #include "esp_timer.h"
 volatile uint32_t g_rc_update_us = 0;
 volatile uint32_t g_rc_eval_us = 0;
+/* do_frame "fixed" costs outside upd/eval (2026-11-15 diag): the gate's memref
+ * save for the rollback, and the post-eval tail (event raise + rc_client_idle). */
+volatile uint32_t g_rc_save_us = 0;
+volatile uint32_t g_rc_post_us = 0;
 /* v0.33 upd phase split: upd1 = leaf memref peeks (static addresses, INDEPENDENT ->
  * the parallelization target); upd2 = modified_memref pointer-chain resolves (have
  * dependencies + already incr-skipped). Confirms which phase to parallelize. */
@@ -2380,6 +2384,9 @@ static void rc_client_fetch_game_sets_callback(const rc_api_server_response_t* s
     }
 
     /* process the game data */
+    /* dedup index over the communal chain links while this patch is parsed
+     * (rc_memrefs_index_begin: O(1) instead of a scan of every link per link) */
+    rc_memrefs_index_begin(load_state->game->runtime.memrefs);
     next_subset = &first_subset;
     for (set_index = 0; set_index < fetch_game_sets_response.num_sets; ++set_index) {
       rc_api_achievement_set_definition_t* set = &fetch_game_sets_response.sets[set_index];
@@ -2409,6 +2416,7 @@ static void rc_client_fetch_game_sets_callback(const rc_api_server_response_t* s
     }
 
     if (!first_subset) {
+      rc_memrefs_index_end(load_state->game->runtime.memrefs);
       rc_client_load_error(load_state, RC_NOT_FOUND, "Response contained no sets");
     } else {
       load_state->subset = first_subset;
@@ -2428,6 +2436,9 @@ static void rc_client_fetch_game_sets_callback(const rc_api_server_response_t* s
           RC_CLIENT_LOG_WARN_FORMATTED(load_state->client, "Parse error %d processing rich presence", result);
         }
       }
+
+      /* parsing done: the index has no use past the load */
+      rc_memrefs_index_end(load_state->game->runtime.memrefs);
 
       if (load_state->client->callbacks.post_process_game_sets_response) {
         load_state->client->callbacks.post_process_game_sets_response(server_response,
@@ -5942,6 +5953,17 @@ extern char g_rc_replay_sentinel;   /* defined in trigger.c; passed as unused_L 
 
 #define RC_DE_MAX_DEPS 512   /* per-ach distinct-memref cap; overflow => never-skip */
 
+/* Dormant triggers (2026-11-15; rules + proof in trigger.c rc_trigger_find_dormant_guards).
+ * An ACTIVE, hit-free achievement whose last real eval already ran with a core
+ * ResetIf guard true is skipped while a guard stays true (each eval would just reset
+ * it again). Unlike the cold+clean skip this needs no dep list, so it also covers the
+ * huge pointer-chain achievements (>512 deps, never dirty-skipped) of the sub-games
+ * that are not running on a compilation disc. Independent runtime toggle. */
+#define RC_DM_MAX_GUARDS 4
+volatile int g_rc_dormant_enabled = 1;
+volatile uint32_t g_rc_dm_skipped = 0;          /* per-frame tally (adapter resets) */
+volatile uint32_t g_rc_dm_stat_ach = 0;         /* boot diag: achievements with a guard */
+
 static void rc_de_add(rc_memref_value_t** arr, uint16_t* n, rc_memref_value_t* mv) {
   uint16_t i;
   if (!mv)
@@ -5981,9 +6003,25 @@ static void rc_de_build_achievement(rc_client_game_info_t* game, rc_client_achie
   ach->dep_memrefs = NULL;
   ach->dep_count = 0;
   ach->eval_next = 0;
+  ach->dm_guards = NULL;
+  ach->dm_count = 0;
+  ach->dm_settled = 0;
 
   if (!trig)
     return;
+
+  {
+    rc_condition_t* guards[RC_DM_MAX_GUARDS];
+    int ng = rc_trigger_find_dormant_guards(trig, guards, RC_DM_MAX_GUARDS);
+    if (ng > 0) {
+      ach->dm_guards = (rc_condition_t**)rc_buffer_alloc(&game->buffer, (size_t)ng * sizeof(rc_condition_t*));
+      if (ach->dm_guards) {
+        memcpy(ach->dm_guards, guards, (size_t)ng * sizeof(rc_condition_t*));
+        ach->dm_count = (uint8_t)ng;
+        g_rc_dm_stat_ach++;
+      }
+    }
+  }
 
   rc_de_collect_condset(trig->requirement, tmp, &n);
   for (cs = trig->alternative; cs != NULL; cs = cs->next)
@@ -6007,6 +6045,7 @@ static void rc_de_scan_richpresence(rc_client_game_info_t* game);
  * single-threaded (do_frame head). */
 static void rc_de_build_game(rc_client_game_info_t* game) {
   rc_client_subset_info_t* subset;
+  g_rc_dm_stat_ach = 0;
   for (subset = game->subsets; subset != NULL; subset = subset->next) {
     rc_client_achievement_info_t* ach = subset->achievements;
     rc_client_achievement_info_t* stop = ach + subset->public_.num_achievements;
@@ -6187,11 +6226,28 @@ static void rc_client_eval_achievement_range(rc_client_t* client,
     int old_state, new_state;
     uint32_t old_measured_value;
     void* rc_replay_L = NULL;   /* non-NULL -> rc_evaluate_trigger uses cached-truth replay */
+#ifdef RC_DIRTY_EVAL
+    int dm_guard = 0;           /* a dormant guard is true this frame */
+#endif
 
     if (!trigger || achievement->public_.state != RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
       continue;
 
 #ifdef RC_DIRTY_EVAL
+    if (achievement->dm_count && g_rc_dormant_enabled) {
+      dm_guard = rc_trigger_dormant_guard_true(achievement->dm_guards, achievement->dm_count);
+      if (dm_guard && achievement->dm_settled &&
+          trigger->state == RC_TRIGGER_STATE_ACTIVE && !trigger->has_hits) {
+        /* the eval would only reset it again: skip. The cached is_true bits go
+         * stale, so the first non-dormant frame must be a full eval (no
+         * cold+clean skip, no replay) — eval_next forces exactly that. */
+        achievement->eval_next = 1;
+        __atomic_fetch_add(&g_rc_dm_skipped, 1, __ATOMIC_RELAXED);
+        continue;
+      }
+    }
+    achievement->dm_settled = 0;   /* re-armed below only by a real eval under a true guard */
+
     if (g_rc_dirty_eval_enabled) {
       int de_act = rc_de_should_skip(achievement);
       if (de_act == 1) {
@@ -6211,6 +6267,12 @@ static void rc_client_eval_achievement_range(rc_client_t* client,
     old_measured_value = trigger->measured_value;
     old_state = trigger->state;
     new_state = rc_evaluate_trigger(trigger, client->state.legacy_peek, client, rc_replay_L);
+#ifdef RC_DIRTY_EVAL
+    /* a real eval with a guard true (and no PauseIf, by eligibility) went through the
+     * ResetIf path: every hit count is now 0 -> later frames under the same guard are
+     * dormant. The guard reads memrefs the eval doesn't modify, so dm_guard still holds. */
+    achievement->dm_settled = (uint8_t)(dm_guard && trigger->state == RC_TRIGGER_STATE_ACTIVE);
+#endif
 
     /* trigger->state doesn't actually change to RESET - RESET just serves as a notification.
      * we don't care about that particular notification, so look at the actual state. */
@@ -7054,6 +7116,9 @@ static void rc_client_raise_pending_events(rc_client_t* client, rc_client_game_i
  * longer cause a false unlock. */
 int  (*g_rc_doframe_primed_cb)(void) = NULL;   /* returns 0 -> cache not primed -> defer */
 rc_memref_value_t* g_rc_doframe_save_buf = NULL;
+rc_memref_value_t** g_rc_doframe_undo_ptrs = NULL;   /* undo-log pointers (same cap); NULL = full copy */
+volatile int g_rc_undo_enabled = 1;                  /* runtime A/B: 0 = old full copy */
+volatile uint32_t g_rc_undo_entries = 0;             /* per-frame diag: entries logged */
 uint32_t g_rc_doframe_save_cap = 0;            /* capacity (entries) of save_buf */
 volatile int g_rc_doframe_gate_enabled = 1;    /* adapter clears it for a fail-open frame */
 volatile int g_rc_doframe_deferred = 0;        /* set every gated do_frame: 1=deferred 0=evaluated */
@@ -7130,6 +7195,110 @@ static size_t rc_lb_probe_condset(const rc_condset_t* cs, char* buf, size_t n, u
     *sig = (*sig ^ (uint32_t)(c->is_true | (c->current_hits << 1))) * 16777619u;
   }
   return off;
+}
+
+/* Achievement probe (2026-11-15, Zelda CE "Listen to Your Elders"): one line
+ * with the client state, trigger state/has_hits and, per evaluated condition,
+ * <flag><op1>[op<op2>][*][h<cur>/<req>] where a memref operand prints as
+ * value[/prior when changed this frame] — so a Delta edge is visible on the
+ * frame it happens. *sig mixes every printed value and truth bit: the caller
+ * logs on change. Must run on the do_frame thread. 0 = id not loaded. */
+static size_t rc_ach_probe_operand(const rc_operand_t* op, char* buf, size_t n) {
+  if (rc_operand_is_memref(op) && op->value.memref) {
+    const rc_memref_value_t* mv = &op->value.memref->value;
+    if (mv->changed)
+      return (size_t)snprintf(buf, n, "%s%lx/%lx", op->type == RC_OPERAND_DELTA ? "d" : op->type == RC_OPERAND_PRIOR ? "p" : "",
+                              (unsigned long)mv->value, (unsigned long)mv->prior);
+    return (size_t)snprintf(buf, n, "%s%lx", op->type == RC_OPERAND_DELTA ? "d" : op->type == RC_OPERAND_PRIOR ? "p" : "",
+                            (unsigned long)mv->value);
+  }
+  if (op->type == RC_OPERAND_RECALL)
+    return (size_t)snprintf(buf, n, "{r}");
+  return (size_t)snprintf(buf, n, "k%lx", (unsigned long)op->value.num);
+}
+
+static size_t rc_ach_probe_condset(const rc_condset_t* cs, char* buf, size_t n, uint32_t* sig, uint32_t* vsig) {
+  static const char flag_ch[] = " PRQTMABIKCDZNO";
+  const rc_condition_t* c;
+  uint32_t i, cnt;
+  size_t off = 0;
+  if (!cs || !cs->conditions)
+    return 0;
+  c = RC_GET_TRAILING(cs, rc_condset_with_trailing_conditions_t, rc_condition_t, conditions);
+  cnt = (uint32_t)cs->num_pause_conditions + cs->num_reset_conditions +
+        cs->num_hittarget_conditions + cs->num_measured_conditions + cs->num_other_conditions;
+  for (i = 0; i < cnt && off + 48 < n; ++i, ++c) {
+    const rc_operand_t* o1 = &c->operand1;
+    off += snprintf(buf + off, n - off, " %c", c->type < sizeof flag_ch - 1 ? flag_ch[c->type] : '?');
+    off += rc_ach_probe_operand(o1, buf + off, n - off);
+    if (c->oper != RC_OPERATOR_NONE) {
+      off += snprintf(buf + off, n - off, "~");
+      off += rc_ach_probe_operand(&c->operand2, buf + off, n - off);
+    }
+    off += snprintf(buf + off, n - off, "%s", (c->is_true & 1) ? "*" : "");
+    if (c->required_hits)
+      off += snprintf(buf + off, n - off, "h%lu/%lu", (unsigned long)c->current_hits, (unsigned long)c->required_hits);
+    {
+      uint32_t v1 = (rc_operand_is_memref(o1) && o1->value.memref) ? o1->value.memref->value.value : 0;
+      *sig  = (*sig ^ (uint32_t)((c->is_true & 1) | (c->current_hits << 1))) * 16777619u;   /* truth/hits */
+      *vsig = (*vsig ^ v1) * 16777619u;                                                    /* values */
+    }
+  }
+  return off;
+}
+
+int rc_client_ach_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig, uint32_t* vsig) {
+  const rc_client_subset_info_t* subset;
+  if (!client || !client->game || !buf || n < 64)
+    return 0;
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    const rc_client_achievement_info_t* a = subset->achievements;
+    const rc_client_achievement_info_t* stop = a + subset->public_.num_achievements;
+    for (; a < stop; ++a) {
+      const rc_trigger_t* t;
+      const rc_condset_t* cs;
+      size_t off;
+      unsigned k;
+      if (a->public_.id != id)
+        continue;
+      t = a->trigger;
+      *sig = 2166136261u ^ (t ? t->state : 0xFF) ^ ((uint32_t)a->public_.state << 8);
+      *vsig = 2166136261u;
+      off = (size_t)snprintf(buf, n, "cst=%u tst=%u hh=%u", (unsigned)a->public_.state,
+                             t ? (unsigned)t->state : 99u, t ? (unsigned)t->has_hits : 0u);
+      if (!t)
+        return 1;
+      off += snprintf(buf + off, n - off, " |core");
+      off += rc_ach_probe_condset(t->requirement, buf + off, n - off, sig, vsig);
+      for (k = 0, cs = t->alternative; cs && off + 48 < n; cs = cs->next, ++k) {
+        off += snprintf(buf + off, n - off, " |a%u%s", k, cs->is_paused ? "P" : "");
+        off += rc_ach_probe_condset(cs, buf + off, n - off, sig, vsig);
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* inactive core achievements at load (diag): writes up to max ids, returns the count */
+int rc_client_inactive_core_ids(const rc_client_t* client, uint32_t* ids, int max) {
+  const rc_client_subset_info_t* subset;
+  int cnt = 0;
+  if (!client || !client->game)
+    return 0;
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    const rc_client_achievement_info_t* a = subset->achievements;
+    const rc_client_achievement_info_t* stop = a + subset->public_.num_achievements;
+    for (; a < stop; ++a) {
+      if (a->public_.category != RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE ||
+          a->public_.state == RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
+        continue;
+      if (cnt < max)
+        ids[cnt] = a->public_.id;
+      cnt++;
+    }
+  }
+  return cnt;
 }
 
 int rc_client_lb_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig) {
@@ -7225,6 +7394,10 @@ void rc_client_do_frame(rc_client_t* client)
     rc_client_subset_info_t* subset;
     int64_t _prof_t1;
     uint32_t _gc_saved = 0;
+#ifdef RC_INCREMENTAL_UPD
+    /* warm flag of the COMMITTED state: a rollback restores it (see below) */
+    const uint8_t _gc_warm = client->game->runtime.memrefs->memrefs.incr_warmed;
+#endif
 
     rc_mutex_lock(&client->state.mutex);
 
@@ -7232,12 +7405,27 @@ void rc_client_do_frame(rc_client_t* client)
 
     /* Gate part 1 — snapshot memref values so a deferred frame can roll back
      * cleanly (zero trace on the Delta the eventual primed frame computes). */
-    if (g_rc_doframe_gate_enabled && g_rc_doframe_primed_cb && g_rc_doframe_save_buf)
-      _gc_saved = rc_gc_save_memref_values(client->game->runtime.memrefs,
-                                           g_rc_doframe_save_buf, g_rc_doframe_save_cap);
+    int _gc_undo = 0;   /* 1 = this update runs under the undo log instead of a full copy */
+    { int64_t _sv0 = esp_timer_get_time();
+    if (g_rc_doframe_gate_enabled && g_rc_doframe_primed_cb && g_rc_doframe_save_buf) {
+      if (g_rc_undo_enabled && g_rc_doframe_undo_ptrs) {
+        g_rc_undo_ptr = g_rc_doframe_undo_ptrs;
+        g_rc_undo_old = g_rc_doframe_save_buf;
+        g_rc_undo_cap = g_rc_doframe_save_cap;
+        g_rc_undo_n = 0;
+        g_rc_undo_overflow = 0;
+        _gc_undo = 1;
+      }
+      else
+        _gc_saved = rc_gc_save_memref_values(client->game->runtime.memrefs,
+                                             g_rc_doframe_save_buf, g_rc_doframe_save_cap);
+    }
+      g_rc_save_us = (uint32_t)(esp_timer_get_time() - _sv0); }
 
     { int64_t _prof_t0 = esp_timer_get_time();
       rc_client_update_memref_values(client);   /* resolve pointer chains (1330 modified_memrefs) */
+      g_rc_undo_ptr = NULL;                     /* logging covers the update only */
+      g_rc_undo_entries = _gc_undo ? g_rc_undo_n : 0;
       _prof_t1 = esp_timer_get_time();
       g_rc_update_us = (uint32_t)(_prof_t1 - _prof_t0); }
 
@@ -7247,16 +7435,31 @@ void rc_client_do_frame(rc_client_t* client)
      * "value became X"). The missed addresses were recorded by the adapter's
      * peek and drive the next convergence round; the frame is evaluated once
      * the cache is primed. See the comment above rc_client_memref_count. */
+    /* undo-log overflow can't happen (each memref is noted at most once and the
+     * log holds them all); if it ever did, the log can't restore this frame — so
+     * it is evaluated instead of rolled back (the pre-gate behavior). */
     if (g_rc_doframe_gate_enabled && g_rc_doframe_primed_cb && g_rc_doframe_save_buf
+        && !(_gc_undo && g_rc_undo_overflow)
         && !g_rc_doframe_primed_cb()) {
-      rc_gc_restore_memref_values(client->game->runtime.memrefs,
-                                  g_rc_doframe_save_buf, _gc_saved);
+      if (_gc_undo) {
+        uint32_t _i = g_rc_undo_n;
+        while (_i-- > 0)
+          *g_rc_doframe_undo_ptrs[_i] = g_rc_doframe_save_buf[_i];
+      }
+      else
+        rc_gc_restore_memref_values(client->game->runtime.memrefs,
+                                    g_rc_doframe_save_buf, _gc_saved);
 #ifdef RC_INCREMENTAL_UPD
-      /* This update was rolled back — its chain values did NOT commit. Clear the
-       * opt-B warm flag so the next NON-deferred frame does a full resolve before
-       * any skipping (else a chain whose first resolve was rolled back could be
-       * B1-skipped while still holding its initial value). */
-      client->game->runtime.memrefs->memrefs.incr_warmed = 0;
+      /* This update was rolled back — its chain values did NOT commit. Restore the
+       * opt-B warm flag of the committed state (2026-11-15; was: force 0, i.e. a
+       * full ~21 ms resolve after EVERY defer — Zelda CE Majora's Mask: defers
+       * cascaded into multi-second lag). Exact because the rollback restores every
+       * memref value: B1 re-derives stability from .changed computed against the
+       * restored values, and B2/U1's "leaf unchanged" is computed by the adapter
+       * against the last COMMITTED frame (snap_changed is OR-accumulated while
+       * frames are deferred). Only a rollback of the very FIRST update (warm was
+       * 0) still forces the full pass — that is what the old reset protected. */
+      client->game->runtime.memrefs->memrefs.incr_warmed = _gc_warm;
 #endif
       g_rc_eval_us = 0;
       g_rc_doframe_deferred = 1;
@@ -7303,7 +7506,9 @@ void rc_client_do_frame(rc_client_t* client)
 
     rc_mutex_unlock(&client->state.mutex);
 
+    { int64_t _ps0 = esp_timer_get_time();
     rc_client_raise_pending_events(client, client->game);
+      g_rc_post_us = (uint32_t)(esp_timer_get_time() - _ps0); }
 
     ++client->state.frames_processed;
   }
@@ -7326,7 +7531,9 @@ void rc_client_do_frame(rc_client_t* client)
     }
   }
 
+  { int64_t _id0 = esp_timer_get_time();
   rc_client_idle(client);
+    g_rc_post_us += (uint32_t)(esp_timer_get_time() - _id0); }
 }
 
 void rc_client_idle(rc_client_t* client)
@@ -8034,6 +8241,86 @@ static uint32_t rc_diag_count_value(const rc_value_t* v) {
   for (cs = v->conditions; cs; cs = cs->next)
     for (c = cs->conditions; c; c = c->next) ++n;
   return n;
+}
+
+/* ---- load estimate inputs (2026-11-15) ----------------------------------
+ * The per-frame cost model in the adapter (frame_budget_estimate) needs what
+ * the census above can't tell apart: how many conditions the EVAL walks
+ * (pause/reset/hittarget/measured/other — the INDIRECT AddAddress links are
+ * resolved by the memref update, not evaluated) for what is actually armed
+ * (ACTIVE achievements; leaderboards ACTIVE/TRACKING, i.e. hardcore), plus the
+ * memref and chain-link (modified memref) counts the update pays every frame. */
+static uint32_t rc_diag_eval_conds_condset(const rc_condset_t* cs) {
+  return cs ? (uint32_t)cs->num_pause_conditions + cs->num_reset_conditions +
+              cs->num_hittarget_conditions + cs->num_measured_conditions + cs->num_other_conditions
+            : 0;
+}
+
+static uint32_t rc_diag_eval_conds_condsets(const rc_condset_t* cs) {
+  uint32_t n = 0;
+  for (; cs; cs = cs->next)
+    n += rc_diag_eval_conds_condset(cs);
+  return n;
+}
+
+static uint32_t rc_diag_eval_conds_trigger(const rc_trigger_t* t) {
+  if (!t)
+    return 0;
+  /* the core is one condset; the alts are the ->next list from t->alternative */
+  return rc_diag_eval_conds_condset(t->requirement) + rc_diag_eval_conds_condsets(t->alternative);
+}
+
+void rc_client_diag_load_estimate(const rc_client_t* client,
+    uint32_t* out_ach_eval, uint32_t* out_ach_active, uint32_t* out_lb_eval, uint32_t* out_lb_active,
+    uint32_t* out_memrefs, uint32_t* out_modified, uint32_t* out_ach_eval_dormant) {
+  uint32_t ae = 0, aa = 0, le = 0, la = 0, ad = 0;
+  const rc_client_subset_info_t* subset;
+  *out_ach_eval = *out_ach_active = *out_lb_eval = *out_lb_active = *out_memrefs = *out_modified = 0;
+  *out_ach_eval_dormant = 0;
+  if (!client || !client->game)
+    return;
+  for (subset = client->game->subsets; subset; subset = subset->next) {
+    const rc_client_achievement_info_t* ach = subset->achievements;
+    const rc_client_achievement_info_t* stop = ach + subset->public_.num_achievements;
+    const rc_client_leaderboard_info_t* lb = subset->leaderboards;
+    const rc_client_leaderboard_info_t* lb_stop = lb + subset->public_.num_leaderboards;
+    for (; ach < stop; ++ach) {
+      if (!ach->trigger || ach->public_.state != RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
+        continue;
+      ae += rc_diag_eval_conds_trigger(ach->trigger);
+      aa++;
+      {
+        /* dormant-eligible (trigger.c): while its guard holds, only its reset
+         * block is evaluated - the rest of its eval conds drop out */
+        rc_condition_t* g[4];
+        if (rc_trigger_find_dormant_guards(ach->trigger, g, 4) > 0) {
+          const rc_condset_t* cs;
+          ad += rc_diag_eval_conds_trigger(ach->trigger);
+          for (cs = ach->trigger->requirement; cs; cs = (cs == ach->trigger->requirement) ? ach->trigger->alternative : cs->next)
+            ad -= cs->num_reset_conditions;
+        }
+      }
+    }
+    for (; lb < lb_stop; ++lb) {
+      if (!lb->lboard || (lb->public_.state != RC_CLIENT_LEADERBOARD_STATE_ACTIVE &&
+                          lb->public_.state != RC_CLIENT_LEADERBOARD_STATE_TRACKING))
+        continue;
+      le += rc_diag_eval_conds_trigger(&lb->lboard->start);
+      le += rc_diag_eval_conds_trigger(&lb->lboard->cancel);
+      le += rc_diag_eval_conds_trigger(&lb->lboard->submit);
+      le += rc_diag_eval_conds_condsets(lb->lboard->value.conditions);
+      la++;
+    }
+  }
+  *out_ach_eval = ae;
+  *out_ach_active = aa;
+  *out_lb_eval = le;
+  *out_lb_active = la;
+  *out_ach_eval_dormant = ad;
+  if (client->game->runtime.memrefs) {
+    *out_memrefs = rc_memrefs_count_memrefs(client->game->runtime.memrefs);
+    *out_modified = rc_memrefs_count_modified_memrefs(client->game->runtime.memrefs);
+  }
 }
 
 void rc_client_diag_cond_census(const rc_client_t* client,

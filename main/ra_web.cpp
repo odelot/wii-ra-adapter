@@ -74,6 +74,17 @@ void ra_web_set_state_json(const char *json, unsigned len)
     xSemaphoreGive(s_json_mux);
 }
 
+void ra_web_clear_state_json(void)
+{
+    if (!s_json_mux) return;
+    xSemaphoreTake(s_json_mux, portMAX_DELAY);
+    free(s_json);
+    s_json = NULL;
+    s_json_cap = 0;
+    s_json_len = 0;
+    xSemaphoreGive(s_json_mux);
+}
+
 /* ---- WebSocket /ws: live push --------------------------------------------- */
 
 enum { WS_UNLOCK = 1, WS_CHALLENGE, WS_PROGRESS, WS_RP, WS_RELOAD };

@@ -155,22 +155,182 @@ rc_memref_t* rc_alloc_memref(rc_parse_state_t* parse, uint32_t address, uint8_t 
   return memref;
 }
 
+/* ---- modified-memref dedup index (see rc_memrefs_index_begin in rc_internal.h) ----
+ * Open addressing over pointers into the memrefs' own lists (items never move).
+ * The hash covers exactly what rc_operands_are_equal compares, so equal keys
+ * always meet; every hit is still confirmed with the original test. A link
+ * operand (modified memref) hashes by pointer: links are unique within the
+ * indexed lists (each is created only after the search found no equal one), so
+ * structural equality there IS pointer equality. Any allocation failure drops
+ * the index and the search falls back to the scan - slower, never different. */
+typedef struct rc_mm_index_t {
+  uint32_t mask;                   /* capacity - 1 (power of two) */
+  uint32_t count;
+  rc_modified_memref_t** slots;
+} rc_mm_index_t;
+
+static uint32_t rc_mm_hash_operand(const rc_operand_t* op) {
+  uint32_t h = (uint32_t)op->type * 0x9E3779B1u;
+  switch (op->type) {
+    case RC_OPERAND_CONST:  return h ^ op->value.num;
+    case RC_OPERAND_FP:     return h;                  /* compared by value: one bucket */
+    case RC_OPERAND_RECALL: return h;   /* NOT the pointer: rc_condition_update_recall_operand
+                                         * rewrites it in links already indexed */
+    default: break;
+  }
+  if (!rc_operand_is_memref(op) || !op->value.memref)
+    return h;
+  h ^= (uint32_t)op->size << 8;
+  h ^= (uint32_t)op->value.memref->value.memref_type << 16;
+  if (op->value.memref->value.memref_type == RC_MEMREF_TYPE_MODIFIED_MEMREF)
+    return h ^ ((uint32_t)(uintptr_t)op->value.memref * 0x85EBCA6Bu);
+  return h ^ (op->value.memref->address * 0x85EBCA6Bu) ^ op->value.memref->value.size;
+}
+
+static uint32_t rc_mm_key(uint8_t size, uint8_t modifier_type,
+                          const rc_operand_t* parent, const rc_operand_t* modifier) {
+  uint32_t h = (uint32_t)size * 0x01000193u ^ (uint32_t)modifier_type * 0x9E3779B1u;
+  h ^= rc_mm_hash_operand(parent) + 0x7F4A7C15u + (h << 6) + (h >> 2);
+  h ^= rc_mm_hash_operand(modifier) + 0x7F4A7C15u + (h << 6) + (h >> 2);
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  return h;
+}
+
+static uint32_t rc_mm_key_of(const rc_modified_memref_t* m) {
+  return rc_mm_key(m->memref.value.size, m->modifier_type, &m->parent, &m->modifier);
+}
+
+static int rc_mm_index_put(rc_mm_index_t* ix, rc_modified_memref_t* m) {
+  uint32_t i;
+  if ((ix->count + 1) * 10 > (ix->mask + 1) * 7) {         /* keep load <= 70% */
+    uint32_t cap = (ix->mask + 1) * 2, j;
+    rc_modified_memref_t** slots = (rc_modified_memref_t**)calloc(cap, sizeof(*slots));
+    if (!slots)
+      return 0;
+    for (j = 0; j <= ix->mask; ++j) {
+      rc_modified_memref_t* o = ix->slots[j];
+      if (o) {
+        uint32_t k = rc_mm_key_of(o) & (cap - 1);
+        while (slots[k]) k = (k + 1) & (cap - 1);
+        slots[k] = o;
+      }
+    }
+    free(ix->slots);
+    ix->slots = slots;
+    ix->mask = cap - 1;
+  }
+  i = rc_mm_key_of(m) & ix->mask;
+  while (ix->slots[i]) i = (i + 1) & ix->mask;
+  ix->slots[i] = m;
+  ix->count++;
+  return 1;
+}
+
+static rc_modified_memref_t* rc_mm_index_find(const rc_mm_index_t* ix, uint32_t key, uint8_t size,
+    const rc_operand_t* parent, uint8_t modifier_type, const rc_operand_t* modifier) {
+  uint32_t i = key & ix->mask;
+  rc_modified_memref_t* m;
+  while ((m = ix->slots[i]) != NULL) {
+    if (m->memref.value.size == size &&
+        m->modifier_type == modifier_type &&
+        rc_operands_are_equal(&m->parent, parent) &&
+        rc_operands_are_equal(&m->modifier, modifier))
+      return m;
+    i = (i + 1) & ix->mask;
+  }
+  return NULL;
+}
+
+void rc_memrefs_index_end(rc_memrefs_t* memrefs) {
+  if (memrefs && memrefs->mm_index) {
+    free(memrefs->mm_index->slots);
+    free(memrefs->mm_index);
+    memrefs->mm_index = NULL;
+  }
+}
+
+void rc_memrefs_index_begin(rc_memrefs_t* memrefs) {
+  rc_mm_index_t* ix;
+  rc_modified_memref_list_t* list;
+  uint32_t cap = 1024;
+  if (!memrefs || memrefs->mm_index)
+    return;
+  while (cap * 7 < rc_memrefs_count_modified_memrefs(memrefs) * 10 * 2) cap <<= 1;
+  ix = (rc_mm_index_t*)calloc(1, sizeof(*ix));
+  if (!ix)
+    return;
+  ix->slots = (rc_modified_memref_t**)calloc(cap, sizeof(*ix->slots));
+  if (!ix->slots) {
+    free(ix);
+    return;
+  }
+  ix->mask = cap - 1;
+  memrefs->mm_index = ix;
+  for (list = &memrefs->modified_memrefs; list; list = list->next) {
+    uint32_t j;
+    for (j = 0; j < list->count; ++j) {
+      if (!rc_mm_index_put(ix, &list->items[j])) {
+        rc_memrefs_index_end(memrefs);   /* incomplete index = wrong answers: drop it */
+        return;
+      }
+    }
+  }
+}
+
 rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t size, const rc_operand_t* parent,
                                                uint8_t modifier_type, const rc_operand_t* modifier) {
   rc_modified_memref_list_t* modified_memref_list = NULL;
   rc_modified_memref_t* modified_memref = NULL;
+  uint32_t key = 0;
+  int key_ready = 0;
   int i = 0;
 
   for (i = 0; i < 2; i++) {
+    rc_memrefs_t* owner;
     if (i == 0) {
       if (!parse->existing_memrefs)
         continue;
 
-      modified_memref_list = &parse->existing_memrefs->modified_memrefs;
+      owner = parse->existing_memrefs;
     }
     else {
-      modified_memref_list = &parse->memrefs->modified_memrefs;
+      owner = parse->memrefs;
     }
+
+    if (owner->mm_index) {   /* indexed: same answer as the scan below, O(1) */
+      if (!key_ready) {
+        key = rc_mm_key(size, modifier_type, parent, modifier);
+        key_ready = 1;
+      }
+      modified_memref = rc_mm_index_find(owner->mm_index, key, size, parent, modifier_type, modifier);
+#ifdef RC_MM_INDEX_VERIFY
+      {   /* host validation: the scan over this same owner must agree */
+        extern unsigned long g_rc_mm_verify_calls, g_rc_mm_verify_bad;
+        rc_modified_memref_t* scan = NULL;
+        const rc_modified_memref_list_t* l;
+        for (l = &owner->modified_memrefs; l && !scan; l = l->next) {
+          uint32_t j;
+          for (j = 0; j < l->count; ++j) {
+            const rc_modified_memref_t* m = &l->items[j];
+            if (m->memref.value.size == size && m->modifier_type == modifier_type &&
+                rc_operands_are_equal(&m->parent, parent) && rc_operands_are_equal(&m->modifier, modifier)) {
+              scan = (rc_modified_memref_t*)m;
+              break;
+            }
+          }
+        }
+        g_rc_mm_verify_calls++;
+        if (scan != modified_memref) g_rc_mm_verify_bad++;
+      }
+#endif
+      if (modified_memref)
+        return modified_memref;
+      continue;
+    }
+
+    modified_memref_list = &owner->modified_memrefs;
 
     do {
       const rc_modified_memref_t* memref_stop;
@@ -241,6 +401,9 @@ rc_modified_memref_t* rc_alloc_modified_memref(rc_parse_state_t* parse, uint8_t 
     modified_memref->depth = parent_modified_memref->depth + 1;
   }
 
+  if (parse->memrefs->mm_index && !rc_mm_index_put(parse->memrefs->mm_index, modified_memref))
+    rc_memrefs_index_end(parse->memrefs);   /* out of memory: back to scanning */
+
   return modified_memref;
 }
 
@@ -290,6 +453,7 @@ void rc_memrefs_destroy(rc_memrefs_t* memrefs)
     }
   } while (modified_memref_list);
 
+  rc_memrefs_index_end(memrefs);
   free(memrefs);
 }
 
@@ -755,7 +919,28 @@ uint32_t rc_peek_value(uint32_t address, uint8_t size, rc_peek_t peek, void* ud)
   }
 }
 
+/* undo log (see rc_internal.h) */
+rc_memref_value_t** g_rc_undo_ptr = 0;
+rc_memref_value_t*  g_rc_undo_old = 0;
+uint32_t g_rc_undo_n = 0, g_rc_undo_cap = 0;
+int g_rc_undo_overflow = 0;
+
+void rc_undo_note(rc_memref_value_t* p) {
+  if (g_rc_undo_n < g_rc_undo_cap) {
+    g_rc_undo_ptr[g_rc_undo_n] = p;
+    g_rc_undo_old[g_rc_undo_n] = *p;
+    g_rc_undo_n++;
+  }
+  else {
+    g_rc_undo_overflow = 1;
+  }
+}
+
 void rc_update_memref_value(rc_memref_value_t* memref, uint32_t new_value) {
+  /* undo log: note it only if this call changes the struct (value moves, or a
+   * stale changed=1 is cleared) — a no-op write needs no restore */
+  if (g_rc_undo_ptr && (memref->changed || memref->value != new_value))
+    rc_undo_note(memref);
   if (memref->value == new_value) {
     memref->changed = 0;
   }
@@ -937,6 +1122,7 @@ int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr) {
     return 0;
 
   if (mm->modifier_type != RC_OPERATOR_INDIRECT_READ) {
+    if (g_rc_undo_ptr && mm->memref.value.changed) rc_undo_note(&mm->memref.value);
     mm->memref.value.changed = 0;     /* B1 */
     ++g_rc_b1_skips;
     return 1;
@@ -957,6 +1143,7 @@ int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr) {
         r = g_rc_u1_populate(u1_idx, a.value.u32, rc_indirect_num_bytes(mm->memref.value.size));
       }
       if (r == 1) {                   /* leaf unchanged -> skip */
+        if (g_rc_undo_ptr && mm->memref.value.changed) rc_undo_note(&mm->memref.value);
         mm->memref.value.changed = 0;
         ++g_rc_b2_skips;
         return 1;
@@ -970,6 +1157,7 @@ int rc_modified_memref_can_skip(rc_modified_memref_t* mm, int incr) {
       rc_typed_value_add(&a, &m);
       rc_typed_value_convert(&a, RC_VALUE_TYPE_UNSIGNED);
       if (g_rc_leaf_unchanged(a.value.u32, rc_indirect_num_bytes(mm->memref.value.size))) {
+        if (g_rc_undo_ptr && mm->memref.value.changed) rc_undo_note(&mm->memref.value);
         mm->memref.value.changed = 0;
         ++g_rc_b2_skips;
         return 1;

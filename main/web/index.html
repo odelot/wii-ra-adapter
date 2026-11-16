@@ -281,11 +281,11 @@
 
     /* RA titles a bonus set "Game [Subset - Name]"; the core set is the game. */
     function setName(s){
-      if (s.id===gameId) return 'Base Set';
+      if (s===sets[0] || s.id===gameId) return 'Base Set';
       const m = /\[Subset - (.+)\]/.exec(s.t||'');
       return m ? m[1] : (s.t || ('Set '+s.id));
     }
-    const setOf = a => a.set || gameId;
+    const setOf = a => a.set || (sets[0] ? sets[0].id : gameId);
     const inSet = () => lastList.filter(a => setOf(a)===curSet);
 
     function render(d){
@@ -326,7 +326,7 @@
       /* Name only for a bonus set — the base set is the game in the header. */
       const cur = sets.find(s=>s.id===curSet);
       const nm = $('setname');
-      nm.textContent = cur && cur.id!==gameId ? setName(cur) : '';
+      nm.textContent = cur && cur!==sets[0] && cur.id!==gameId ? setName(cur) : '';
       nm.style.display = nm.textContent ? '' : 'none';
 
       /* Summary of the selected set, with the RA "beaten" rule: every
@@ -498,6 +498,50 @@
     function ago(s){ return s < 0 ? 'never' : fmtUp(s) + ' ago'; }
     function kb(b){ return (b/1024).toFixed(1) + ' KB'; }
 
+    /* Frame fidelity since the game loaded: one evaluation per game frame, each
+       on that frame's own data. Anything else means unlocks may be missed (or,
+       with missing reads, wrong) — the game is too heavy for the adapter. */
+    /* Load-time estimate of the per-frame cost (structure of the loaded set).
+       HEAVY = a typical frame doesn't fit the budget: expect lost frames. */
+    function estRows(d){
+      if (!d.est || d.est === 'n/a') return [];
+      const ms = us => (us / 1000).toFixed(1) + ' ms';
+      const msg = {OK: 'fits', RISK: 'tight — may lag at busy moments', HEAVY: 'too heavy — frames will be lost'};
+      return [
+        ['load estimate', d.est + ' — ' + (msg[d.est] || ''), d.est === 'HEAVY' ? 'bad' : d.est === 'RISK' ? 'warn' : ''],
+        ['estimated frame', ms(d.est_typ_us) + ' typical · ' + ms(d.est_peak_us) + ' peak · budget ' + ms(d.est_budget_us)],
+        ...(d.est_dm_eval ? [['if dormant guards hold', d.est_dm + ' — ' + ms(d.est_dm_typ_us) + ' typical · ' +
+          ms(d.est_dm_peak_us) + ' peak (' + d.est_dm_eval + ' conds drop out; e.g. a compilation\'s other games)',
+          d.est_dm === 'HEAVY' ? 'bad' : d.est_dm === 'RISK' ? 'warn' : '']] : []),
+        ['set structure', d.est_links + ' chain links · ' + d.est_memrefs + ' memrefs · ' + d.est_ach_eval +
+          ' eval conds in ' + d.est_ach_n + ' achievements' + (d.est_lb_n ? ' · ' + d.est_lb_eval + ' in ' + d.est_lb_n + ' leaderboards' : '')],
+      ];
+    }
+
+    function fidRows(d){
+      if (d.fid_gf == null) return [];
+      if (!d.fid_gf) return [...estRows(d), ['frame fidelity', '— (no game running)']];
+      const lost = d.fid_lost, pct = (100 * lost / d.fid_gf).toFixed(lost && lost * 1000 < d.fid_gf ? 2 : 1);
+      const bad = d.fid_fo > 0 || lost * 100 > d.fid_gf;   /* holes, or >1% lost */
+      const other = Math.max(0, lost - d.fid_def - d.fid_drop - d.fid_ok0);
+      return [
+        ...estRows(d),
+        ['frame fidelity', !lost && !d.fid_fo ? 'OK — every game frame evaluated'
+          : 'DEGRADED — ' + lost + ' frame' + (lost === 1 ? '' : 's') + ' not evaluated (' + pct + '%)',
+          !lost && !d.fid_fo ? '' : bad ? 'bad' : 'warn'],
+        ['frames evaluated', d.fid_ev + ' of ' + d.fid_gf + ' game frames'],
+        ['not evaluated', lost ? 'deferred ' + d.fid_def + ' · queue-dropped ' + d.fid_drop +
+          ' · out-of-sync ' + d.fid_ok0 + (other ? ' · never received ' + other : '') : '0',
+          lost ? (bad ? 'bad' : 'warn') : ''],
+        ['evaluated with missing reads', String(d.fid_fo), d.fid_fo ? 'bad' : ''],
+        ['evaluated late (queue)', d.fid_late + ' · queue now ' + d.fid_q + '/' + d.fid_qcap +
+          ' · max ' + d.fid_qmax + '/' + d.fid_qcap, d.fid_qmax >= d.fid_qcap ? 'warn' : ''],
+        ['last loss', ago(d.fid_loss_ago_s)],
+        ['address fetches while lagging', (d.lag_q || 0) + ' queries · ' + (d.lag_q_addrs || 0) + ' addresses · ' +
+          (d.late_miss || 0) + ' reads deferred to newer frames'],
+      ];
+    }
+
     function renderDiag(d){
       const rssiCls = !d.rssi ? 'bad' : d.rssi < -80 ? 'bad' : d.rssi < -70 ? 'warn' : '';
       const rssiTxt = !d.rssi ? 'no signal' : d.rssi + ' dBm (' +
@@ -522,6 +566,7 @@
           ' · rssi ' + d.http_last_rssi + ' · ' + ago(d.http_last_ago_s) : '0',
           d.http_errs ? 'warn' : ''],
         ['console link', d.link],
+        ...fidRows(d),
         ['internal heap', kb(d.heap_int) + ' (min ' + kb(d.heap_int_min) + ', blk ' + kb(d.heap_int_blk) + ')'],
         ['PSRAM free', kb(d.heap_psram)],
         ['log', kb(d.log_pos) + ' since boot' + (d.log_dropped ? ' · UART dropped ' + d.log_dropped + ' B' : '')],

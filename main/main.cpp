@@ -61,6 +61,7 @@ Unlock LED:               WS2812 RGB GPIO48        yellow user LED GPIO21 (activ
 #include <StreamString.h>
 #include "rc_client.h"
 #include "rc_api_user.h"   /* portal-time login check (rc_api_init_login_request) */
+#include "rc_consoles.h"   /* RC_CONSOLE_WII (MEM2-LAYOUT diag) */
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "SPI.h"
@@ -107,17 +108,27 @@ extern "C" {
   uint32_t rc_client_memref_count(const rc_client_t* client);
   uint32_t rc_client_modified_memref_count(const rc_client_t* client);   /* U1 sizing */
   int rc_client_lb_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig);
+  int rc_client_ach_probe(const rc_client_t* client, uint32_t id, char* buf, size_t n, uint32_t* sig, uint32_t* vsig);
+  int rc_client_inactive_core_ids(const rc_client_t* client, uint32_t* ids, int max);
   extern int (*g_rc_doframe_primed_cb)(void);
   extern rc_memref_value_t* g_rc_doframe_save_buf;
+  extern rc_memref_value_t** g_rc_doframe_undo_ptrs;   /* undo-log pointers (rc_client.c) */
+  extern volatile uint32_t g_rc_undo_entries;
   extern uint32_t g_rc_doframe_save_cap;
   extern volatile int g_rc_doframe_gate_enabled;
   extern volatile int g_rc_doframe_deferred;
+  extern volatile uint32_t g_rc_save_us, g_rc_post_us;   /* do_frame fixed-cost diag */
 #ifdef RC_DIRTY_EVAL
   /* dirty/incremental eval: cold+clean trigger skipping. enabled=runtime A/B;
    * skipped/evaled = per-frame tallies (we zero them before each do_frame). */
   extern volatile int g_rc_dirty_eval_enabled;
   extern volatile uint32_t g_rc_de_skipped;
   extern volatile uint32_t g_rc_de_evaled;
+  /* dormant triggers (2026-11-15): achievements whose core ResetIf guard is true
+   * and already reset them are skipped (see rc_client.c / trigger.c). */
+  extern volatile int g_rc_dormant_enabled;
+  extern volatile uint32_t g_rc_dm_skipped;      /* per-frame tally */
+  extern volatile uint32_t g_rc_dm_stat_ach;     /* achievements with a guard */
   /* lb dirty-eval + RP throttle (2026-07-03, the hardcore +3ms fix) */
   extern volatile int g_rc_lb_dirty_enabled;
   extern volatile uint32_t g_rc_lb_skipped;
@@ -570,6 +581,32 @@ volatile uint32_t frame_counter = 0;
  * console-side cause. */
 static uint8_t g_disc_id_mem[RA_GAME_ID_LEN];
 static volatile bool g_disc_id_mem_ok = false;
+/* PROCESSING status (2026-11-15): set once the patch body is downloaded, while
+ * the ESP strips + parses it (Zelda CE spent 80 s there before the parse index).
+ * The console sees RA_STATUS_PROCESSING instead of LOADING_GAME and restarts its
+ * LOAD_GAME timeout window on that change (old frontends just keep waiting, as
+ * for 0x05). Written by the HTTP task, read by the Core-1 servicer; cleared at
+ * the start of every load. */
+static volatile bool g_set_processing = false;
+/* Achievement probe (rc_client_ach_probe): ACHP log lines with every condition's
+ * values whenever they change. Set an achievement id to diagnose one that won't
+ * fire; 0 = off. (2026-11-15: 474244 on Zelda CE found the PPC write-back cache
+ * holding stale NES RAM — fixed in Nintendont, probe turned off again.) */
+#ifndef RA_ACH_PROBE_ID
+#define RA_ACH_PROBE_ID 0u
+#endif
+/* Upper bound (exclusive) of the MEM2 a Wii game's reads may target — mirrors the
+ * d2x module's RA_MEM2_SAFE_HI. 0x13400000 until the MEM2-LAYOUT diag reads the
+ * OS global "end of PPC MEM2" (0x80003120) for the running game; accepted only in
+ * [0x13400000, 0x13600000] (d2x IOS here: 0x13600000; Kirby's Dream Collection
+ * reads 0x135E1044). Same rule on both sides: the d2x answers 0 past its own
+ * bound anyway, so an old cIOS just keeps the old behavior. */
+#define MEM2_HI_DEFAULT 0x13400000u
+#define MEM2_HI_MAX     0x13600000u
+static volatile uint32_t g_mem2_hi = MEM2_HI_DEFAULT;
+static inline uint8_t published_status(uint8_t st) {
+    return (st == RA_STATUS_LOADING_GAME && g_set_processing) ? (uint8_t)RA_STATUS_PROCESSING : st;
+}
 // Set by the RA_CMD_RESET_CREDENTIALS handler; loop() wipes WiFi + RA creds and reboots.
 volatile bool g_factory_reset_pending = false;
 
@@ -582,6 +619,18 @@ volatile bool g_factory_reset_pending = false;
  * the index->address mapping; count-stability within a session == membership
  * stability), so a freshly-cached leaf always resolves at least once. */
 uint8_t *snap_changed = NULL;
+/* Deferred-frame carry (2026-11-15): set while the last do_frame was rolled back
+ * (gate defer), cleared by the next committed one. While set, snapshot_apply
+ * OR-accumulates snap_changed, so it means "moved since the last COMMITTED frame"
+ * — what B2/U1 need, since a rollback restores every chain value to that frame.
+ * (Without it the deferred frame's diff is lost: a leaf that moved in the deferred
+ * frame and then stopped would be skipped with the committed, stale value. This
+ * is why rc_client used to force a full resolve after every defer.) Host-checked:
+ * updfuzz (device sources, 25% random defers) 0 diverged frames on Zelda CE /
+ * SMG / MKW / KDC / synthetic; without the OR it diverges on ~every frame.
+ * Loop task only (apply + process_one_frame run there or on the worker while the
+ * loop task is idle — never concurrently). */
+static volatile bool g_upd_carry = false;
 static volatile bool g_b2_enabled = true;          // master A/B toggle
 static uint16_t g_last_doframe_watch_count = 0xFFFF;
 extern "C" {
@@ -933,6 +982,67 @@ uint8_t  query_values[ADDR_QUERY_MAX];
 uint16_t query_count = 0;
 static volatile bool addr_query_pending = false;
 
+/* LAG-PATH CONVERGENCE (2026-11-15, Zelda CE death spiral). Collect/ADDR_QUERY
+ * used to run only on the fast path (loop idle + empty snapshot queue), so a
+ * game lagging for good never fetched the addresses its new pointers needed:
+ * every frame deferred on the same miss, forever (cm=0, 88% of frames lost).
+ * Now, while lagging, the worker sends ONE ADDR_QUERY for the concrete reads
+ * that missed (peek_miss list — no chain walk against in-flight do_frame state)
+ * and appends them for the FUTURE snapshots. Exactness rule: a frame may only
+ * read watch entries its own snapshot carried. g_frame_valid_count = how many
+ * leading memory_data entries belong to the frame being evaluated (the applied
+ * snapshot's count; the fast path adds its own convergence appends). An entry
+ * at or past it holds a value from ANOTHER moment (the lag query's) -> read as
+ * a miss, exactly what that frame saw before the append (tombstone or defer).
+ * So no queued frame ever evaluates a future value, and no frame is dropped
+ * that wasn't already lost. */
+static volatile uint32_t g_frame_valid_count = 0xFFFFFFFFu;
+static volatile bool     g_lag_query = false;     /* the in-flight ADDR_QUERY is a lag query */
+static uint32_t g_lag_q_sent = 0, g_lag_q_addrs = 0;   /* cumulative diag */
+static volatile uint32_t g_late_miss = 0;         /* reads of entries newer than the frame (diag) */
+
+/* EXACT CONVERGENCE (2026-11-15, with the Nintendont USB pipeline). The fast
+ * path lets a frame read the entries its own ADDR_QUERY rounds appended — exact
+ * only while the console answers within the same frame (blocking exchange: it
+ * is waiting for our reply and reads the addresses ~1 ms later). A PIPELINED
+ * console (Nintendont USB, d2x RAMOD) handles our reply only at its NEXT
+ * retrace, so those values belong to the next frame. When the answer comes
+ * later than RA_CONV_LATE_US after the query, the frame keeps only what its
+ * snapshot carried (entries past it read as a miss -> tombstone or defer, the
+ * lag-path rule); the next snapshot carries them. Cost: about one deferred
+ * frame per new pointer target on pipelined consoles; blocking consoles never
+ * hit it. OFF by default (2026-11-15): a deferred frame is NOT evaluated, so
+ * its hits are lost (a 3600-hit timer needs 3601 frames); reading the new
+ * address one frame late is wrong only if that value moved in that one frame,
+ * so the old "read at query time" semantics (d2x since Phase B) is the more
+ * faithful one for hit counts. Kept as an experiment knob. */
+#define RA_CONV_LATE_US 4000u
+static volatile int      g_conv_exact = 0;        /* runtime toggle (default OFF = d2x semantics, see above) */
+static uint32_t          g_conv_q_us = 0;         /* fast-path ADDR_QUERY send time */
+static bool              g_conv_late = false;     /* this vblank's convergence came back late */
+static volatile uint32_t g_conv_late_n = 0;       /* frames held to their snapshot (cumulative diag) */
+
+/* B2 membership rule (2026-11-15). B2/U1 skip a chain whose leaf bytes did not
+ * move since the last COMMITTED frame. Any membership change used to switch B2
+ * off for a frame — but on a heavy game the lag-path ADDR_QUERY appends after
+ * almost every defer, so the frame after a defer always paid the full ~21 ms
+ * resolve (Majora's Mask: b2sk=0 on every post-defer frame). Now:
+ *  - a REMAP (evict/defrag/rebuild: hash_clear) bumps g_wl_remap_gen and still
+ *    switches B2 off until a frame commits (indices moved);
+ *  - an APPEND keeps existing indices, so B2 stays on, and every entry at or past
+ *    b2_fresh_limit() (what the last committed frame actually carried, and what
+ *    this frame's snapshot carries) counts as "moved": a leaf that just became
+ *    cached is always resolved once, and a "late" entry is read (-> miss path).
+ * Host-checked (updfuzz2: watched set with appends + remaps, unwatched reads = 0,
+ * 25% defers): 0 diverged frames; without the fresh rule 150-250 per 3000. */
+static volatile uint32_t g_wl_remap_gen = 0;
+static uint32_t g_commit_remap_gen = 0xFFFFFFFFu;
+static volatile uint32_t g_b2_fresh_lim = 0;   /* entries >= this: fresh for B2/U1 */
+static inline uint32_t b2_fresh_limit(void) {
+    uint32_t lim = g_b2_fresh_lim;
+    return lim < g_frame_valid_count ? lim : g_frame_valid_count;
+}
+
 /* peek_from_snapshot miss tracker — captures byte addresses that peek
  * was called for but were not in cache. rc_memrefs_get_addresses outputs
  * UNMASKED resolved addresses (parent_raw_value + offset) but the real
@@ -997,6 +1107,45 @@ static volatile uint8_t  g_snapq_head = 0;    /* consumer: loop task */
 static volatile uint8_t  g_snapq_tail = 0;    /* producer: worker task */
 static volatile bool     g_df_busy = false;   /* loop task inside do_frame/drain */
 static uint32_t g_q_enq = 0, g_q_drop = 0, g_q_hwm = 0;   /* per-CATCHUP diag */
+static bool g_dm_logged = false;   /* dormant-guard census logged for this game */
+
+/* FIDELITY DETECTOR (2026-11-15). Hardcore-grade evaluation means one do_frame
+ * per game frame, each on that frame's own data. When the ESP can't keep up it
+ * degrades silently: frames get deferred (gate), dropped (queue overload) or
+ * skipped (out-of-sync snapshot), or evaluated with unresolved reads (gate
+ * fail-open). These counters (since the game loaded) make that visible: a
+ * FIDELITY log line per 5s window with losses, and the dashboard debug view.
+ * gf comes from the console's frame clock (Nintendont falls back to wall clock
+ * when the VBI counter stalls), so lost = gf - ev is the true gap. */
+static uint32_t g_fid_gf = 0;         /* game frames elapsed (console clock) */
+static uint32_t g_fid_ev = 0;         /* frames evaluated */
+static uint32_t g_fid_deferred = 0;   /* gate-deferred: rolled back, not evaluated */
+static uint32_t g_fid_failopen = 0;   /* evaluated with a read that returned 0 */
+static uint32_t g_fid_late = 0;       /* evaluated late, from the snapshot queue */
+static uint32_t g_fid_ok0 = 0;        /* out-of-sync snapshots (not evaluated) */
+static uint32_t g_fid_qdrop0 = 0;     /* g_q_drop at game load (q_drop is lifetime) */
+static uint8_t  g_fid_qmax = 0;       /* deepest snapshot queue since game load */
+static uint32_t g_fid_loss_ms = 0;    /* millis() of the last window with a loss */
+static uint32_t g_fid_gen = 0;        /* bumped by fid_reset (new game) */
+static inline uint32_t fid_lost(void) { return g_fid_gf > g_fid_ev ? g_fid_gf - g_fid_ev : 0; }
+static inline uint32_t fid_dropped(void) { return g_q_drop - g_fid_qdrop0; }
+/* FRAME-BUDGET ESTIMATE state (see frame_budget_estimate). */
+static uint32_t g_est_typ_us = 0, g_est_peak_us = 0;
+static uint8_t  g_est_verdict = 0;          /* 0 n/a, 1 OK, 2 RISK, 3 HEAVY */
+static uint32_t g_est_links = 0, g_est_memrefs = 0, g_est_ach_eval = 0, g_est_lb_eval = 0;
+static uint32_t g_est_ach_n = 0, g_est_lb_n = 0;
+/* same model if every dormant-eligible achievement sits behind a true guard
+ * (compilations: the other sub-games) - a lower bound, it depends on the game */
+static uint32_t g_est_dm_typ_us = 0, g_est_dm_peak_us = 0, g_est_dm_eval = 0;
+static uint8_t  g_est_dm_verdict = 0;
+static const char* const kEstVerdict[] = { "n/a", "OK", "RISK", "HEAVY" };
+#define FRAME_BUDGET_US 16683u              /* one 59.94 Hz frame */
+static void fid_reset(void) {
+    g_fid_gf = g_fid_ev = g_fid_deferred = g_fid_failopen = g_fid_late = g_fid_ok0 = 0;
+    g_fid_qdrop0 = g_q_drop; g_fid_qmax = 0; g_fid_loss_ms = 0; g_fid_gen++;
+    g_est_verdict = 0;   /* recomputed by frame_budget_estimate on this load */
+    g_mem2_hi = MEM2_HI_DEFAULT;   /* until this game's MEM2-LAYOUT says otherwise */
+}
 static inline bool    snapq_empty(void) { return g_snapq_head == g_snapq_tail; }
 static inline uint8_t snapq_depth(void) {
     return (uint8_t)((g_snapq_tail - g_snapq_head + SNAPQ_N) % SNAPQ_N);
@@ -1137,6 +1286,37 @@ static void trigger_watchlist_resync(const char *reason) {
                   (unsigned)watch_count);
 }
 
+/* Answer an out-of-sync SNAPSHOT. While a resync is pending, the answer MUST be
+ * the WATCHLIST_UPDATE notify (the console only re-fetches on that event) —
+ * a plain ACK here deadlocked both sides (2026-11-15, Kirby's Dream Collection:
+ * the game reloaded IOS for its NES sub-game, the ra-module restarted with the
+ * 671-entry list, the ESP had 715 — "RESYNC (count@seq)" once, then every
+ * snapshot was refused with a plain ACK for the rest of the session).
+ * Same notify as the converged fast path: seq = the base both sides hold
+ * after the chunk fetch. No frame is evaluated on these snapshots. */
+static void send_desync_answer(void) {
+    ra_esp_header_t resp;
+    resp.magic       = RA_MAGIC_ESP_TO_GC;
+    resp.status      = (uint8_t)state;
+    resp.event_count = 0;
+    if (g_watchlist_pending) {
+        ra_watchlist_notify_t notify;
+        notify.total_addr_count = ra_host_to_be16(g_watchlist_count);
+        notify.num_chunks       = ra_host_to_be16((uint16_t)RA_WATCHLIST_NUM_CHUNKS(g_watchlist_count));
+        notify.seq              = ra_host_to_be16(wl_seq);
+        resp.event_type = RA_EVT_WATCHLIST_UPDATE;
+        resp.data_len   = ra_host_to_be16(sizeof(notify));
+        uint8_t buf[sizeof(ra_esp_header_t) + sizeof(notify)];
+        memcpy(buf, &resp, sizeof(resp));
+        memcpy(buf + sizeof(resp), &notify, sizeof(notify));
+        send_response(buf, sizeof(buf));
+        return;
+    }
+    resp.event_type = RA_EVT_NONE;
+    resp.data_len   = 0;
+    send_response((uint8_t*)&resp, sizeof(resp));
+}
+
 /* ============================================================================
  * Address → watch_index hash table — O(1) lookup instead of linear search
  * across watch_addresses[]. Critical for keeping ESP32 Core 1's processing
@@ -1257,6 +1437,7 @@ static void hash_clear() {
     }
     l1_clear();              /* watchlist remapped -> L1 widxs are stale */
     u1_clear_all();          /* ...and the U1 leaf-widx cache is stale too */
+    g_wl_remap_gen++;        /* ...and B2 must not trust snap_changed until a commit */
     g_incr_remapped = true;  /* ...and the incr reverse index needs a rebuild */
 }
 
@@ -1301,6 +1482,23 @@ static inline int32_t hash_lookup(uint32_t addr) {
     return -1;   /* not present: don't cache (a later insert may add it) */
 }
 
+/* hash_lookup WITHOUT the L1 populate - for the worker task while the loop task
+ * may be inside do_frame (the lag-path query builder). Two tasks populating the
+ * same L1 set can interleave addr/widx writes and leave a slot mapping one
+ * address to ANOTHER's index (a wrong byte read later). Read-only here: a torn
+ * L1 read can only make an entry look present/absent, never mis-map it, and
+ * the caller only needs present-or-not. */
+static int32_t hash_probe_ro(uint32_t addr) {
+    uint32_t base = ((addr * 0x9E3779B9u) & L1_SET_MASK) << 1;
+    if (g_l1_addr[base] == addr || g_l1_addr[base + 1] == addr) return 0;
+    uint32_t h = hash_addr(addr);
+    while (addr_hash[h].watch_index != HASH_EMPTY) {
+        if (addr_hash[h].addr == addr) return (int32_t)addr_hash[h].watch_index;
+        h = (h + 1) & HASH_MASK;
+    }
+    return -1;
+}
+
 /* rc_is_cached_t for rc_memrefs_get_pending_addresses(): every byte in
  * [addr, addr+num_bytes) must be in the hash for this level to be readable
  * from cache. If any byte is missing, the chain walk stops here and reports
@@ -1321,9 +1519,11 @@ static int is_cached_cb(uint32_t addr, uint32_t num_bytes, void* ud) {
  * membership gating (g_rc_indirect_skip_enabled) is handled by the caller. */
 extern "C" int rc_leaf_unchanged_impl(uint32_t addr, uint32_t num_bytes) {
     if (!snap_changed) return 0;
+    const uint32_t fresh = b2_fresh_limit();
     for (uint32_t b = 0; b < num_bytes; b++) {
         int32_t widx = hash_lookup(addr + b);
         if (widx < 0) return 0;            // not cached -> resolve
+        if ((uint32_t)widx >= fresh) return 0;   // appended since the commit / late -> resolve
         if (snap_changed[widx]) return 0;  // moved this snapshot -> resolve
     }
     return 1;
@@ -1367,8 +1567,11 @@ extern "C" int rc_u1_cached(uint32_t idx) {
     u1_entry_t* e = &g_u1[idx];
     if (!e->n) return -1;                        /* not populated yet */
     ++g_u1_fast;
-    for (uint8_t b = 0; b < e->n; b++)
+    const uint32_t fresh = b2_fresh_limit();
+    for (uint8_t b = 0; b < e->n; b++) {
+        if (e->widx[b] >= fresh) return 0;       /* appended since the commit / late -> resolve */
         if (snap_changed[e->widx[b]]) return 0;  /* moved -> resolve (cache kept) */
+    }
     return 1;                                    /* unchanged -> skip */
 }
 
@@ -1380,11 +1583,12 @@ extern "C" int rc_u1_populate(uint32_t idx, uint32_t addr, uint32_t num_bytes) {
         return rc_leaf_unchanged_impl(addr, num_bytes);   /* uncacheable -> original B2 */
     u1_entry_t* e = &g_u1[idx];
     int unchanged = 1;
+    const uint32_t fresh = b2_fresh_limit();
     for (uint32_t b = 0; b < num_bytes; b++) {
         int32_t widx = hash_lookup(addr + b);
         if (widx < 0) { e->n = 0; return 0; }    /* leaf not cached yet -> resolve, don't store */
         e->widx[b] = (uint16_t)widx;
-        if (snap_changed[widx]) unchanged = 0;
+        if ((uint32_t)widx >= fresh || snap_changed[widx]) unchanged = 0;
     }
     e->n = (uint8_t)num_bytes;                   /* now cached for the stable address */
     return unchanged;
@@ -1918,6 +2122,14 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
         }
 
         int32_t widx = hash_lookup(byte_addr);
+        bool late = false;   /* watched, but not part of this frame (see g_frame_valid_count) */
+        if (widx >= 0 && (uint32_t)widx >= g_frame_valid_count) {
+            /* appended (lag query) after this frame's snapshot: its value is
+             * from another moment -> the frame sees what it saw before (miss) */
+            widx = -1;
+            late = true;
+            g_late_miss++;
+        }
         if (widx >= 0) {
             buffer[j] = memory_data[widx];
             /* Phase A.5: bump last_used (unless static-protected). */
@@ -1944,7 +2156,7 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
             buffer[j] = has_tomb ? tv : 0;
             /* Sanity-checked miss tracking — same rules as peek_from_snapshot. */
             bool valid_ppc_addr = (byte_addr <= 0x017FFFFF)
-                               || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */);
+                               || (byte_addr >= 0x10000000 && byte_addr < g_mem2_hi  /* PPC-addressable MEM2 only (= d2x RA_MEM2_SAFE_HI; from the OS global, see g_mem2_hi) */);
             if (valid_ppc_addr) {
                 /* v0.32 gate: a NO-tombstone miss is a read that returns 0 —
                  * the only miss that can forge a Delta "became X" edge. Bump
@@ -1953,12 +2165,19 @@ static uint32_t read_memory_ingame(uint32_t address, uint8_t *buffer,
                  * safe (last real value, Delta==Mem) and does NOT defer — it
                  * just gets refreshed via the peek_miss net below. */
                 if (!has_tomb) g_update_miss_count++;
-                if (peek_miss_count < PEEK_MISS_MAX) {
+                /* late: already watched (the next snapshots carry it) - nothing to fetch */
+                if (!late && peek_miss_count < PEEK_MISS_MAX) {
                     bool dup = false;
                     for (uint16_t k = 0; k < peek_miss_count; k++) {
                         if (peek_miss_addrs[k] == byte_addr) { dup = true; break; }
                     }
-                    if (!dup) peek_miss_addrs[peek_miss_count++] = byte_addr;
+                    if (!dup) {
+                        /* store, THEN publish the count: the worker task may read
+                         * the list (lag query) by preempting us on this core */
+                        peek_miss_addrs[peek_miss_count] = byte_addr;
+                        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+                        peek_miss_count++;
+                    }
                 }
             }
         }
@@ -2032,7 +2251,7 @@ static uint32_t peek_from_snapshot(uint32_t address, uint32_t num_bytes, void *u
              * the address falls outside mapped RAM, the Starlet thread can
              * hang or trip a bus error, taking the whole system down. */
             bool valid_ppc_addr = (byte_addr <= 0x017FFFFF)
-                               || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */);
+                               || (byte_addr >= 0x10000000 && byte_addr < g_mem2_hi  /* PPC-addressable MEM2 only (= d2x RA_MEM2_SAFE_HI; from the OS global, see g_mem2_hi) */);
             if (valid_ppc_addr && peek_miss_count < PEEK_MISS_MAX) {
                 bool dup = false;
                 for (uint16_t k = 0; k < peek_miss_count; k++) {
@@ -3273,19 +3492,164 @@ static volatile uint32_t http_gen = 0;
 static const char HTTP_ERR_TOO_LARGE[] = "achievement data too large for the adapter";
 static const char HTTP_ERR_NO_MEMORY[] = "adapter out of memory for the response";
 
+/* Login→load chaining state (see login_then_load_cb). Declared up here because
+ * the defrag reset below stashes it. */
+static char g_pending_hash[64];
+
+/* ---- On-demand defrag reset (2026-11-14) ------------------------------------
+ * The patch download needs ONE contiguous PSRAM block, and a long session can
+ * leave a small long-lived allocation in the middle of PSRAM (field log: after
+ * Zelda Collector's on Nintendont, free 7.58MB but largest block 3.87MB, so
+ * Mario Kart Wii's 4.4MB set no longer fit). When a patch overflows a buffer
+ * that FRAGMENTATION (not total memory) limited, the adapter reboots, which
+ * gives PSRAM back in one piece, and resumes the same load by itself: the hash
+ * and disc ID survive in RTC_NOINIT memory, which a software reset keeps.
+ * The console just sees the adapter go away for a few seconds while it keeps
+ * polling: WiiFlow drops and re-finds the USB device on every failed exchange
+ * (90 s LOAD_GAME budget), and EXI has no enumeration at all. Nintendont over
+ * USB is excluded: its kernel takes the device id from the loader once and
+ * marks the link dead on the first failure, so it would time out (and shut
+ * the console down) instead of resuming. */
+#ifndef RA_DEFRAG_RESET
+#define RA_DEFRAG_RESET 1
+#endif
+#define DEFRAG_MIN_TRAPPED   (1024UL * 1024)   /* free PSRAM outside the largest block that justifies a reboot */
+#define DEFRAG_MAGIC_PENDING 0x44465231u       /* "DFR1": resume this load on the next boot */
+#define DEFRAG_MAGIC_DONE    0x44465232u       /* "DFR2": already resumed once, never reboot again for it */
+typedef struct {
+    uint32_t magic;
+    char     hash[RA_HASH_LEN + 1];
+    char     disc_id[RA_GAME_ID_LEN];
+    uint8_t  disc_id_ok;
+    uint32_t sum;
+} defrag_stash_t;
+static RTC_NOINIT_ATTR defrag_stash_t s_defrag;
+static volatile bool     s_patch_frag_limited   = false;  /* server_call_attempt: overflow was fragmentation */
+static volatile bool     g_defrag_reset_pending = false;  /* httpTask → loop(): reboot now */
+static volatile uint32_t g_gc_frontend_ms       = 0;      /* millis() of the last "GC-RA" debug line (Nintendont) */
+static volatile bool     g_load_from_nintendont = false;  /* latched at LOAD_GAME */
+static bool              g_defrag_resume        = false;  /* this boot resumes a stashed load */
+
+static uint32_t defrag_sum(const defrag_stash_t *s) {
+    const uint8_t *p = (const uint8_t *)s;
+    uint32_t h = 2166136261u;                        /* FNV-1a over everything before .sum */
+    for (size_t i = 0; i < offsetof(defrag_stash_t, sum); i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+static bool defrag_stash_valid(void) {
+    return (s_defrag.magic == DEFRAG_MAGIC_PENDING || s_defrag.magic == DEFRAG_MAGIC_DONE) &&
+           s_defrag.hash[RA_HASH_LEN] == '\0' && s_defrag.sum == defrag_sum(&s_defrag);
+}
+static void defrag_stash_seal(uint32_t magic) {
+    s_defrag.magic = magic;
+    s_defrag.sum = defrag_sum(&s_defrag);
+}
+static void defrag_stash_clear(void) {
+    s_defrag.magic = 0;
+    s_defrag.sum = 0;
+}
+
+/* httpTask, a patch overflowed its buffer. Returns true when a reboot was
+ * requested: the caller must then NOT deliver the error (loop() reboots within
+ * milliseconds and the next boot resumes the load). */
+static bool defrag_reset_request(void) {
+#if RA_DEFRAG_RESET
+    const char *why = NULL;
+    if (!s_patch_frag_limited) return false;          /* genuinely too big: E2 as before */
+#if CONFIG_RA_LINK_USB
+    /* HW 2026-11-15 (Kirby -> SMG -> MKW, WiiFlow): after the reboot the Wii
+     * never enumerated the adapter again (mounted=0 for good). On a disconnect
+     * the EHCI takes the port back, and the d2x EHCI module (bases 38/56/57)
+     * hands a full-speed device to the OHCI only in its one-time discovery at
+     * IOS start. Until an IOS reload the console can't see the rebooted ESP,
+     * whichever frontend is running. */
+    why = "a rebooted adapter is not seen again over USB until the next IOS reload";
+    (void)g_load_from_nintendont;
+#endif
+    if (!why && strlen(g_pending_hash) != RA_HASH_LEN) why = "no 32-char hash to resume";
+    if (!why && defrag_stash_valid() && s_defrag.magic == DEFRAG_MAGIC_DONE &&
+        strncmp(s_defrag.hash, g_pending_hash, RA_HASH_LEN) == 0)
+        why = "already rebooted once for this load";
+    if (why) {
+        LOG_ERR("DEBUG=Defrag reset skipped: %s\r\n", why);
+        return false;
+    }
+    memset(&s_defrag, 0, sizeof(s_defrag));
+    memcpy(s_defrag.hash, g_pending_hash, RA_HASH_LEN);
+    memcpy(s_defrag.disc_id, g_disc_id_mem, RA_GAME_ID_LEN);
+    s_defrag.disc_id_ok = g_disc_id_mem_ok ? 1 : 0;
+    defrag_stash_seal(DEFRAG_MAGIC_PENDING);
+    LOG_ERR("DEBUG=Defrag reset: PSRAM fragmented, rebooting to resume the load of %s\r\n",
+            s_defrag.hash);
+    g_defrag_reset_pending = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+/* Game arena (rc_game_arena.h): a PSRAM block reserved at boot for the patch
+ * buffer + what rcheevos parses from it, so sockets and other long-lived
+ * allocations made during a game can't split the space the next game needs. */
+#ifndef RA_GAME_ARENA_KB
+#define RA_GAME_ARENA_KB 6400           /* 6.25MB; 0 = off (the old single-heap path) */
+#endif
+#define GAME_ARENA_SYS_KEEP (1280UL * 1024)  /* PSRAM left to everything else at boot */
+
+static size_t game_arena_free(void) {
+    rc_arena_info_t ai;
+    rc_arena_get_info(&ai);
+    return ai.free_bytes;
+}
+
+/* setup(), after the boot-time PSRAM buffers: the arena takes RA_GAME_ARENA_KB,
+ * less if that would leave the rest of the firmware under GAME_ARENA_SYS_KEEP. */
+static void game_arena_setup(void) {
+#if RA_GAME_ARENA_KB > 0
+    size_t want = (size_t)RA_GAME_ARENA_KB * 1024;
+    size_t free_now = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t cap = free_now > GAME_ARENA_SYS_KEEP ? free_now - GAME_ARENA_SYS_KEEP : 0;
+    if (want > cap) want = cap;
+    if (want > blk) want = blk;
+    size_t got = want >= 1024UL * 1024 ? rc_arena_init(want) : 0;
+    LOG_INFO("DEBUG=Game arena: %uKB reserved (psram free before %uKB, after %uKB)\r\n",
+             (unsigned)(got / 1024), (unsigned)(free_now / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+#endif
+}
+
+/* Before each patch download (loadGame): the arena must be empty again once
+ * the previous game is gone; anything left is an rcheevos allocation that
+ * outlived its game, and it splits the arena for the next one. */
+static void game_arena_report(void) {
+    rc_arena_info_t ai;
+    rc_arena_get_info(&ai);
+    if (!ai.size) return;
+    if (ai.allocated_blocks)
+        LOG_ERR("DEBUG=Game arena: %u block(s) / %u bytes still allocated after the unload (free %uKB, largest %uKB)\r\n",
+                (unsigned)ai.allocated_blocks, (unsigned)ai.allocated_bytes,
+                (unsigned)(ai.free_bytes / 1024), (unsigned)(ai.largest_free / 1024));
+    else
+        LOG_DBG("DEBUG=Game arena: empty, largest %uKB, %u fallback(s) to PSRAM so far\r\n",
+                (unsigned)(ai.largest_free / 1024), (unsigned)ai.fallbacks);
+}
+
 /* Queue a response whose body the done-queue now OWNS (http_drain frees it
  * after the callback). body must be NUL-terminated at body_len. */
-static void http_finish_owned(const http_job_t *job, char *body, size_t body_len, int status) {
+static void http_finish_owned(const http_job_t *job, char *body, size_t body_len, int status,
+                              bool is_patch = false) {
     http_done_t done;
     done.body          = body;
     done.body_len      = body_len;
+    done.is_patch      = is_patch;
     done.status        = status;
     done.callback      = job->callback;
     done.callback_data = job->callback_data;
     done.gen           = job->gen;
     if (xQueueSend(http_done_q, &done, pdMS_TO_TICKS(2000)) != pdTRUE) {
         LOG_ERR("ERROR=http_finish: done queue full, response dropped\r\n");
-        free(done.body);
+        rc_arena_free(done.body);
     }
 }
 
@@ -3494,23 +3858,43 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
          * records and the other tasks), ~7MB here. Every strip below works in
          * place, and ps.shrink() hands the slack back before http_finish's copy
          * and rc_client's parse — download big, then strip. */
+        /* 2026-11-15: the buffer comes from the game arena (rc_game_arena.h),
+         * which nothing but the game load uses, so no headroom is needed
+         * there. The shared PSRAM heap (minus the headroom) is the fallback
+         * when the arena is missing or smaller. */
         const size_t PATCH_BUF_HEADROOM = 512UL * 1024;
         size_t psram_blk = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        size_t patch_limit = (psram_blk > PATCH_BUF_HEADROOM + 1) ? psram_blk - PATCH_BUF_HEADROOM - 1 : 0;
+        size_t psram_free0 = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        size_t sys_limit = (psram_blk > PATCH_BUF_HEADROOM + 1) ? psram_blk - PATCH_BUF_HEADROOM - 1 : 0;
+        rc_arena_info_t ai;
+        rc_arena_get_info(&ai);
+        size_t ar_limit = ai.largest_free > 64 ? ai.largest_free - 64 : 0;  /* +1 NUL, alignment */
+        bool in_arena = ar_limit > 0 && ar_limit >= sys_limit;
+        size_t patch_limit = in_arena ? ar_limit : sys_limit;
+        size_t pool_free = in_arena ? ai.free_bytes : psram_free0;
+        size_t pool_blk  = in_arena ? ai.largest_free : psram_blk;
+        /* Overflow caused by fragmentation = a lot of free memory sits OUTSIDE
+         * the largest block of the pool (defrag reset, see defrag_reset_request). */
+        bool frag_trapped = pool_free >= pool_blk + DEFRAG_MIN_TRAPPED;
+        s_patch_frag_limited = false;
         if (contentLen > 0 && (size_t)contentLen > patch_limit) {
-            LOG_ERR("DEBUG=HTTP patch too large: content-length=%d > limit %u\r\n",
-                    contentLen, (unsigned)patch_limit);
+            LOG_ERR("DEBUG=HTTP patch too large: content-length=%d > limit %u in %s (free %u)\r\n",
+                    contentLen, (unsigned)patch_limit, in_arena ? "arena" : "psram",
+                    (unsigned)pool_free);
+            s_patch_frag_limited = frag_trapped &&
+                (size_t)contentLen + DEFRAG_MIN_TRAPPED <= pool_free;
             https.end();
             client.stop();
             return HTTP_ATTEMPT_TOO_LARGE;
         }
         size_t buf_size = (contentLen > 0) ? (size_t)(contentLen + 4096) : patch_limit;
         if (buf_size > patch_limit) buf_size = patch_limit;
-        LOG_DBG("DEBUG=HTTP patch buffer %u bytes (psram largest block %u)\r\n",
-                (unsigned)buf_size, (unsigned)psram_blk);
+        LOG_DBG("DEBUG=HTTP patch buffer %u bytes in %s (arena largest %u, psram largest %u)\r\n",
+                (unsigned)buf_size, in_arena ? "arena" : "psram",
+                (unsigned)ai.largest_free, (unsigned)psram_blk);
 
         PsramStream ps;
-        if (!ps.reserve(buf_size)) {
+        if (!ps.reserve(buf_size, in_arena)) {
             LOG_ERR("ERROR=PSRAM alloc failed (%u bytes), psram-free=%u\r\n",
                     (unsigned)buf_size, (unsigned)ESP.getFreePsram());
             https.end();
@@ -3551,8 +3935,10 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
         if (!complete_body && buf_full) {
             /* Deterministic: a retry would hit the same wall, and it is not
              * a connectivity problem — report it as such (see caller). */
-            LOG_ERR("DEBUG=HTTP patch too large: exceeded %u-byte buffer\r\n",
-                    (unsigned)ps.capacity());
+            LOG_ERR("DEBUG=HTTP patch too large: exceeded %u-byte buffer in %s (free %u, largest %u)\r\n",
+                    (unsigned)ps.capacity(), in_arena ? "arena" : "psram",
+                    (unsigned)pool_free, (unsigned)pool_blk);
+            s_patch_frag_limited = frag_trapped;
             client.stop();
             https.end();
             return HTTP_ATTEMPT_TOO_LARGE;
@@ -3566,6 +3952,7 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
             https.end();
             return -1;
         }
+        g_set_processing = true;   /* console: "processing achievements" */
         LOG_DBG("DEBUG=Patch read: %u bytes, stripping (psram-free=%u)...\r\n",
                 (unsigned)ps.length(), (unsigned)ESP.getFreePsram());
 
@@ -3668,13 +4055,14 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
          * cleanly (0xE2) instead of crashing inside the parse. */
         const size_t PARSE_MARGIN = 1024UL * 1024;
         auto parse_need = [&]() { return ps.length() / 4 * 13 + PARSE_MARGIN; };  /* 3.25x + margin */
-        size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        /* The parse goes to the arena first (window), PSRAM after. */
+        size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) + game_arena_free();
         if (parse_need() > psram_free) {
             LOG_ERR("DEBUG=Patch over parse budget (need ~%uKB, psram-free %uKB) — dropping leaderboards\r\n",
                     (unsigned)(parse_need() / 1024), (unsigned)(psram_free / 1024));
             vTaskDelay(1); json_clean_field_array(ps, "Leaderboards");
             ps.shrink(ps.length());
-            psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) + game_arena_free();
             LOG_DBG("DEBUG=Patch without leaderboards: size=%u bytes\r\n", (unsigned)ps.length());
             if (parse_need() > psram_free) {
                 LOG_ERR("DEBUG=Patch still over parse budget (need ~%uKB, psram-free %uKB) — refusing\r\n",
@@ -3684,15 +4072,15 @@ static int server_call_attempt(const http_job_t *job, bool is_patch) {
                 return HTTP_ATTEMPT_TOO_LARGE;
             }
         }
-        LOG_DBG("DEBUG=Patch buffer shrunk: psram-free=%u largest=%u\r\n",
-                (unsigned)psram_free,
+        LOG_DBG("DEBUG=Patch buffer shrunk: free=%u (arena %u) psram largest=%u\r\n",
+                (unsigned)psram_free, (unsigned)game_arena_free(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
         /* Hand off to the done-queue — the rc_client callback runs on the
          * loop task (Core 1), not here. The buffer itself changes owner (no
          * body-sized copy: 2026-09-25 a 4.4MB copy failed with 3.6MB free). */
         size_t patch_len = ps.length();
-        http_finish_owned(job, ps.detach(), patch_len, httpCode);
+        http_finish_owned(job, ps.detach(), patch_len, httpCode, true);
     } else {
         // ----------------------------------------------------------------
         // Small response (login, startsession, award, etc.)
@@ -3806,6 +4194,10 @@ static void server_call_blocking(const http_job_t *job) {
         int rc = server_call_attempt(job, is_patch);
         if (rc == 0) return;
         if (rc == HTTP_ATTEMPT_TOO_LARGE) {
+            /* Fragmented PSRAM: reboot and resume instead of failing. No
+             * callback — rc_client stays waiting, loop() reboots. */
+            if (is_patch && defrag_reset_request())
+                return;
             /* Not a link problem and a retry can't help: non-retryable client
              * error, with a message on_game_loaded() maps to 0xE2. */
             http_finish(job, HTTP_ERR_TOO_LARGE, strlen(HTTP_ERR_TOO_LARGE),
@@ -3878,25 +4270,32 @@ static void http_drain_done(void) {
              * parses it and allocates all the trigger/memref structs; the
              * before/after delta is the resident cost of the game's set. */
             bool big = done.body_len > 100000;
-            uint32_t sram_b = 0, psram_b = 0;
+            uint32_t sram_b = 0, psram_b = 0, arena_b = 0;
             if (big) {
                 sram_b  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 psram_b = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                arena_b = game_arena_free();
             }
+            /* What rcheevos builds from the patch (the game's whole parsed
+             * set) goes to the game arena; see rc_game_arena.h. */
+            if (done.is_patch) rc_arena_window(1);
             done.callback(&server_response, done.callback_data);
+            rc_arena_window(0);
             if (big) {
                 int32_t sram_used  = (int32_t)sram_b  - (int32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
                 int32_t psram_used = (int32_t)psram_b - (int32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-                LOG_INFO("DEBUG=rcheevos struct cost: body=%uKB sram=%+dKB psram=%+dKB (after: sram-free=%uKB psram-free=%uKB)\r\n",
+                int32_t arena_used = (int32_t)arena_b - (int32_t)game_arena_free();
+                LOG_INFO("DEBUG=rcheevos struct cost: body=%uKB sram=%+dKB psram=%+dKB arena=%+dKB (after: sram-free=%uKB psram-free=%uKB arena-free=%uKB)\r\n",
                          (unsigned)(done.body_len / 1024),
-                         (int)(sram_used / 1024), (int)(psram_used / 1024),
+                         (int)(sram_used / 1024), (int)(psram_used / 1024), (int)(arena_used / 1024),
                          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+                         (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                         (unsigned)(game_arena_free() / 1024));
             }
         } else if (done.gen != http_gen) {
             LOG_DBG("DEBUG=http_drain: stale-generation response discarded\r\n");
         }
-        free(done.body);
+        rc_arena_free(done.body);   /* PSRAM or the game arena */
     }
 }
 
@@ -3969,6 +4368,15 @@ static inline void set_new_snapshot(void) {
      * immune to later ok=0 snapshots resetting g_vblank_stats. */
     memcpy(&g_frame_log, (const void*)&g_vblank_stats, sizeof(g_frame_log));
     g_frame_log_fc = frame_counter;
+    /* fast path: this frame = its snapshot + the entries its own convergence
+     * rounds just appended (read at query time, the long-standing semantics) —
+     * unless an answer came back a frame late (EXACT CONVERGENCE): then only the
+     * snapshot's own entries, as snapshot_apply_payload already set. */
+    if (g_conv_exact && g_conv_late)
+        g_conv_late_n++;
+    else
+        g_frame_valid_count = watch_count;
+    g_conv_late = false;
     new_snapshot = true;
 }
 
@@ -4457,10 +4865,16 @@ static bool snapshot_apply_payload(const uint8_t* rx_data, uint32_t rx_len) {
      * memory_data — snap_changed[i] marks entries whose value moved. */
     if ((g_b2_enabled || g_incr_collect_active) && snap_changed) {
         uint16_t lim = (count < watch_count) ? count : watch_count;
-        for (uint16_t i = 0; i < lim; i++)
-            snap_changed[i] = (values[i] != memory_data[i]) ? 1 : 0;
+        if (g_upd_carry) {   /* last frame rolled back: keep its diff (see g_upd_carry) */
+            for (uint16_t i = 0; i < lim; i++)
+                snap_changed[i] |= (values[i] != memory_data[i]) ? 1 : 0;
+        } else {
+            for (uint16_t i = 0; i < lim; i++)
+                snap_changed[i] = (values[i] != memory_data[i]) ? 1 : 0;
+        }
     }
     memcpy(memory_data, values, count);
+    g_frame_valid_count = count;   /* only these entries are this frame's data */
     /* incremental collect: dirty only chains whose inputs moved (uses the
      * fresh snap_changed[]; must precede this vblank's collect rounds). */
     incr_mark_dirty(count);
@@ -4542,7 +4956,7 @@ static uint16_t collect_missing_addresses(void) {
              * still land here, and asking ra-module to Swi_MLoad an invalid
              * address can hang the Starlet thread. */
             if (!((byte_addr <= 0x017FFFFF)
-                  || (byte_addr >= 0x10000000 && byte_addr <= 0x133FFFFF  /* PPC-addressable MEM2 only (matches d2x RA_MEM2_SAFE_HI 0x13400000, 2026-09-25) */))) continue;
+                  || (byte_addr >= 0x10000000 && byte_addr < g_mem2_hi  /* PPC-addressable MEM2 only (= d2x RA_MEM2_SAFE_HI; from the OS global, see g_mem2_hi) */))) continue;
 
             /* In static watchlist? O(1) hash lookup. */
             if (hash_lookup(byte_addr) >= 0) continue;
@@ -4676,7 +5090,9 @@ static void send_addr_query_response(void) {
         LOG_ERR("ERROR=send_addr_query_response: malloc(%u) FAILED\n",
                 (unsigned)(sizeof(ra_esp_header_t) + payload_len));
         addr_query_pending = false;
-        set_new_snapshot();  /* fail-open: process frame with what we have */
+        /* fail-open: process frame with what we have (fast path only - a lag
+         * query belongs to a queued frame, the caller just acks) */
+        if (!g_lag_query) set_new_snapshot();
         return;
     }
     memcpy(buf, &resp, sizeof(resp));
@@ -4687,6 +5103,7 @@ static void send_addr_query_response(void) {
     for (uint16_t i = 0; i < round_count; i++)
         aq_addrs[i] = ra_host_to_be32(query_addrs[pending_query_start + i]);
 
+    if (!g_lag_query) g_conv_q_us = (uint32_t)esp_timer_get_time();   /* EXACT CONVERGENCE */
     send_response(buf, sizeof(ra_esp_header_t) + payload_len);
     free(buf);
 }
@@ -4784,6 +5201,12 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             memcpy(buf + 4 + sizeof(resp), &device_id, 4);
             exi_spi_prepare_response(buf, sizeof(buf));
             LOG_DBG("DEBUG=EXI: IDENTIFY\r\n");
+            /* IDENTIFY while ACTIVE = the console's ra-module restarted (the game
+             * reloaded IOS, e.g. Kirby's Dream Collection starting a sub-game) and
+             * will now fetch the PUBLISHED watchlist: publish the current one
+             * (it has grown since the load) so the fetch matches our replica. */
+            if (state == STATE_ACTIVE)
+                trigger_watchlist_resync("re-identify");
             break;
         }
         
@@ -4837,6 +5260,11 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             memcpy(gid, p, RA_GAME_ID_LEN);
             gid[RA_GAME_ID_LEN] = '\0';
             LOG_INFO("DEBUG=EXI: LOAD_GAME id=%s rx_len=%u\r\n", gid, (unsigned)rx_len);
+            g_load_from_nintendont = g_gc_frontend_ms != 0 &&
+                                     (millis() - g_gc_frontend_ms) < 120000UL;
+            /* A fresh request from the console starts over: forget any
+             * "already rebooted once" mark from an earlier defrag reset. */
+            defrag_stash_clear();
             /* Region-alt pruning needs the disc ID when the patch arrives
              * (httpTask, after login) — RA address 0..5 holds these bytes. */
             memcpy(g_disc_id, gid, sizeof(g_disc_id));
@@ -4956,6 +5384,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             g_vblank_stats.had_cleanup            = 0;
             g_vblank_stats.snap_start_us          = (uint32_t)esp_timer_get_time();
             g_vblank_stats.wl_seq_at_snap_start   = wl_seq;
+            g_conv_late = false;   /* EXACT CONVERGENCE: per vblank */
 
             // Throttled log: confirm ra_do_frame VBlank hook is firing on GC side.
             // frame_counter should increment ~60x/sec. If stuck at 0, hook is not installed.
@@ -5013,13 +5442,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                         /* Wii ahead of us, or the ring no longer holds the
                          * mutation it needs — unrecoverable by walking. */
                         trigger_watchlist_resync("seq-gap");
-                        ra_esp_header_t ack;
-                        ack.magic       = RA_MAGIC_ESP_TO_GC;
-                        ack.status      = (uint8_t)state;
-                        ack.event_type  = RA_EVT_NONE;
-                        ack.event_count = 0;
-                        ack.data_len    = 0;
-                        send_response((uint8_t*)&ack, sizeof(ack));
+                        send_desync_answer();   /* notify while the resync is pending */
                     }
                     g_ok0_skips++;
                     break;   /* out of sync — no memcpy, no do_frame */
@@ -5029,13 +5452,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                     /* Same mutation point but different length = replica
                      * corruption the seq stream cannot explain. */
                     trigger_watchlist_resync("count@seq");
-                    ra_esp_header_t ack;
-                    ack.magic       = RA_MAGIC_ESP_TO_GC;
-                    ack.status      = (uint8_t)state;
-                    ack.event_type  = RA_EVT_NONE;
-                    ack.event_count = 0;
-                    ack.data_len    = 0;
-                    send_response((uint8_t*)&ack, sizeof(ack));
+                    send_desync_answer();   /* notify while the resync is pending */
                     g_ok0_skips++;
                     break;
                 }
@@ -5059,6 +5476,34 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
                         g_q_enq++;
                         uint8_t d = snapq_depth();
                         if (d > g_q_hwm) g_q_hwm = d;
+                    }
+                    /* LAG-PATH CONVERGENCE (see g_frame_valid_count): reads that
+                     * missed while we lag can't wait for an idle fast path that
+                     * never comes. Query exactly those addresses now (one query
+                     * in flight, no chain walk); the console appends them
+                     * in-band, so the NEXT snapshots carry them. */
+                    if (!addr_query_pending && !g_watchlist_pending && peek_miss_count > 0) {
+                        uint16_t pm = peek_miss_count, n = 0;
+                        if (pm > PEEK_MISS_MAX) pm = PEEK_MISS_MAX;
+                        for (uint16_t i = 0; i < pm && n < ADDR_QUERY_MAX; i++) {
+                            uint32_t a = peek_miss_addrs[i];
+                            if (hash_probe_ro(a) >= 0) continue;   /* already watched (no L1 write: loop may be mid-lookup) */
+                            bool dup = false;
+                            for (uint16_t q = 0; q < n; q++)
+                                if (query_addrs[q] == a) { dup = true; break; }
+                            if (!dup) query_addrs[n++] = a;
+                        }
+                        peek_miss_count = 0;
+                        if (n > 0) {
+                            query_count = n;
+                            pending_query_start = 0;
+                            addr_query_iter_count = 1;
+                            g_lag_query = true;
+                            g_lag_q_sent++;
+                            send_addr_query_response();   /* sets addr_query_pending */
+                            if (addr_query_pending) break;
+                            g_lag_query = false;          /* send failed: plain ack below */
+                        }
                     }
                     ra_esp_header_t ack;
                     ack.magic       = RA_MAGIC_ESP_TO_GC;
@@ -5309,6 +5754,33 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
 
             addr_query_pending = false;
 
+            /* LAG-PATH CONVERGENCE: this answered a lag query (sent while the
+             * loop task is busy with queued frames). The batch is committed
+             * above (the console appended the same addresses in-band), which
+             * is all it is for: NO collect walk (do_frame may be mid-update),
+             * NO set_new_snapshot (no fast-path frame is pending - the frames
+             * are in the queue, gated by g_frame_valid_count). Just answer. */
+            if (g_lag_query) {
+                g_lag_query = false;
+                g_lag_q_addrs += round_new_addrs;
+                if (state == STATE_ACTIVE && ra_seq_view != wl_seq && mut_deliver_next())
+                    break;
+                ra_esp_header_t ack;
+                ack.magic       = RA_MAGIC_ESP_TO_GC;
+                ack.status      = (uint8_t)state;
+                ack.event_type  = RA_EVT_NONE;
+                ack.event_count = 0;
+                ack.data_len    = 0;
+                send_response((uint8_t*)&ack, sizeof(ack));
+                break;
+            }
+
+            /* EXACT CONVERGENCE: an answer slower than a same-frame turnaround
+             * was read at the console's next retrace -> everything appended for
+             * this vblank (this round and any later one) is not this frame's. */
+            if ((uint32_t)esp_timer_get_time() - g_conv_q_us > RA_CONV_LATE_US)
+                g_conv_late = true;
+
             /* Run next convergence pass — peek_from_snapshot now sees the
              * newly committed addresses via hash_lookup (not query_addrs),
              * so deeper pointer chain levels resolve correctly. */
@@ -5412,6 +5884,11 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
             /* ra-module diag passthrough (VBI/PHB timing, etc). These GC messages
              * are throttled (~2 per 5s); emitted at LOG_DBG (RA_LOG_LEVEL >= 2). */
             LOG_DBG("DEBUG=GC: %.*s\r\n", (int)msg_len, (const char *)(p + 1));
+            /* Nintendont's pre-boot narrates every stage ("GC-RA ...") right
+             * before its LOAD_GAME; WiiFlow sends none. Used by the defrag
+             * reset to spot a frontend that can't survive a USB re-enumeration. */
+            if (msg_len >= 6 && memcmp(p + 1, "GC-RA ", 6) == 0)
+                g_gc_frontend_ms = millis() | 1u;
 
             /* Minimal ACK — we don't care about the response on the GC side. */
             ra_esp_header_t ack;
@@ -5680,7 +6157,7 @@ void handle_exi_command(const uint8_t *rx_data, size_t rx_len) {
              * would time out — see [[project-wiiflow-exi]] poll-loop semantics. */
             ra_esp_header_t resp;
             resp.magic = RA_MAGIC_ESP_TO_GC;
-            resp.status = (uint8_t)state;
+            resp.status = published_status((uint8_t)state);
             resp.event_type = RA_EVT_NONE;
             resp.event_count = has_pending_event() ? 1 : 0;
             resp.data_len = 0;
@@ -6150,6 +6627,30 @@ static unsigned web_diag_hook(char *out, unsigned cap) {
     o = web_json_esc(out, cap, o, link);
     if (o + 2 >= cap) return 0;
     out[o++] = '"';
+    /* frame fidelity since the game loaded (g_fid_*; racy reads, display only) */
+    if (o + 760 >= cap) return (unsigned)o;
+    o += (size_t)snprintf(out + o, cap - o,
+        ",\"fid_gf\":%lu,\"fid_ev\":%lu,\"fid_lost\":%lu,\"fid_def\":%lu,\"fid_drop\":%lu,"
+        "\"fid_ok0\":%lu,\"fid_fo\":%lu,\"fid_late\":%lu,\"fid_q\":%u,\"fid_qmax\":%u,"
+        "\"fid_qcap\":%u,\"fid_loss_ago_s\":%ld,"
+        "\"est\":\"%s\",\"est_typ_us\":%lu,\"est_peak_us\":%lu,\"est_budget_us\":%u,"
+        "\"est_links\":%lu,\"est_memrefs\":%lu,\"est_ach_eval\":%lu,\"est_ach_n\":%lu,"
+        "\"est_lb_eval\":%lu,\"est_lb_n\":%lu,"
+        "\"est_dm\":\"%s\",\"est_dm_typ_us\":%lu,\"est_dm_peak_us\":%lu,\"est_dm_eval\":%lu,"
+        "\"lag_q\":%lu,\"lag_q_addrs\":%lu,\"late_miss\":%lu",
+        (unsigned long)g_fid_gf, (unsigned long)g_fid_ev, (unsigned long)fid_lost(),
+        (unsigned long)g_fid_deferred, (unsigned long)fid_dropped(),
+        (unsigned long)(g_fid_ok0 + g_ok0_skips), (unsigned long)g_fid_failopen,
+        (unsigned long)g_fid_late, (unsigned)snapq_depth(),
+        (unsigned)(g_fid_qmax > g_q_hwm ? g_fid_qmax : g_q_hwm), (unsigned)(SNAPQ_N - 1),
+        diag_ago_s(g_fid_loss_ms),
+        kEstVerdict[g_est_verdict < 4 ? g_est_verdict : 0], (unsigned long)g_est_typ_us,
+        (unsigned long)g_est_peak_us, FRAME_BUDGET_US, (unsigned long)g_est_links,
+        (unsigned long)g_est_memrefs, (unsigned long)g_est_ach_eval, (unsigned long)g_est_ach_n,
+        (unsigned long)g_est_lb_eval, (unsigned long)g_est_lb_n,
+        kEstVerdict[g_est_dm_verdict < 4 ? g_est_dm_verdict : 0], (unsigned long)g_est_dm_typ_us,
+        (unsigned long)g_est_dm_peak_us, (unsigned long)g_est_dm_eval,
+        (unsigned long)g_lag_q_sent, (unsigned long)g_lag_q_addrs, (unsigned long)g_late_miss);
     return (unsigned)o;
 }
 
@@ -6217,7 +6718,13 @@ static void build_and_publish_web_json(void) {
 
     /* Rarity the RA site shows for the mode we play in. */
     const bool hc = rc_client_get_hardcore_enabled(g_client) != 0;
-    const unsigned long core_id = g ? (unsigned long)g->id : 0;
+    /* Core set id for single-set buckets (subset_id 0). With the
+     * achievementsets API the core subset's id is the SET id (MadWorld: game
+     * 86, set 23871), not the game id — tagging achievements with g->id made
+     * the UI (which selects sets[0].id) filter every achievement out (0/0). */
+    const unsigned long core_id = (sets && sets->num_subsets)
+        ? (unsigned long)sets->subsets[0]->id
+        : (g ? (unsigned long)g->id : 0);
     int first = 1;
     for (uint32_t b = 0; b < list->num_buckets; b++) {
         const rc_client_achievement_bucket_t *bk = &list->buckets[b];
@@ -6262,6 +6769,74 @@ static void build_and_publish_web_json(void) {
 /* rc_client.c diagnostic — parsed-condition census per bucket (sweet-spot). */
 extern "C" void rc_client_diag_cond_census(const rc_client_t*,
                                            uint32_t*, uint32_t*, uint32_t*);
+extern "C" void rc_client_diag_load_estimate(const rc_client_t*, uint32_t* ach_eval,
+                                             uint32_t* ach_active, uint32_t* lb_eval,
+                                             uint32_t* lb_active, uint32_t* memrefs,
+                                             uint32_t* modified, uint32_t* ach_eval_dormant);
+
+/* ============================================================================
+ * FRAME-BUDGET ESTIMATE at game load (2026-11-15). Predicts the do_frame cost
+ * from the loaded set's structure, so a game too heavy for the adapter is
+ * flagged up front (log + dashboard debug view) instead of being discovered by
+ * a missed unlock. Runtime truth is the FIDELITY detector (g_fid_*).
+ *
+ * Model (per frame, µs, PSRAM 120MHz):
+ *   upd   = 1.5  x chain links (modified memrefs)   - paid every frame
+ *   fixed = 0.5  x (memrefs + chain links)          - gate save/rollback etc.
+ *   eval  = 0.35 x eval conds (typical) .. 2.1 x eval conds (peak, everything
+ *           dirty) for ACTIVE achievements, + 0.3 x eval conds of armed
+ *           leaderboards (they evaluate every frame; hardcore only)
+ * "eval conds" = pause/reset/hittarget/measured/other (AddAddress links are
+ * resolved by the update, not evaluated). Calibrated on HW medians:
+ *   Zelda CE (menu)  model 20.0 ms   measured 18.4 ms (51 df/s)
+ *   SMG              model 5.7/14.8  measured 5.4 / p90 14.6
+ *   MKW (pruned)     model peak ~8.7 measured race 8.45
+ * PSRAM 80MHz: x1.4 (the eval ran +43% at 80M). It is an ESTIMATE (±~20%):
+ * dormant achievements and dirty-eval make the real eval cheaper, LB-heavy
+ * hardcore sets may run hotter. */
+/* (the g_est_* state lives next to the fidelity counters, above web_diag_hook) */
+
+static void frame_budget_estimate(rc_client_t* client) {
+    uint32_t ae, aa, le, la, mr, mm, ad;
+    rc_client_diag_load_estimate(client, &ae, &aa, &le, &la, &mr, &mm, &ad);
+#if CONFIG_SPIRAM_SPEED_80M
+    const float scale = 1.4f;
+#else
+    const float scale = 1.0f;
+#endif
+    float base = 1.5f * mm + 0.5f * (mr + mm) + 0.3f * le;
+    float typ  = (base + 0.35f * ae) * scale;
+    float peak = (base + 2.1f  * ae) * scale;
+    float dtyp  = (base + 0.35f * (float)(ae - ad)) * scale;   /* dormant guards holding */
+    float dpeak = (base + 2.1f  * (float)(ae - ad)) * scale;
+    g_est_typ_us = (uint32_t)typ;  g_est_peak_us = (uint32_t)peak;
+    g_est_dm_typ_us = (uint32_t)dtyp; g_est_dm_peak_us = (uint32_t)dpeak; g_est_dm_eval = ad;
+    g_est_links = mm; g_est_memrefs = mr; g_est_ach_eval = ae; g_est_lb_eval = le;
+    g_est_ach_n = aa; g_est_lb_n = la;
+    /* HEAVY: even a typical frame doesn't fit -> it will lag and lose frames.
+     * RISK: typical fits but with <30% headroom, or peaks (dirty storms) don't
+     * -> short lags (absorbed by the 7-deep queue) or losses at busy moments. */
+    g_est_verdict = (typ > FRAME_BUDGET_US) ? 3
+                  : (typ > FRAME_BUDGET_US * 0.7f || peak > FRAME_BUDGET_US) ? 2 : 1;
+    g_est_dm_verdict = (dtyp > FRAME_BUDGET_US) ? 3
+                     : (dtyp > FRAME_BUDGET_US * 0.7f || dpeak > FRAME_BUDGET_US) ? 2 : 1;
+    LOG_INFO("DEBUG=LOAD-ESTIMATE: %s - frame ~%lu us typical, ~%lu us peak (budget %u) | "
+             "chain links %lu, memrefs %lu, eval conds %lu in %lu achievements + %lu in %lu leaderboards\r\n",
+             kEstVerdict[g_est_verdict], (unsigned long)g_est_typ_us, (unsigned long)g_est_peak_us,
+             FRAME_BUDGET_US, (unsigned long)mm, (unsigned long)mr, (unsigned long)ae,
+             (unsigned long)aa, (unsigned long)le, (unsigned long)la);
+    if (ad)
+        LOG_INFO("DEBUG=LOAD-ESTIMATE: with dormant guards holding (%lu eval conds drop out): %s - "
+                 "~%lu us typical, ~%lu us peak\r\n",
+                 (unsigned long)ad, kEstVerdict[g_est_dm_verdict],
+                 (unsigned long)g_est_dm_typ_us, (unsigned long)g_est_dm_peak_us);
+    if (g_est_verdict == 3 && (!ad || g_est_dm_verdict == 3))
+        LOG_INFO("DEBUG=LOAD-ESTIMATE WARNING: this set is too heavy for the adapter: frames will be lost and unlocks "
+                 "may be missed (see FIDELITY lines)\r\n");
+    else if (g_est_verdict == 3)
+        LOG_INFO("DEBUG=LOAD-ESTIMATE WARNING: too heavy unless the dormant guards hold (e.g. a compilation's "
+                 "other games) - watch the FIDELITY lines\r\n");
+}
 
 static void on_game_loaded(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
@@ -6286,6 +6861,7 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         snd_request(SND_ERROR);
         return;
     }
+    defrag_stash_clear();   /* a resumed load (defrag reset) is done */
     LOG_DBG("DEBUG=Game loaded, building initial watchlist...\r\n");
 
     /* Leaderboard roster: per-bucket counts (UNSUPPORTED = a "Mem" that failed
@@ -6320,8 +6896,14 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         n = rc_memrefs_get_addresses(memrefs, prefetch_addrs, prefetch_sizes, PREFETCH_MAX, NULL, NULL);
 
     watch_count = 0;
-    free(watch_addresses); watch_addresses = NULL;
-    free(memory_data);     memory_data     = NULL;
+    /* Keep the MAX-sized watchlist buffers (allocated once in setup(), at the
+     * bottom of PSRAM) and just clear them. Freeing and re-allocating them
+     * here put them right after this game's rcheevos data — in the MIDDLE of
+     * PSRAM — where they split the free space for the next game's patch
+     * download (MKW field report 2026-11-14: 7.3MB free, largest block
+     * 3.4MB → "achievement data too large"). */
+    if (memory_data) memset(memory_data, 0, RA_MAX_WATCH_ADDRS);
+    if (watch_addresses) memset(watch_addresses, 0, RA_MAX_WATCH_ADDRS * sizeof(uint32_t));
     watchlist_update_if_changed(n);
 
     rc_client_set_read_memory_function(client, read_memory_ingame);
@@ -6337,8 +6919,12 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         g_rc_doframe_primed_cb = NULL;          /* disarm until the buffer is ready */
         g_rc_doframe_save_buf  = NULL;
         g_rc_doframe_save_cap  = 0;
+        free(g_rc_doframe_undo_ptrs); g_rc_doframe_undo_ptrs = NULL;
         if (mrc > 0) {
             g_memref_save = (rc_memref_value_t*)ps_malloc((size_t)mrc * sizeof(rc_memref_value_t));
+            /* undo log (rc_internal.h): pointers alongside the old values; NULL ->
+             * the gate falls back to the full per-frame copy */
+            g_rc_doframe_undo_ptrs = (rc_memref_value_t**)ps_malloc((size_t)mrc * sizeof(rc_memref_value_t*));
         }
         if (g_memref_save) {
             g_rc_doframe_save_buf     = g_memref_save;
@@ -6436,6 +7022,8 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
         g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0; g_pc_dpskip = 0;   /* Phase D */
         g_phasec_dp_n = 0; g_phasec_dp_have = false; g_pc_dpmm = 0; g_pc_dpskip = 0;   /* Phase D */
         g_rc_lb_stat_active_ok = 0; g_rc_lb_stat_total = 0;   /* lb dirty-eval boot diag */
+        g_dm_logged = false;                                   /* dormant-guard census, per game */
+        fid_reset();                                           /* fidelity counters, per game */
         free(g_phasec_nodes);     g_phasec_nodes = NULL;
         free(g_phasec_blob);      g_phasec_blob = NULL;
         free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
@@ -6782,6 +7370,20 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
                  (unsigned long)na, (unsigned long)nl, (unsigned long)nr,
                  (unsigned long)(na + nl + nr));
     }
+    frame_budget_estimate(client);   /* LOAD-ESTIMATE: will it fit one frame? */
+    {   /* which core achievements are NOT armed (unlocked already / unsupported) */
+        uint32_t ids[8];
+        int n = rc_client_inactive_core_ids(client, ids, 8);
+        if (n > 0)
+            LOG_INFO("DEBUG=Inactive core achievements: %d (ids %lu %lu %lu %lu %lu %lu %lu %lu)\r\n", n,
+                     (unsigned long)(n > 0 ? ids[0] : 0), (unsigned long)(n > 1 ? ids[1] : 0),
+                     (unsigned long)(n > 2 ? ids[2] : 0), (unsigned long)(n > 3 ? ids[3] : 0),
+                     (unsigned long)(n > 4 ? ids[4] : 0), (unsigned long)(n > 5 ? ids[5] : 0),
+                     (unsigned long)(n > 6 ? ids[6] : 0), (unsigned long)(n > 7 ? ids[7] : 0));
+#if RA_ACH_PROBE_ID
+        LOG_INFO("DEBUG=ACHP armed for achievement %u\r\n", (unsigned)RA_ACH_PROBE_ID);
+#endif
+    }
 
     /* v0.27.1 warm-up: NOW the session exists (startsession fired during
      * begin_load_game), so spectator mode is togglable — not LOCKED. It
@@ -6809,8 +7411,8 @@ static void on_game_loaded(int result, const char *error_message, rc_client_t *c
 /* Login→load chaining (v0.24.0). server_call is async now, so the old
  * "login then immediately begin_load_game" sequence — which relied on the
  * login HTTP round-trip completing synchronously — must be event-driven:
- * begin_load_game only fires from the login completion callback. */
-static char g_pending_hash[64];
+ * begin_load_game only fires from the login completion callback.
+ * (g_pending_hash itself is declared near HTTP_ERR_TOO_LARGE.) */
 
 static void login_then_load_cb(int result, const char *error_message, rc_client_t *client, void *userdata) {
     if (result != RC_OK) {
@@ -6830,7 +7432,156 @@ static void login_then_load_cb(int result, const char *error_message, rc_client_
     rc_client_begin_load_game(g_client, g_pending_hash, on_game_loaded, NULL);
 }
 
+/* Free every per-game buffer of the PREVIOUS game before the next patch
+ * download (2026-11-14). They used to be freed only in on_game_loaded — i.e.
+ * AFTER the download — so the old game's Phase C tables, U1 cache, do_frame
+ * rollback buffer and dashboard JSON were still sitting in the middle of
+ * PSRAM while the new (possibly 4MB+) body needed one contiguous block.
+ * Same disarm-then-free order as on_game_loaded; the console is in WiiFlow
+ * during LOAD_GAME, so no SNAPSHOT / GET_CHAIN_CHUNK touches these. */
+static void release_game_buffers(void) {
+    /* Phase C */
+    g_phasec_auth = false;
+    g_rc_phasec_read = NULL;
+    g_rc_phasec_covered = NULL;
+    g_watch_high_water = WATCHLIST_HIGH_WATER;
+    free(g_phasec_mm_ship);   g_phasec_mm_ship = NULL; g_phasec_mm_total = 0;
+    free(g_phasec_nodes);     g_phasec_nodes = NULL;
+    free(g_phasec_blob);      g_phasec_blob = NULL;
+    free(g_phasec_blob_off);  g_phasec_blob_off = NULL;
+    free(g_phasec_ship_node); g_phasec_ship_node = NULL;
+    free(g_phasec_node_ship); g_phasec_node_ship = NULL;
+    free(g_phasec_valid);     g_phasec_valid = NULL;
+    free(g_phasec_fresh);     g_phasec_fresh = NULL;
+    g_phasec_node_count = 0; g_phasec_blob_bytes = 0; g_phasec_shipped = 0;
+    /* U1 leaf-widx cache */
+    g_rc_u1_cached = NULL; g_rc_u1_populate = NULL; g_rc_u1_invalidate = NULL;
+    free(g_u1); g_u1 = NULL; g_u1_cap = 0;
+    /* do_frame rollback buffer (gate) */
+    g_rc_doframe_primed_cb = NULL;
+    g_rc_doframe_save_buf  = NULL;
+    g_rc_doframe_save_cap  = 0;
+    free(g_memref_save); g_memref_save = NULL;
+    free(g_rc_doframe_undo_ptrs); g_rc_doframe_undo_ptrs = NULL;
+    /* Dashboard JSON (grow-only render buffers; rebuilt on the next publish) */
+#if RA_WEB_DASHBOARD
+    free(g_web_json); g_web_json = NULL; g_web_json_cap = 0;
+    ra_web_clear_state_json();
+#endif
+}
+
+/* PSRAM map diagnostic (2026-11-14): when PSRAM is fragmented at game load,
+ * name WHAT splits it. Free total is the same after the Zelda session as on a
+ * fresh boot, so the culprit is small; size alone won't identify it. The walk
+ * (address order) keeps every big free hole (>= 256KB) and the used blocks
+ * BETWEEN two big holes (the blockers), each with its first 32 bytes and, when
+ * it is one of our own buffers, its name. The walker runs under the heap lock,
+ * so it only records into static arrays; logging happens after. */
+enum { PMAP_HOLES = 8, PMAP_SEP = 16, PMAP_DUMP = 32 };
+#define PMAP_BIG_HOLE (256u * 1024u)
+struct pmap_blk { uint32_t off, size; uintptr_t ptr; uint8_t head[PMAP_DUMP]; };
+struct pmap_acc {
+    uintptr_t heap_start;
+    uint32_t  heap_bytes, used_n, used_bytes;
+    pmap_blk  hole[PMAP_HOLES]; uint32_t n_hole;
+    /* used blocks since the last big hole (become blockers at the next one) */
+    pmap_blk  pend[PMAP_SEP];   uint32_t n_pend, pend_total, pend_bytes;
+    pmap_blk  sep[PMAP_SEP];    uint32_t n_sep, sep_total, sep_bytes;
+    bool      seen_hole;
+};
+static pmap_acc s_pmap;
+static bool pmap_walk_cb(walker_heap_into_t h, walker_block_info_t b, void *u) {
+    pmap_acc *a = (pmap_acc *)u;
+    if (a->heap_start != (uintptr_t)h.start) {   /* more than one PSRAM region: restart run tracking */
+        a->heap_start = (uintptr_t)h.start;
+        a->heap_bytes += (uint32_t)(h.end - h.start);
+        a->n_pend = a->pend_total = a->pend_bytes = 0;
+        a->seen_hole = false;
+    }
+    uint32_t off = (uint32_t)((intptr_t)b.ptr - h.start);
+    if (b.used) {
+        a->used_n++; a->used_bytes += (uint32_t)b.size;
+        a->pend_total++; a->pend_bytes += (uint32_t)b.size;
+        if (a->n_pend < PMAP_SEP) {
+            pmap_blk *k = &a->pend[a->n_pend++];
+            k->off = off; k->size = (uint32_t)b.size; k->ptr = (uintptr_t)b.ptr;
+            memset(k->head, 0, PMAP_DUMP);
+            memcpy(k->head, b.ptr, b.size < PMAP_DUMP ? b.size : PMAP_DUMP);
+        }
+    } else if (b.size >= PMAP_BIG_HOLE) {
+        if (a->n_hole < PMAP_HOLES) {
+            pmap_blk *k = &a->hole[a->n_hole++];
+            k->off = off; k->size = (uint32_t)b.size; k->ptr = (uintptr_t)b.ptr;
+        }
+        if (a->seen_hole && a->pend_total) {   /* the run between two big holes */
+            for (uint32_t i = 0; i < a->n_pend && a->n_sep < PMAP_SEP; i++)
+                a->sep[a->n_sep++] = a->pend[i];
+            a->sep_total += a->pend_total; a->sep_bytes += a->pend_bytes;
+        }
+        a->n_pend = a->pend_total = a->pend_bytes = 0;
+        a->seen_hole = true;
+    }
+    return true;
+}
+/* Our own long-lived PSRAM buffers, so a blocker that is one of them gets named. */
+static const char *pmap_label(uintptr_t ptr, uint32_t size) {
+    struct { const char *name; const void *p; } k[] = {
+        {"addr_hash", addr_hash}, {"memory_data", memory_data},
+        {"watch_addresses", watch_addresses}, {"last_used_frame", last_used_frame},
+        {"snap_changed", snap_changed}, {"incr_rev_head", incr_rev_head},
+        {"incr_rev_pool", incr_rev_pool}, {"g_root_baddrs", g_root_baddrs},
+        {"prefetch_addrs", prefetch_addrs}, {"prefetch_sizes", prefetch_sizes},
+        {"g_watchlist_addrs", g_watchlist_addrs}, {"tomb", tomb}, {"mut_ring", mut_ring},
+        {"g_phasec_nodes", g_phasec_nodes}, {"g_phasec_blob", g_phasec_blob},
+        {"g_u1", g_u1}, {"g_memref_save", g_memref_save},
+#if RA_WEB_DASHBOARD
+        {"g_web_json", g_web_json},
+#endif
+    };
+    for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        uintptr_t p = (uintptr_t)k[i].p;
+        if (p && p + 16 >= ptr && p < ptr + size) return k[i].name;
+    }
+    for (int i = 0; i < SNAPQ_N; i++) {
+        uintptr_t p = (uintptr_t)g_snapq_buf[i];
+        if (p && p + 16 >= ptr && p < ptr + size) return "g_snapq_buf";
+    }
+    return "?";
+}
+static void log_psram_map_if_fragmented(void) {
+    size_t fr = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t lg = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    LOG_DBG("DEBUG=PSRAM before game load: free=%u largest=%u\r\n", (unsigned)fr, (unsigned)lg);
+    if (lg + 524288u >= fr) return;   /* contiguous enough — nothing to report */
+    rc_arena_info_t ai;
+    rc_arena_get_info(&ai);
+    if (ai.size) return;   /* the patch uses the game arena: a split shared heap doesn't matter */
+    memset(&s_pmap, 0, sizeof(s_pmap));
+    heap_caps_walk(MALLOC_CAP_SPIRAM, pmap_walk_cb, &s_pmap);
+    LOG_DBG("DEBUG=PSRAM map: heap=%uKB used=%u blocks (%uKB), %u blocker(s) of %u bytes between big holes\r\n",
+            (unsigned)(s_pmap.heap_bytes / 1024), (unsigned)s_pmap.used_n,
+            (unsigned)(s_pmap.used_bytes / 1024), (unsigned)s_pmap.sep_total,
+            (unsigned)s_pmap.sep_bytes);
+    for (uint32_t i = 0; i < s_pmap.n_hole; i++)
+        LOG_DBG("DEBUG=PSRAM map: hole off=%uKB size=%uKB\r\n",
+                (unsigned)(s_pmap.hole[i].off / 1024), (unsigned)(s_pmap.hole[i].size / 1024));
+    for (uint32_t i = 0; i < s_pmap.n_sep; i++) {
+        const pmap_blk *k = &s_pmap.sep[i];
+        char hex[PMAP_DUMP * 2 + 1], asc[PMAP_DUMP + 1];
+        uint32_t n = k->size < PMAP_DUMP ? k->size : PMAP_DUMP;
+        for (uint32_t j = 0; j < n; j++) {
+            snprintf(hex + j * 2, 3, "%02x", k->head[j]);
+            asc[j] = (k->head[j] >= 32 && k->head[j] < 127) ? (char)k->head[j] : '.';
+        }
+        hex[n * 2] = '\0'; asc[n] = '\0';
+        LOG_DBG("DEBUG=PSRAM map: blocker off=0x%06x size=%u ptr=%08x [%s] %s |%s|\r\n",
+                (unsigned)k->off, (unsigned)k->size, (unsigned)k->ptr,
+                pmap_label(k->ptr, k->size), hex, asc);
+    }
+}
+
 void loadGame(const char *hash) {
+    g_set_processing = false;   /* LOADING_GAME until this load's patch arrives */
 #if RA_WEB_DASHBOARD
     ra_web_stage(RA_STAGE_GAME_LOAD);
 #endif
@@ -6841,7 +7592,13 @@ void loadGame(const char *hash) {
         http_gen++;
         rc_client_destroy(g_client);
         g_client = NULL;
+        /* Drop the responses still queued for the old client now (all stale
+         * after the bump): a stale patch body would sit in the game arena. */
+        http_drain_done();
     }
+    release_game_buffers();
+    log_psram_map_if_fragmented();
+    game_arena_report();
 
     g_client = rc_client_create(read_memory_nop, server_call);
     g_rc_leaf_unchanged = rc_leaf_unchanged_impl;   /* opt B2 INDIRECT-skip hook */
@@ -7115,6 +7872,7 @@ void processSnapshot() {
         uint8_t h = g_snapq_head;
         snapshot_apply_payload(g_snapq_buf[h], g_snapq_len[h]);
         g_snapq_head = (uint8_t)((h + 1) % SNAPQ_N);   /* release slot AFTER apply */
+        g_fid_late++;                                    /* exact data, but late */
         process_one_frame();
     }
     g_df_busy = false;
@@ -7210,6 +7968,7 @@ static void process_one_frame() {
             elapsed = 1;   /* first frame / frozen counter / absurd jump */
         prev_game_frame = frame_counter;
         frame_debt += elapsed;
+        g_fid_gf += elapsed;
         if (frame_debt > FRAME_DEBT_CAP) frame_debt = FRAME_DEBT_CAP;
 
         uint32_t run = (frame_debt < FRAME_DEBT_RUN_MAX)
@@ -7236,14 +7995,19 @@ static void process_one_frame() {
              * must resolve once). Count-stability within a session == membership
              * stability. Off-frames just do a full resolve (safe). */
             g_rc_collect_walk_budget = g_collect_walk_budget;   /* lever B: per-vblank walk cap */
-            g_rc_indirect_skip_enabled = (g_b2_enabled && watch_count == g_last_doframe_watch_count) ? 1 : 0;
-            g_last_doframe_watch_count = watch_count;
+            /* membership compared with the last COMMITTED do_frame (a rolled-back
+             * frame's count proves nothing about the restored chain values) */
+            const uint16_t wc_now = watch_count;
+            const uint32_t rg_now = g_wl_remap_gen;
+            g_rc_indirect_skip_enabled = (g_b2_enabled && rg_now == g_commit_remap_gen &&
+                                          wc_now >= g_last_doframe_watch_count) ? 1 : 0;
             g_rc_b1_skips = 0; g_rc_b2_skips = 0; g_rc_upd_resolves = 0;  /* per-frame */
             g_l1_hits = 0; g_l1_miss = 0;            /* STEP 0: per-frame L1 hit/miss */
             g_rc_upd_resolve_us = 0;                 /* STEP 0: resolve-only time within upd2 */
             g_u1_fast = 0; g_u1_pop = 0;             /* U1: per-frame fast skips / cache-miss populates */
 #ifdef RC_DIRTY_EVAL
             g_rc_de_skipped = 0; g_rc_de_evaled = 0;  /* per-frame skip% */
+            g_rc_dm_skipped = 0;                      /* per-frame dormant skips */
             g_rc_lb_skipped = 0; g_rc_lb_evaled = 0;  /* per-frame lb skip% */
 #ifdef RC_CLEAN_REPLAY
             g_rc_de_replayed = 0;  /* per-frame replay count */
@@ -7253,15 +8017,27 @@ static void process_one_frame() {
             //for (uint32_t f = 0; f < run; f++) {
                 rc_client_do_frame(g_client);
             //}
+            if (!g_rc_doframe_deferred) {   /* this frame's values committed */
+                g_last_doframe_watch_count = wc_now;
+                g_commit_remap_gen = rg_now;
+                /* entries this frame really carried (a queued frame may predate appends) */
+                g_b2_fresh_lim = (g_frame_valid_count < wc_now) ? g_frame_valid_count : wc_now;
+            }
+            g_upd_carry = g_rc_doframe_deferred ? true : false;
             if (g_rc_doframe_deferred) {
                 /* Deferred: un-spend the frame debt (the frame wasn't evaluated)
                  * and skip the do_frame accounting; eval lands next frame once
                  * the cache primes. */
                 consec_defer++;
                 g_doframe_deferred_total++;
+                g_fid_deferred++;
                 frame_debt += run;
                 if (frame_debt > FRAME_DEBT_CAP) frame_debt = FRAME_DEBT_CAP;
             } else {
+                /* gate forced open (MAX_DOFRAME_DEFER) while a read still missed:
+                 * this frame was evaluated with 0 in place of a value */
+                if (!g_rc_doframe_gate_enabled && g_update_miss_count != 0) g_fid_failopen++;
+                g_fid_ev++;
                 consec_defer = 0;
                 df_ran = 1;
                 this_df_us = (uint32_t)esp_timer_get_time() - t0;
@@ -7294,6 +8070,82 @@ static void process_one_frame() {
                         }
                     }
                 }
+                /* MEM2 layout diag (2026-11-15, Kirby's Dream Collection: its set reads
+                 * 0xG135e1044, above RA_MEM2_SAFE_HI 0x13400000 = the guard that cured
+                 * the MKW race-start IOS freeze). READ-ONLY, MEM1 only: the Wii OS
+                 * globals at 0x3118-0x3143 say how much MEM2 the running IOS gives the
+                 * PPC. They aren't in any set, so the first passes queue them as peek
+                 * misses (the normal convergence fetches them), then one line is logged
+                 * per game. Wii titles only (on GC these addresses are game RAM). */
+                {
+                    static uint32_t os_gen = 0xFFFFFFFFu, os_next_ms = 0;
+                    static uint8_t  os_tries = 0;
+                    const rc_client_game_t* gi = g_client ? rc_client_get_game_info(g_client) : NULL;
+                    if (os_gen != g_fid_gen) { os_gen = g_fid_gen; os_tries = 0; os_next_ms = millis() + 3000; }
+                    if (os_tries < 30 && gi && gi->console_id == RC_CONSOLE_WII && memory_data &&
+                        (int32_t)(millis() - os_next_ms) >= 0) {
+                        os_next_ms = millis() + 1000;
+                        enum { OS_LO = 0x3118, OS_N = 0x3144 - 0x3118 };
+                        uint8_t b[OS_N];
+                        bool all_in = true;
+                        for (uint32_t i = 0; i < OS_N; i++) {
+                            int32_t w = hash_lookup(OS_LO + i);
+                            if (w >= 0) { b[i] = memory_data[w]; continue; }
+                            all_in = false;
+                            bool dup = false;
+                            for (uint16_t k = 0; k < peek_miss_count; k++)
+                                if (peek_miss_addrs[k] == OS_LO + i) { dup = true; break; }
+                            if (!dup && peek_miss_count < PEEK_MISS_MAX)
+                                peek_miss_addrs[peek_miss_count++] = OS_LO + i;
+                        }
+                        if (all_in) {
+                            os_tries = 0xFF;   /* done for this game */
+                            #define OSG(off) ((uint32_t)b[(off)-OS_LO] << 24 | (uint32_t)b[(off)-OS_LO+1] << 16 | \
+                                              (uint32_t)b[(off)-OS_LO+2] << 8 | (uint32_t)b[(off)-OS_LO+3])
+                            uint32_t ppc_end = OSG(0x3120) & 0x1FFFFFFFu;   /* physical, = RA address */
+                            if (ppc_end >= MEM2_HI_DEFAULT && ppc_end <= MEM2_HI_MAX)
+                                g_mem2_hi = ppc_end;   /* same rule as the d2x module */
+                            LOG_INFO("DEBUG=MEM2-LAYOUT: phys size %08lX sim %08lX | PPC end %08lX | usable %08lX-%08lX | "
+                                     "IPC %08lX-%08lX | IOS %lu v%lu | MEM2 read bound now %08lX (was 0x13400000: %s)\r\n",
+                                     (unsigned long)OSG(0x3118), (unsigned long)OSG(0x311C), (unsigned long)OSG(0x3120),
+                                     (unsigned long)OSG(0x3124), (unsigned long)OSG(0x3128),
+                                     (unsigned long)OSG(0x3130), (unsigned long)OSG(0x3134),
+                                     (unsigned long)(OSG(0x3140) >> 16), (unsigned long)(OSG(0x3140) & 0xFFFF),
+                                     (unsigned long)g_mem2_hi,
+                                     ppc_end == 0x13400000u ? "== PPC end (MEM2 above it is IOS memory)"
+                                     : ppc_end > 0x13400000u ? "< PPC end: the game owns MEM2 above our guard"
+                                                             : "> PPC end");
+                            #undef OSG
+                        } else if (++os_tries == 30) {
+                            LOG_INFO("DEBUG=MEM2-LAYOUT: OS globals 0x3118-0x3143 never arrived (not fetched)\r\n");
+                        }
+                    }
+                }
+#if RA_ACH_PROBE_ID
+                /* Achievement probe: one line whenever a value, truth bit, hit
+                 * count or state of the probed achievement changes (capped at
+                 * 30 lines/s), plus a 5 s heartbeat. f= is the console frame:
+                 * a jump > 1 between lines that should be consecutive = frames
+                 * that never reached the evaluator. */
+                {
+                    static uint32_t ap_sig = 0, ap_vsig = 0, ap_beat = 0, ap_win = 0, ap_lines = 0;
+                    static char ap_buf[700];
+                    uint32_t sig = 0, vsig = 0, now = millis();
+                    if (rc_client_ach_probe(g_client, RA_ACH_PROBE_ID, ap_buf, sizeof(ap_buf), &sig, &vsig)) {
+                        if (now - ap_win >= 1000) { ap_win = now; ap_lines = 0; }
+                        /* truth/hit/state changes ALWAYS log (the edge frame must
+                         * never be capped away); value-only changes are capped */
+                        if (sig != ap_sig || (vsig != ap_vsig && ap_lines < 30) || now - ap_beat >= 5000) {
+                            ap_sig = sig; ap_vsig = vsig; ap_beat = now; ap_lines++;
+                            size_t len = strlen(ap_buf);
+                            for (size_t off = 0, part = 0; off < len; off += 300, part++)
+                                LOG_INFO("DEBUG=ACHP %u f=%lu lost=%lu %u: %.300s\r\n", (unsigned)RA_ACH_PROBE_ID,
+                                         (unsigned long)frame_counter, (unsigned long)fid_lost(),
+                                         (unsigned)part, ap_buf + off);
+                        }
+                    }
+                }
+#endif
 #if CONFIG_RA_LB_PROBE_ID
                 /* Leaderboard probe: log the probed LB's conditions whenever a
                  * truth bit / hit count / state changes (≥250ms apart) plus a
@@ -7347,8 +8199,18 @@ static void process_one_frame() {
          * evl→fewer active achievements. */
 #ifdef RC_DIRTY_EVAL
         unsigned long de_sk = (unsigned long)g_rc_de_skipped, de_ev = (unsigned long)g_rc_de_evaled;
+        unsigned long dm_sk = (unsigned long)g_rc_dm_skipped;
+        {
+            /* one-shot: how many achievements carry a dormant guard (built on the
+             * first do_frame of each game; 0 = the set has none, nothing changes) */
+            if (df_ran && !g_dm_logged) {
+                g_dm_logged = true;
+                LOG_INFO("DEBUG=Dormant guards: %lu achievement(s) with a core ResetIf guard (skip %s)\r\n",
+                         (unsigned long)g_rc_dm_stat_ach, g_rc_dormant_enabled ? "on" : "off");
+            }
+        }
 #else
-        unsigned long de_sk = 0, de_ev = 0;
+        unsigned long de_sk = 0, de_ev = 0, dm_sk = 0;
 #endif
 #ifdef RC_CLEAN_REPLAY
         unsigned long de_rp = (unsigned long)g_rc_de_replayed;  /* warm+clean replays (subset of de_ev) */
@@ -7363,7 +8225,7 @@ static void process_one_frame() {
          *                     skips/cache/parallel/EXI, l1h/l1m/urs/u1f/u1p).
          * To move a field between the two, edit the lists below. */
 #if RA_LOG_LEVEL >= 2
-        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu lpa=%lu lpb=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu lbs=%lu lbe=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
+        LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u ms=%u cm=%u cmr=%s it=%u mut=%d cln=%d ap_us=%lu apc_us=%lu df=%d df_us=%lu upd_us=%lu upd1=%lu upd2=%lu uda=%lu udb=%lu evl_us=%lu cyc_us=%lu par_a=%lu par_b=%lu lpa=%lu lpb=%lu runs=%lu de_sk=%lu de_ev=%lu de_rp=%lu dm=%lu sv=%lu ul=%lu pst=%lu lbs=%lu lbe=%lu b1sk=%lu b2sk=%lu upr=%lu csk=%lu cwk=%lu crb=%lu rvc=%u ov=%d mk=%lu l1h=%lu l1m=%lu urs=%lu u1f=%lu u1p=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
                   (unsigned)fl.snap_addr_count,
@@ -7389,7 +8251,9 @@ static void process_one_frame() {
                   (unsigned long)g_par_lb_a_us,
                   (unsigned long)g_par_lb_b_us,
                   (unsigned long)g_par_runs,
-                  de_sk, de_ev, de_rp,
+                  de_sk, de_ev, de_rp, dm_sk,
+                  (unsigned long)g_rc_save_us, (unsigned long)g_rc_undo_entries,
+                  (unsigned long)g_rc_post_us,
                   (unsigned long)g_rc_lb_skipped, (unsigned long)g_rc_lb_evaled,
                   (unsigned long)g_rc_b1_skips, (unsigned long)g_rc_b2_skips,
                   (unsigned long)g_rc_upd_resolves,
@@ -7400,7 +8264,7 @@ static void process_one_frame() {
                   (unsigned long)g_rc_upd_resolve_us,
                   (unsigned long)g_u1_fast, (unsigned long)g_u1_pop);
 #else
-        (void)cmr_buf; (void)de_sk; (void)de_rp;   /* level-2-only fields (computed above) */
+        (void)cmr_buf; (void)de_sk; (void)de_rp; (void)dm_sk;   /* level-2-only fields (computed above) */
         LOG_FRAME_REC("FRAME seq=%lu ok=%d sa=%u df=%d df_us=%lu upd_us=%lu evl_us=%lu de_ev=%lu\r\n",
                   (unsigned long)fl_fc,
                   (int)fl.data_ok,
@@ -7434,7 +8298,7 @@ static void process_one_frame() {
             uint32_t dt = df_now - last_df_log;
             uint32_t gf = frame_counter - g_df_prev_gameframe;
             /* last frame's eval split: ach = achievements core1/core0, lb = leaderboards core1/core0 */
-            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu q=%lu/%lu/%lu | ach=%lu/%lu lb=%lu/%lu\r\n",
+            LOG_FRAME("DEBUG=CATCHUP df/s=%lu gf/s=%lu ok0/s=%lu dfr/s=%lu debt=%lu | df_us=%lu cm_us=%lu cm_n=%lu cm_skip=%lu q=%lu/%lu/%lu lq=%lu/%lu lm=%lu cl=%lu | ach=%lu/%lu lb=%lu/%lu\r\n",
                      (unsigned long)(g_doframe_count * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(gf * 1000UL / (dt ? dt : 1)),
                      (unsigned long)(g_ok0_skips * 1000UL / (dt ? dt : 1)),
@@ -7446,8 +8310,38 @@ static void process_one_frame() {
                      (unsigned long)g_cm_skipped,
                      (unsigned long)g_q_enq, (unsigned long)g_q_hwm,
                      (unsigned long)g_q_drop,   /* q=enqueued/high-water/dropped */
+                     (unsigned long)g_lag_q_sent, (unsigned long)g_lag_q_addrs,   /* lag queries / addrs (cumulative) */
+                     (unsigned long)g_late_miss,  /* reads of entries newer than their frame (cumulative) */
+                     (unsigned long)g_conv_late_n, /* frames held to their snapshot: late convergence (cumulative) */
                      (unsigned long)g_par_a_us, (unsigned long)g_par_b_us,
                      (unsigned long)g_par_lb_a_us, (unsigned long)g_par_lb_b_us);
+            /* FIDELITY: this window's losses (see g_fid_*); silent when frame-exact. */
+            {
+                static uint32_t w_gf = 0, w_ev = 0, w_def = 0, w_drop = 0, w_fo = 0, w_ok0 = 0, w_gen = 0;
+                if (w_gen != g_fid_gen) {   /* new game: counters were reset */
+                    w_gen = g_fid_gen;
+                    w_gf = w_ev = w_def = w_drop = w_fo = w_ok0 = 0;
+                }
+                g_fid_ok0 += g_ok0_skips;
+                if (g_q_hwm > g_fid_qmax) g_fid_qmax = (uint8_t)g_q_hwm;
+                uint32_t d_gf = g_fid_gf - w_gf, d_ev = g_fid_ev - w_ev;
+                uint32_t d_lost = d_gf > d_ev ? d_gf - d_ev : 0;
+                uint32_t d_fo = g_fid_failopen - w_fo;
+                if (d_lost || d_fo) {
+                    g_fid_loss_ms = df_now ? df_now : 1;
+                    LOG_INFO("DEBUG=FIDELITY: %lu of %lu game frames NOT evaluated in %lus "
+                             "(deferred %lu, queue-dropped %lu, out-of-sync %lu), %lu evaluated with "
+                             "missing reads | since load: lost %lu/%lu, late %lu, queue max %u/%u\r\n",
+                             (unsigned long)d_lost, (unsigned long)d_gf, (unsigned long)(dt / 1000),
+                             (unsigned long)(g_fid_deferred - w_def),
+                             (unsigned long)(fid_dropped() - w_drop),
+                             (unsigned long)(g_fid_ok0 - w_ok0), (unsigned long)d_fo,
+                             (unsigned long)fid_lost(), (unsigned long)g_fid_gf,
+                             (unsigned long)g_fid_late, (unsigned)g_fid_qmax, (unsigned)(SNAPQ_N - 1));
+                }
+                w_gf = g_fid_gf; w_ev = g_fid_ev; w_def = g_fid_deferred;
+                w_drop = fid_dropped(); w_fo = g_fid_failopen; w_ok0 = g_fid_ok0;
+            }
             g_doframe_count = 0;
             g_ok0_skips = 0;
             g_doframe_deferred_total = 0;
@@ -7515,10 +8409,11 @@ void taskCore1(void *pvParameters) {
          * BEFORE polling — so the next GC POLL/STATUS read returns the live state.
          * Only call when state actually changes, to avoid touching shared buffers
          * unnecessarily (no need to write the same byte every millisecond). */
-        if ((uint8_t)state != last_published_state) {
+        if (published_status((uint8_t)state) != last_published_state) {
+            uint8_t pub = published_status((uint8_t)state);   /* PROCESSING while parsing */
             LOG_INFO("DEBUG=state transition %02X -> %02X\r\n",
-                     last_published_state, (uint8_t)state);
-            last_published_state = (uint8_t)state;
+                     last_published_state, pub);
+            last_published_state = pub;
             exi_spi_update_status(last_published_state);
         }
 
@@ -7532,6 +8427,19 @@ void taskCore1(void *pvParameters) {
         uint32_t now = millis();
         if (now - last_heartbeat >= 5000) {
             last_heartbeat = now;
+            /* FIDELITY when NOTHING is evaluated: the per-window FIDELITY line
+             * lives in process_one_frame, so a session where every snapshot is
+             * refused (out of sync) printed nothing at all (KDC 2026-11-15). */
+            {
+                static uint32_t hb_ev = 0, hb_ok0 = 0, hb_gen = 0xFFFFFFFFu;
+                uint32_t ok0 = g_fid_ok0 + g_ok0_skips;
+                if (hb_gen != g_fid_gen) { hb_gen = g_fid_gen; hb_ev = g_fid_ev; hb_ok0 = ok0; }
+                if (state == STATE_ACTIVE && g_fid_ev == hb_ev && ok0 != hb_ok0)
+                    LOG_INFO("DEBUG=FIDELITY: NO frame evaluated in 5s - %lu snapshot(s) refused as out of sync "
+                             "(watchlist resync %s)\r\n", (unsigned long)(ok0 - hb_ok0),
+                             g_watchlist_pending ? "pending" : "not pending");
+                hb_ev = g_fid_ev; hb_ok0 = ok0;
+            }
 #if CONFIG_RA_LINK_USB
             int cs = -1;   /* no CS line on the USB link */
 #else
@@ -7641,6 +8549,21 @@ void setup() {
     if (!prefetch_addrs || !prefetch_sizes || !g_watchlist_addrs || !addr_hash || !tomb || !mut_ring) {
         LOG_ERR("ERROR=setup: PSRAM buffer alloc failed\r\n");
     }
+    /* PSRAM anti-fragmentation (2026-11-14): every buffer that lives for the
+     * whole power-on is allocated HERE, at boot, so it sits at the bottom of
+     * PSRAM next to the ones above. They used to be allocated lazily by the
+     * first game (~410KB: watchlist arrays, the 320KB incremental-collect
+     * pool, chain roots) — right after that game's rcheevos data — and stayed
+     * there after it unloaded, splitting PSRAM in two. A big set loaded after
+     * another game (MKW: ~4.4MB raw patch) then found 7.3MB free but only a
+     * 3.4MB contiguous block for the download. Per-game buffers are released
+     * in release_game_buffers() before the next download. */
+    ensure_watchlist_capacity();
+    if (!g_root_baddrs)
+        g_root_baddrs = (uint32_t*)ps_malloc(CHAIN_ROOTS_MAX * sizeof(uint32_t));
+    /* Then the game arena (patch buffer + parsed set), before Wi-Fi/lwIP
+     * start allocating. */
+    game_arena_setup();
     /* Report where the hot buffers landed + remaining internal headroom. */
     LOG_DBG("DEBUG=hotbuf: hash=%s(%uKB) memdata=deferred internal-free=%uKB maxblk=%uKB\r\n",
              g_hash_internal ? "SRAM" : "PSRAM",
@@ -7783,6 +8706,21 @@ void setup() {
     ra_web_stage(RA_STAGE_WIFI_START);
 #endif
 
+#if RA_DEFRAG_RESET
+    /* Defrag reset: our own reboot left a load to resume (defrag_reset_request).
+     * Marked DONE right away, so a second overflow (or a crash during the
+     * resumed load) can't turn into a reboot loop. */
+    if (esp_reset_reason() == ESP_RST_SW && defrag_stash_valid() &&
+        s_defrag.magic == DEFRAG_MAGIC_PENDING) {
+        g_defrag_resume = true;
+        defrag_stash_seal(DEFRAG_MAGIC_DONE);
+        LOG_INFO("DEBUG=Defrag reset: will resume the load of %s once Wi-Fi is up\r\n",
+                 s_defrag.hash);
+    } else if (esp_reset_reason() != ESP_RST_SW) {
+        defrag_stash_clear();   /* power-on: RTC contents are random */
+    }
+#endif
+
     // WiFi + RA login (same flow as fpga-ra-adapter)
     if (!isConfigured()) {
         state = STATE_PORTAL;   // visible to the Wii: "configure me first"
@@ -7841,12 +8779,17 @@ void setup() {
         ra_web_stage(RA_STAGE_LOGIN);
 #endif
         state = STATE_LOGGING_IN;
-        String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
-        if (token != "null") {
-            LOG_DBG("DEBUG=RA login OK\r\n");
-            snd_request(SND_SUCCESS);
+        if (g_defrag_resume) {
+            /* The resumed loadGame logs in itself; skip the boot check (~2 s). */
+            LOG_DBG("DEBUG=Defrag reset: skipping the boot login check\r\n");
         } else {
-            snd_request(SND_ERROR);
+            String token = try_login_RA(read_ra_user_from_eeprom(), read_ra_pass_from_eeprom());
+            if (token != "null") {
+                LOG_DBG("DEBUG=RA login OK\r\n");
+                snd_request(SND_SUCCESS);
+            } else {
+                snd_request(SND_ERROR);
+            }
         }
     }
 
@@ -7859,7 +8802,21 @@ void setup() {
     WiFi.setSleep(false);
     apply_wifi_tx_limit();   /* portal path: WiFiManager set the mode itself */
 
-    state = STATE_WAIT_GAME_ID;
+    if (g_defrag_resume && isConfigured()) {
+        /* Same state the LOAD_GAME handler leaves behind; loop()'s state
+         * machine runs loadGame() with it. The console is still polling. */
+        memcpy(g_disc_id, s_defrag.disc_id, RA_GAME_ID_LEN);
+        g_disc_id[RA_GAME_ID_LEN] = '\0';
+        g_disc_id_mem_ok = false;
+        memcpy(g_disc_id_mem, s_defrag.disc_id, RA_GAME_ID_LEN);
+        g_disc_id_mem_ok = s_defrag.disc_id_ok != 0;
+        gameId = String(s_defrag.hash);
+        state = STATE_LOADING_GAME;
+        LOG_INFO("DEBUG=Defrag reset: resuming the load of %s (disc %.6s)\r\n",
+                 s_defrag.hash, s_defrag.disc_id);
+    } else {
+        state = STATE_WAIT_GAME_ID;
+    }
 #if RA_WEB_DASHBOARD
     if (getCpuFrequencyMhz() != cpu_mhz_build) {
         setCpuFrequencyMhz(cpu_mhz_build);
@@ -7973,6 +8930,14 @@ void loop() {
     if (g_factory_reset_pending) {
         g_factory_reset_pending = false;
         do_factory_reset();   // does not return (ESP.restart())
+    }
+    /* Defrag reset (see defrag_reset_request): the load is stashed in RTC
+     * memory, setup() resumes it after Wi-Fi. */
+    if (g_defrag_reset_pending) {
+        g_defrag_reset_pending = false;
+        LOG_INFO("DEBUG=Defrag reset: rebooting now\r\n");
+        delay(300);   // let the log drain
+        esp_restart();
     }
     // Reconnect WiFi if needed
     if (WiFi.status() != WL_CONNECTED) {

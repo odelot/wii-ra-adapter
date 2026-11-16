@@ -56,7 +56,31 @@ typedef struct rc_modified_memref_list_t {
 typedef struct rc_memrefs_t {
   rc_memref_list_t memrefs;
   rc_modified_memref_list_t modified_memrefs;
+  /* optional dedup index over modified_memrefs (rc_memrefs_index_begin/_end):
+   * NULL = rc_alloc_modified_memref scans the lists, as upstream does */
+  struct rc_mm_index_t* mm_index;
 } rc_memrefs_t;
+
+/* Modified-memref dedup index (2026-11-15). rc_alloc_modified_memref compares a
+ * new chain link against EVERY existing one (blocks of 8 chained across the
+ * heap): O(N^2) per game load. Zelda Collector's Edition (5.9K links) spent
+ * 80 s of its load there on the ESP32 (PSRAM) - past Nintendont's 90 s LOAD_GAME
+ * timeout. While enabled, new links are found through a hash of exactly the
+ * fields the equality test compares, then confirmed with that same test: the
+ * same link is returned as the scan would return. Enable for the communal
+ * memrefs while a game loads, then drop it (it isn't used after parsing). */
+void rc_memrefs_index_begin(rc_memrefs_t* memrefs);
+/* Memref UNDO LOG (2026-11-15). While g_rc_undo_ptr != NULL every memref value
+ * the update is about to CHANGE is recorded first (pointer + old value), at most
+ * once per memref per update. A deferred frame restores exactly those — same end
+ * state as restoring a full copy of every memref, without copying all of them
+ * each frame (Majora's Mask: the full 74 KB copy was 3.0 ms of every frame). */
+extern rc_memref_value_t** g_rc_undo_ptr;
+extern rc_memref_value_t*  g_rc_undo_old;
+extern uint32_t g_rc_undo_n, g_rc_undo_cap;
+extern int g_rc_undo_overflow;
+void rc_undo_note(rc_memref_value_t* p);
+void rc_memrefs_index_end(rc_memrefs_t* memrefs);
 
 #ifdef RC_SHADOW_VALUES
 /* compact shadow value cache (see memref.c / project_shadow_array). Eval reads a
@@ -530,6 +554,9 @@ void rc_modified_memrefs_mark_all_dirty(const rc_memrefs_t* memrefs);
 
 void rc_parse_trigger_internal(rc_trigger_t* self, const char** memaddr, rc_parse_state_t* parse);
 int rc_trigger_state_active(int state);
+/* dormant triggers (see trigger.c) */
+int rc_trigger_find_dormant_guards(rc_trigger_t* self, rc_condition_t** guards, int max_guards);
+int rc_trigger_dormant_guard_true(rc_condition_t* const* guards, int num_guards);
 rc_memrefs_t* rc_trigger_get_memrefs(rc_trigger_t* self);
 
 typedef struct rc_condset_with_trailing_conditions_t {

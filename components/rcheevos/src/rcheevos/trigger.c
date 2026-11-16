@@ -401,3 +401,91 @@ void rc_reset_trigger(rc_trigger_t* self) {
 
   self->has_hits = 0;
 }
+
+/* ===========================================================================
+ * Dormant triggers (2026-11-15, Zelda Collector's Edition).
+ *
+ * Compilations (several games on one disc) guard every achievement with a core
+ * ResetIf on a selector byte (`R:0xH29b45!=131` = "reset unless Majora's Mask is
+ * running"). While that guard is true the trigger is reset on EVERY frame, yet
+ * its conditions are still evaluated in full (Zelda CE: ~35K of 45K conditions
+ * belong to sub-games that are not running). A trigger is DORMANT this frame
+ * when evaluating it is provably a no-op:
+ *
+ *   - the core has a standalone ResetIf "guard" (no hit target, not preceded by
+ *     a combining condition, no {recall}/function operand) that is TRUE now;
+ *   - no group of the trigger has a PauseIf (a pause would skip the reset and
+ *     could flip the state to PAUSED);
+ *   - no value-based Measured (required_hits == 0): it is refreshed from memory
+ *     even on a reset frame. Hit-based Measured is zeroed by the reset;
+ *   - the trigger is ACTIVE with has_hits == 0 AND its previous real evaluation
+ *     already ran with a guard true ("settled", tracked by the caller): that
+ *     evaluation reset every hit count, so re-running it changes nothing.
+ *
+ * Under those rules a real evaluation leaves state (ACTIVE), every current_hits
+ * (0), has_hits (0) and measured_value unchanged and raises no event; only the
+ * cached per-condition is_true bits differ, so the caller must force a full
+ * (non-replay) evaluation on the first non-dormant frame. The guards are read
+ * from memref values the frame's memref update already produced; this module
+ * only looks, it never writes trigger state.
+ * =========================================================================== */
+static int rc_dormant_operand_ok(const rc_operand_t* op) {
+  return op->type != RC_OPERAND_RECALL && op->type != RC_OPERAND_FUNC;
+}
+
+int rc_trigger_find_dormant_guards(rc_trigger_t* self, rc_condition_t** guards, int max_guards) {
+  rc_condset_t* condset;
+  rc_condition_t* condition;
+  rc_condition_t* conditions;
+  int i, count = 0;
+
+  if (!self || !self->requirement || max_guards <= 0)
+    return 0;
+
+  /* whole-trigger eligibility: no PauseIf, no value-based Measured, in any group */
+  condset = self->requirement;
+  while (condset) {
+    if (condset->num_pause_conditions)
+      return 0;
+    for (condition = condset->conditions; condition != NULL; condition = condition->next) {
+      if (condition->type == RC_CONDITION_MEASURED && condition->required_hits == 0)
+        return 0;
+    }
+    condset = (condset == self->requirement) ? self->alternative : condset->next;
+  }
+
+  /* guards: standalone ResetIf in the core's reset block. The parser stores the
+   * core's conditions grouped pause|reset|hittarget|measured|other (AddAddress
+   * links live apart, in the indirect block), each chain contiguous and ending in
+   * its terminal - so a ResetIf whose predecessor in the block is another ResetIf
+   * (or that opens the block) starts its own chain: nothing combines into it. */
+  conditions = rc_condset_get_conditions(self->requirement);
+  if (!conditions)
+    return 0;
+
+  for (i = 0; i < self->requirement->num_reset_conditions && count < max_guards; ++i) {
+    condition = &conditions[i];
+    if (condition->type != RC_CONDITION_RESET_IF || condition->required_hits != 0)
+      continue;
+    if (i > 0 && conditions[i - 1].type != RC_CONDITION_RESET_IF)
+      continue;
+    if (!rc_dormant_operand_ok(&condition->operand1) || !rc_dormant_operand_ok(&condition->operand2))
+      continue;
+    guards[count++] = condition;
+  }
+
+  return count;
+}
+
+int rc_trigger_dormant_guard_true(rc_condition_t* const* guards, int num_guards) {
+  rc_eval_state_t eval_state;
+  int i;
+
+  memset(&eval_state, 0, sizeof(eval_state));   /* no replay, no recall: plain read */
+  for (i = 0; i < num_guards; ++i) {
+    if (rc_test_condition(guards[i], &eval_state RC_HOTA(NULL)))
+      return 1;
+  }
+
+  return 0;
+}

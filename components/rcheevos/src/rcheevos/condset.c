@@ -366,7 +366,16 @@ rc_condset_t* rc_parse_condset(const char** memaddr, rc_parse_state_t* parse) {
 
         classification = combining_classification;
       }
-      else {
+      else if (classification != RC_CONDITION_CLASSIFICATION_INDIRECT) {
+        /* Backport of upstream master (post-12.3): an INDIRECT (AddAddress) link
+         * must NOT invalidate the cached look-ahead. rc_find_next_classification
+         * skips COMBINING and INDIRECT alike, so every combining condition of one
+         * chain resolves to the same terminal classification; resetting on each
+         * AddAddress re-scanned the rest of the chain per link = O(L^2).
+         * 2026-11-14, Zelda Collector's Edition (GC 2198): AddSource/AddAddress
+         * chains of up to 3199 conditions -> ~21M look-ahead condition parses ->
+         * the achievementsets callback never returned (Nintendont LOAD_GAME
+         * timeout). Exact: the cached value is what the re-scan would return. */
         combining_classification = RC_CONDITION_CLASSIFICATION_COMBINING;
       }
 

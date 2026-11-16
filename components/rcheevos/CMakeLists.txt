@@ -30,6 +30,12 @@ idf_component_register(
 # asserts (the known-good baseline). To A/B -O2 rigorously: same scene, per-trigger metric.
 target_compile_options(${COMPONENT_LIB} PRIVATE -w -fpermissive)
 
+# Game arena (2026-11-15): every heap call in this component goes through
+# rc_game_arena.c, which puts the allocations made while a patch is parsed into
+# a PSRAM block reserved at boot (rc_game_arena.h has the why). Force-included
+# so no upstream file needs editing.
+target_compile_options(${COMPONENT_LIB} PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/rc_arena_hook.h)
+
 # Dirty/incremental eval: skip cold+clean triggers in rc_client's do_frame eval
 # loop (the path to 60fps). PUBLIC so it propagates to `main` (REQUIRES rcheevos)
 # — rc_client.c needs it for the struct fields + skip logic, main.cpp for the

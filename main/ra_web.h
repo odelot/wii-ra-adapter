@@ -49,6 +49,11 @@ void ra_web_publish(const ra_web_pub_t *pub);
  * handler serves that copy. Call ONLY from the rc_client/loop task. */
 void ra_web_set_state_json(const char *json, unsigned len);
 
+/* Drop the full /api/state JSON and free its PSRAM buffer (between games, so
+ * the grow-only buffer doesn't fragment PSRAM before the next patch download).
+ * /api/state falls back to the small header snapshot until the next publish. */
+void ra_web_clear_state_json(void);
+
 /* True if a browser fetched /api/state (or /) within the last window_ms, OR a
  * WebSocket client is connected — i.e. a phone is actually watching. The loop
  * task uses this to gate the (heavier) full-list build so there is ZERO cost

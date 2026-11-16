@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <Stream.h>
 #include <esp_heap_caps.h>
+#include "rc_game_arena.h"
 
 class PsramStream : public Stream {
 private:
@@ -28,13 +29,16 @@ public:
 
   ~PsramStream() { release(); }
 
-  // Allocate or reallocate the buffer in PSRAM
-  bool reserve(size_t size) {
+  // Allocate or reallocate the buffer in PSRAM. in_arena: the first
+  // allocation goes to the game arena (rc_game_arena.h); a buffer living there
+  // is resized and freed there too.
+  bool reserve(size_t size, bool in_arena = false) {
     if (size == 0) { release(); return true; }
 
     if (_buffer == nullptr) {
-      _buffer = (char*)heap_caps_malloc(size + 1,
-                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      _buffer = in_arena ? (char*)rc_arena_alloc(size + 1)
+                         : (char*)heap_caps_malloc(size + 1,
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
       if (_buffer) {
         _buffer[0] = '\0';
         _capacity = size;
@@ -45,8 +49,10 @@ public:
       return false;
     }
 
-    char* nb = (char*)heap_caps_realloc(_buffer, size + 1,
-                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char* nb = rc_arena_owns(_buffer)
+                   ? (char*)rc_arena_realloc(_buffer, size + 1)
+                   : (char*)heap_caps_realloc(_buffer, size + 1,
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (nb) {
       _buffer   = nb;
       _capacity = size;
@@ -57,12 +63,13 @@ public:
   }
 
   void release() {
-    if (_buffer) { heap_caps_free(_buffer); _buffer = nullptr; }
+    if (_buffer) { rc_arena_free(_buffer); _buffer = nullptr; }   /* either heap */
     _capacity = _length = _readPos = 0;
   }
 
   // Hand the buffer (NUL-terminated at length()) to the caller, who frees it
-  // with free(); the stream is left empty. Avoids a body-sized copy.
+  // with rc_arena_free() (it may live in the game arena); the stream is left
+  // empty. Avoids a body-sized copy.
   char* detach() {
     char* b = _buffer;
     _buffer = nullptr;

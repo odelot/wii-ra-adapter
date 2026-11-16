@@ -263,6 +263,10 @@ typedef enum {
      * config portal (WII_RA_ADAPTER AP). Non-terminal from the adapter's
      * point of view, but a frontend should tell the user to configure it. */
     RA_STATUS_PORTAL         = 0x08,
+    /* Achievement set downloaded; the adapter is parsing it (can take a while
+     * for huge sets). Still a LOADING phase: frontends keep waiting, and may
+     * restart their LOAD_GAME timeout on the 0x05 -> 0x09 change (progress). */
+    RA_STATUS_PROCESSING     = 0x09,
     RA_STATUS_ERROR_WIFI     = 0xE0,  /* no WiFi link / no internet (RC_NO_RESPONSE) */
     RA_STATUS_ERROR_LOGIN    = 0xE1,  /* RA rejected the credentials / token expired */
     RA_STATUS_ERROR_GAME     = 0xE2,  /* game load failed (server/API error) */
